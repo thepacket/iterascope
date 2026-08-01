@@ -25,7 +25,9 @@ runs entirely in WGSL.
 - Automatic GPU precision switching between fast `f32` and a centred
   double-single recurrence with adaptive per-pixel rebasing (approximately
   48-bit reference coordinates)
-- A cached 3×3 CPU instability probe comparing `f32` and `f64` orbit behavior
+- A cached 3×3 CPU instability probe comparing both GPU arithmetic paths with
+  `f64`, including adaptive rebasing and non-finite detection
+- Explicit `DS STABLE`, `DS RISK`, and `DS LIMIT` states with diagnostic reasons
 - Responsive side-by-side or stacked layout
 - Native and WASM entry points from the same codebase
 - Offline WGSL parsing and validation using the exact Naga version used by wgpu

@@ -66,6 +66,13 @@ impl DoubleSingle {
         Self::normalize(sum, error)
     }
 
+    pub(crate) fn sub(self, other: Self) -> Self {
+        self.add(Self {
+            hi: -other.hi,
+            lo: -other.lo,
+        })
+    }
+
     pub(crate) fn mul(self, other: Self) -> Self {
         let product = self.hi * other.hi;
         let error = self.hi.mul_add(other.hi, -product)
@@ -93,20 +100,25 @@ pub(crate) struct ProbeInput {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ProbeResult {
+pub(crate) struct PathProbeResult {
     pub(crate) unstable_samples: u8,
     pub(crate) classification_mismatches: u8,
+    pub(crate) non_finite_samples: u8,
     pub(crate) max_escape_delta: f64,
     pub(crate) max_orbit_delta: f64,
 }
 
-impl ProbeResult {
+impl PathProbeResult {
     pub(crate) fn unstable(self) -> bool {
-        self.classification_mismatches > 0 || self.unstable_samples >= 2
+        self.non_finite_samples > 0
+            || self.classification_mismatches > 0
+            || self.unstable_samples >= 2
     }
 
     pub(crate) fn summary(self) -> String {
-        if self.classification_mismatches > 0 {
+        if self.non_finite_samples > 0 {
+            format!("{} / 9 non-finite orbits", self.non_finite_samples)
+        } else if self.classification_mismatches > 0 {
             format!(
                 "{} / 9 classifications disagree",
                 self.classification_mismatches
@@ -115,6 +127,108 @@ impl ProbeResult {
             format!("{} / 9 sampled orbits unstable", self.unstable_samples)
         } else {
             "9 / 9 sampled orbits agree".to_owned()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProbeResult {
+    pub(crate) f32: PathProbeResult,
+    pub(crate) ds: PathProbeResult,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ValidityLevel {
+    #[default]
+    Stable,
+    Risk,
+    Limit,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ValidityReason {
+    #[default]
+    SamplesAgree,
+    CoordinateRisk,
+    CoordinateCollapse,
+    OrbitDivergence(u8),
+    ClassificationMismatch(u8),
+    NonFinite(u8),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DsValidity {
+    pub(crate) level: ValidityLevel,
+    pub(crate) reason: ValidityReason,
+}
+
+impl DsValidity {
+    pub(crate) fn from_probe(probe: PathProbeResult, coordinate_ratio: f64) -> Self {
+        if coordinate_ratio >= 0.5 {
+            return Self {
+                level: ValidityLevel::Limit,
+                reason: ValidityReason::CoordinateCollapse,
+            };
+        }
+        if probe.non_finite_samples > 0 {
+            return Self {
+                level: ValidityLevel::Limit,
+                reason: ValidityReason::NonFinite(probe.non_finite_samples),
+            };
+        }
+        if probe.classification_mismatches >= 3 {
+            return Self {
+                level: ValidityLevel::Limit,
+                reason: ValidityReason::ClassificationMismatch(probe.classification_mismatches),
+            };
+        }
+        if probe.classification_mismatches > 0 {
+            return Self {
+                level: ValidityLevel::Risk,
+                reason: ValidityReason::ClassificationMismatch(probe.classification_mismatches),
+            };
+        }
+        if probe.unstable_samples >= 5 {
+            return Self {
+                level: ValidityLevel::Limit,
+                reason: ValidityReason::OrbitDivergence(probe.unstable_samples),
+            };
+        }
+        if probe.unstable_samples >= 2 {
+            return Self {
+                level: ValidityLevel::Risk,
+                reason: ValidityReason::OrbitDivergence(probe.unstable_samples),
+            };
+        }
+        if coordinate_ratio >= 0.0625 {
+            return Self {
+                level: ValidityLevel::Risk,
+                reason: ValidityReason::CoordinateRisk,
+            };
+        }
+        Self::default()
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self.level {
+            ValidityLevel::Stable => "DS STABLE",
+            ValidityLevel::Risk => "DS RISK",
+            ValidityLevel::Limit => "DS LIMIT",
+        }
+    }
+
+    pub(crate) fn summary(self) -> String {
+        match self.reason {
+            ValidityReason::SamplesAgree => "DS samples agree with f64".to_owned(),
+            ValidityReason::CoordinateRisk => "DS pixel spacing approaching limit".to_owned(),
+            ValidityReason::CoordinateCollapse => "DS adjacent coordinates may collapse".to_owned(),
+            ValidityReason::OrbitDivergence(count) => {
+                format!("{count} / 9 DS orbits diverge from f64")
+            }
+            ValidityReason::ClassificationMismatch(count) => {
+                format!("{count} / 9 DS classifications disagree")
+            }
+            ValidityReason::NonFinite(count) => format!("{count} / 9 DS orbits non-finite"),
         }
     }
 }
@@ -192,31 +306,49 @@ fn run_probe(input: ProbeInput) -> ProbeResult {
                 (world, input.julia_c)
             };
             let precise = orbit_f64(z0, c, input.iterations, input.bailout);
-            let gpu = orbit_f32(z0, c, input.iterations, input.bailout);
+            let f32_outcome = orbit_f32(z0, c, input.iterations, input.bailout);
+            let local_offset = [
+                (x as f32 * input.aspect as f32) * input.half_height as f32,
+                y as f32 * input.half_height as f32,
+            ];
+            let ds_outcome = orbit_adaptive_ds(input, local_offset);
 
-            if precise.escaped != gpu.escaped {
-                result.classification_mismatches += 1;
-                result.unstable_samples += 1;
-                continue;
-            }
-
-            if precise.escaped {
-                let delta = (precise.smooth_iteration - gpu.smooth_iteration).abs();
-                result.max_escape_delta = result.max_escape_delta.max(delta);
-                if delta > 0.2 {
-                    result.unstable_samples += 1;
-                }
-            } else {
-                let delta =
-                    ((precise.z[0] - gpu.z[0]).powi(2) + (precise.z[1] - gpu.z[1]).powi(2)).sqrt();
-                result.max_orbit_delta = result.max_orbit_delta.max(delta);
-                if delta > 1e-3 * (1.0 + precise.z[0].hypot(precise.z[1])) {
-                    result.unstable_samples += 1;
-                }
-            }
+            compare_outcome(&mut result.f32, precise, f32_outcome);
+            compare_outcome(&mut result.ds, precise, ds_outcome);
         }
     }
     result
+}
+
+fn compare_outcome(result: &mut PathProbeResult, precise: OrbitOutcome, candidate: OrbitOutcome) {
+    if !candidate.smooth_iteration.is_finite()
+        || !candidate.z[0].is_finite()
+        || !candidate.z[1].is_finite()
+    {
+        result.non_finite_samples += 1;
+        result.unstable_samples += 1;
+        return;
+    }
+    if precise.escaped != candidate.escaped {
+        result.classification_mismatches += 1;
+        result.unstable_samples += 1;
+        return;
+    }
+    if precise.escaped {
+        let delta = (precise.smooth_iteration - candidate.smooth_iteration).abs();
+        result.max_escape_delta = result.max_escape_delta.max(delta);
+        if delta > 0.2 {
+            result.unstable_samples += 1;
+        }
+    } else {
+        let delta = ((precise.z[0] - candidate.z[0]).powi(2)
+            + (precise.z[1] - candidate.z[1]).powi(2))
+        .sqrt();
+        result.max_orbit_delta = result.max_orbit_delta.max(delta);
+        if delta > 1e-3 * (1.0 + precise.z[0].hypot(precise.z[1])) {
+            result.unstable_samples += 1;
+        }
+    }
 }
 
 fn orbit_f64(z0: [f64; 2], c: [f64; 2], iterations: u32, bailout: f64) -> OrbitOutcome {
@@ -264,6 +396,101 @@ fn orbit_f32(z0: [f64; 2], c: [f64; 2], iterations: u32, bailout: f64) -> OrbitO
     }
 }
 
+fn orbit_adaptive_ds(input: ProbeInput, local_offset: [f32; 2]) -> OrbitOutcome {
+    let zero = [DoubleSingle::default(); 2];
+    let centre = [
+        DoubleSingle::from_f64(input.centre[0]),
+        DoubleSingle::from_f64(input.centre[1]),
+    ];
+    let julia_c = [
+        DoubleSingle::from_f64(input.julia_c[0]),
+        DoubleSingle::from_f64(input.julia_c[1]),
+    ];
+    let (mut reference_z, mut reference_c, mut delta_z, mut delta_c) = if input.pane == 0 {
+        (zero, centre, [0.0; 2], local_offset)
+    } else {
+        (centre, julia_c, local_offset, [0.0; 2])
+    };
+    let bailout_squared = (input.bailout as f32) * (input.bailout as f32);
+    let mut approximate = ds2_approx(reference_z);
+
+    for iteration in 1..=input.iterations.min(4096) {
+        let reference_before = ds2_approx(reference_z);
+        let coupling = complex_mul_f32(reference_before, delta_z);
+        let delta_square = complex_square_f32(delta_z);
+        delta_z = [
+            2.0 * coupling[0] + delta_square[0] + delta_c[0],
+            2.0 * coupling[1] + delta_square[1] + delta_c[1],
+        ];
+        let square = ds_complex_square(reference_z);
+        reference_z = [square[0].add(reference_c[0]), square[1].add(reference_c[1])];
+        let reference_approximate = ds2_approx(reference_z);
+        approximate = [
+            reference_approximate[0] + delta_z[0],
+            reference_approximate[1] + delta_z[1],
+        ];
+
+        let reference_size = reference_approximate[0].hypot(reference_approximate[1]);
+        let delta_size = delta_z[0].hypot(delta_z[1]);
+        let cancellation_scale = reference_size.max(delta_size);
+        let delta_is_large = delta_size > 0.03125 * (1.0 + reference_size);
+        let cancellation = cancellation_scale > 1e-4
+            && approximate[0].hypot(approximate[1]) < 0.01 * cancellation_scale;
+        if delta_is_large || cancellation {
+            reference_z = ds2_add_f32(reference_z, delta_z);
+            reference_c = ds2_add_f32(reference_c, delta_c);
+            delta_z = [0.0; 2];
+            delta_c = [0.0; 2];
+            approximate = ds2_approx(reference_z);
+        }
+
+        let magnitude_squared = approximate[0] * approximate[0] + approximate[1] * approximate[1];
+        if magnitude_squared > bailout_squared {
+            let log_zn = 0.5 * magnitude_squared.max(1.000_001).ln();
+            return OrbitOutcome {
+                escaped: true,
+                smooth_iteration: (iteration as f32 + 1.0 - log_zn.max(1e-6).log2()) as f64,
+                z: [approximate[0] as f64, approximate[1] as f64],
+            };
+        }
+    }
+
+    OrbitOutcome {
+        escaped: false,
+        smooth_iteration: input.iterations as f64,
+        z: [approximate[0] as f64, approximate[1] as f64],
+    }
+}
+
+fn ds2_approx(value: [DoubleSingle; 2]) -> [f32; 2] {
+    [value[0].hi + value[0].lo, value[1].hi + value[1].lo]
+}
+
+fn ds2_add_f32(value: [DoubleSingle; 2], offset: [f32; 2]) -> [DoubleSingle; 2] {
+    [
+        value[0].add(DoubleSingle::from_f32(offset[0])),
+        value[1].add(DoubleSingle::from_f32(offset[1])),
+    ]
+}
+
+fn ds_complex_square(value: [DoubleSingle; 2]) -> [DoubleSingle; 2] {
+    let xx = value[0].mul(value[0]);
+    let yy = value[1].mul(value[1]);
+    let xy = value[0].mul(value[1]);
+    [xx.sub(yy), DoubleSingle::from_f32(2.0).mul(xy)]
+}
+
+fn complex_square_f32(value: [f32; 2]) -> [f32; 2] {
+    [
+        value[0] * value[0] - value[1] * value[1],
+        2.0 * value[0] * value[1],
+    ]
+}
+
+fn complex_mul_f32(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    [a[0] * b[0] - a[1] * b[1], a[0] * b[1] + a[1] * b[0]]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,8 +531,8 @@ mod tests {
         let mut cache = ProbeCache::default();
         let first = cache.update(input);
         assert_eq!(
-            cache.current(input).unwrap().unstable_samples,
-            first.unstable_samples
+            cache.current(input).unwrap().f32.unstable_samples,
+            first.f32.unstable_samples
         );
 
         let changed = ProbeInput {
@@ -326,7 +553,47 @@ mod tests {
             bailout: 4.0,
             pane: 0,
         });
-        assert_eq!(result.classification_mismatches, 0);
-        assert!(!result.unstable());
+        assert_eq!(result.f32.classification_mismatches, 0);
+        assert!(!result.f32.unstable());
+        assert_eq!(result.ds.classification_mismatches, 0);
+        assert!(!result.ds.unstable());
+    }
+
+    #[test]
+    fn adaptive_ds_probe_improves_the_reported_deep_view() {
+        let result = run_probe(ProbeInput {
+            centre: [-0.015_945_7, 1.013_91],
+            half_height: 1.45 / 119_577.0,
+            aspect: 0.71,
+            julia_c: [-0.015_945_7, 1.013_91],
+            iterations: 2048,
+            bailout: 6.1,
+            pane: 0,
+        });
+        assert_eq!(result.ds.non_finite_samples, 0);
+        assert!(result.ds.classification_mismatches <= result.f32.classification_mismatches);
+    }
+
+    #[test]
+    fn ds_validity_distinguishes_risk_and_limit() {
+        assert_eq!(
+            DsValidity::from_probe(PathProbeResult::default(), 0.0).level,
+            ValidityLevel::Stable
+        );
+        assert_eq!(
+            DsValidity::from_probe(
+                PathProbeResult {
+                    classification_mismatches: 1,
+                    ..Default::default()
+                },
+                0.0,
+            )
+            .level,
+            ValidityLevel::Risk
+        );
+        assert_eq!(
+            DsValidity::from_probe(PathProbeResult::default(), 0.5).level,
+            ValidityLevel::Limit
+        );
     }
 }

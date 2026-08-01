@@ -1,6 +1,9 @@
 use web_time::Instant;
 
-use crate::precision::{DoubleSingle, PrecisionMode, ProbeCache, ProbeInput, ProbeResult};
+use crate::precision::{
+    DoubleSingle, DsValidity, PathProbeResult, PrecisionMode, ProbeCache, ProbeInput, ProbeResult,
+    ValidityLevel,
+};
 use crate::render::{self, FractalPipeline, Uniforms};
 
 const PANEL_WIDTH: f32 = 286.0;
@@ -89,6 +92,7 @@ pub struct App {
     grid: bool,
     zoom_focus: [Option<[f64; 2]>; 2],
     precision_modes: [PrecisionMode; 2],
+    ds_validity: [DsValidity; 2],
     probes: [ProbeCache; 2],
     frame_ms: f32,
     frame_start: Instant,
@@ -119,6 +123,7 @@ impl App {
             grid: false,
             zoom_focus: [None, None],
             precision_modes: [PrecisionMode::F32; 2],
+            ds_validity: [DsValidity::default(); 2],
             probes: [ProbeCache::default(); 2],
             frame_ms: 0.0,
             frame_start: Instant::now(),
@@ -179,8 +184,18 @@ impl App {
                         .logarithmic(true)
                         .text("bailout"),
                 );
-                precision_row(ui, "Parameter", self.precision_modes[0]);
-                precision_row(ui, "Julia", self.precision_modes[1]);
+                precision_row(
+                    ui,
+                    "Parameter",
+                    self.precision_modes[0],
+                    self.ds_validity[0],
+                );
+                precision_row(
+                    ui,
+                    "Julia",
+                    self.precision_modes[1],
+                    self.ds_validity[1],
+                );
                 ui.label(
                     egui::RichText::new("Precision switches automatically after instability.")
                         .small()
@@ -191,11 +206,21 @@ impl App {
             section(ui, "View status", |ui| {
                 zoom_row(ui, "Parameter", self.parameter.magnification());
                 zoom_row(ui, "Julia", self.dynamical.magnification());
-                probe_row(ui, "P probe", self.probes[0].last_result());
-                probe_row(ui, "J probe", self.probes[1].last_result());
+                probe_rows(
+                    ui,
+                    "P",
+                    self.probes[0].last_result(),
+                    self.ds_validity[0],
+                );
+                probe_rows(
+                    ui,
+                    "J",
+                    self.probes[1].last_result(),
+                    self.ds_validity[1],
+                );
                 ui.label(
                     egui::RichText::new(
-                        "Nine CPU orbit samples validate f32 only when a settled view changes.",
+                        "Nine CPU samples compare both GPU arithmetic paths with f64 after a settled view change.",
                     )
                     .small()
                     .color(MUTED),
@@ -377,10 +402,27 @@ impl App {
         );
         let precision = choose_precision(magnification, coordinate_limited, probe);
         self.precision_modes[pane] = precision;
+        let ds_validity = DsValidity::from_probe(
+            probe.ds,
+            ds_coordinate_ratio(
+                &view,
+                (pane == 1).then_some(self.julia_c),
+                viewport,
+                ui.ctx().pixels_per_point(),
+            ),
+        );
+        self.ds_validity[pane] = ds_validity;
 
         let (precision_text, zoom_colour) = match precision {
-            PrecisionMode::DoubleSingle => ("DS ~48-BIT", BLUE),
-            PrecisionMode::F32 if probe.unstable() => ("F32 UNSTABLE", CORAL),
+            PrecisionMode::DoubleSingle => (
+                ds_validity.label(),
+                match ds_validity.level {
+                    ValidityLevel::Stable => BLUE,
+                    ValidityLevel::Risk => CREAM,
+                    ValidityLevel::Limit => CORAL,
+                },
+            ),
+            PrecisionMode::F32 if probe.f32.unstable() => ("F32 UNSTABLE", CORAL),
             PrecisionMode::F32 => ("F32", CREAM),
         };
         ui.painter().text(
@@ -594,24 +636,41 @@ fn zoom_row(ui: &mut egui::Ui, label: &str, magnification: f64) {
     });
 }
 
-fn precision_row(ui: &mut egui::Ui, label: &str, precision: PrecisionMode) {
+fn precision_row(ui: &mut egui::Ui, label: &str, precision: PrecisionMode, validity: DsValidity) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).color(MUTED));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            badge(
-                ui,
-                precision.label(),
-                if precision == PrecisionMode::DoubleSingle {
-                    BLUE
-                } else {
-                    CREAM
-                },
-            );
+            let (text, colour) = match precision {
+                PrecisionMode::F32 => (precision.label(), CREAM),
+                PrecisionMode::DoubleSingle => (
+                    validity.label(),
+                    match validity.level {
+                        ValidityLevel::Stable => BLUE,
+                        ValidityLevel::Risk => CREAM,
+                        ValidityLevel::Limit => CORAL,
+                    },
+                ),
+            };
+            badge(ui, text, colour);
         });
     });
 }
 
-fn probe_row(ui: &mut egui::Ui, label: &str, result: Option<ProbeResult>) {
+fn probe_rows(ui: &mut egui::Ui, label: &str, result: Option<ProbeResult>, validity: DsValidity) {
+    path_probe_row(ui, &format!("{label} f32"), result.map(|value| value.f32));
+    path_probe_row(ui, &format!("{label} DS"), result.map(|value| value.ds));
+    ui.label(
+        egui::RichText::new(validity.summary())
+            .small()
+            .color(match validity.level {
+                ValidityLevel::Stable => MUTED,
+                ValidityLevel::Risk => CREAM,
+                ValidityLevel::Limit => CORAL,
+            }),
+    );
+}
+
+fn path_probe_row(ui: &mut egui::Ui, label: &str, result: Option<PathProbeResult>) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).color(MUTED));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -723,13 +782,35 @@ fn view_is_f32_limited(
     arithmetic_spacing >= world_per_pixel * 0.5
 }
 
+fn ds_coordinate_ratio(
+    view: &PlaneView,
+    dynamics_parameter: Option<[f64; 2]>,
+    rect: egui::Rect,
+    pixels_per_point: f32,
+) -> f64 {
+    let physical_height = (rect.height() * pixels_per_point).max(1.0) as f64;
+    let world_per_pixel = 2.0 * view.half_height / physical_height;
+    let mut spacing = ds_spacing(view.centre[0]).max(ds_spacing(view.centre[1]));
+    if let Some(c) = dynamics_parameter {
+        spacing = spacing.max(ds_spacing(c[0])).max(ds_spacing(c[1]));
+    }
+    spacing / world_per_pixel.max(f64::MIN_POSITIVE)
+}
+
+fn ds_spacing(value: f64) -> f64 {
+    // A normalized double-single carries about one additional f32 mantissa
+    // beneath the high word. This conservative estimate intentionally warns
+    // before the theoretical best case.
+    f32_spacing(value) * 2.0_f64.powi(-24)
+}
+
 fn choose_precision(
     magnification: f64,
     coordinate_limited: bool,
     probe: ProbeResult,
 ) -> PrecisionMode {
-    let classification_failed = probe.classification_mismatches > 0;
-    let orbit_failed = magnification >= PROBE_DS_MIN_ZOOM && probe.unstable();
+    let classification_failed = probe.f32.classification_mismatches > 0;
+    let orbit_failed = magnification >= PROBE_DS_MIN_ZOOM && probe.f32.unstable();
     if coordinate_limited || classification_failed || orbit_failed {
         PrecisionMode::DoubleSingle
     } else {
@@ -847,7 +928,10 @@ mod tests {
                 512.0,
                 false,
                 ProbeResult {
-                    unstable_samples: 2,
+                    f32: PathProbeResult {
+                        unstable_samples: 2,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 }
             ),
