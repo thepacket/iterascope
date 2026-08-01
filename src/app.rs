@@ -1,5 +1,6 @@
 use web_time::Instant;
 
+use crate::precision::{DoubleSingle, PrecisionMode, ProbeCache, ProbeInput, ProbeResult};
 use crate::render::{self, FractalPipeline, Uniforms};
 
 const PANEL_WIDTH: f32 = 286.0;
@@ -9,6 +10,10 @@ const PANE_GAP: f32 = 6.0;
 /// it one-for-one feels abrupt on a high-resolution trackpad, so temper it
 /// without introducing lag or accumulating hidden state.
 const PINCH_SENSITIVITY: f64 = 0.65;
+/// Orbit disagreement alone enables the more expensive DS path only once a
+/// view is meaningfully zoomed. Classification disagreement and coordinate
+/// collapse always override this floor.
+const PROBE_DS_MIN_ZOOM: f64 = 256.0;
 
 const BG: egui::Color32 = egui::Color32::from_rgb(10, 13, 18);
 const PANEL: egui::Color32 = egui::Color32::from_rgb(22, 24, 29);
@@ -83,6 +88,8 @@ pub struct App {
     smooth: bool,
     grid: bool,
     zoom_focus: [Option<[f64; 2]>; 2],
+    precision_modes: [PrecisionMode; 2],
+    probes: [ProbeCache; 2],
     frame_ms: f32,
     frame_start: Instant,
 }
@@ -111,6 +118,8 @@ impl App {
             smooth: true,
             grid: false,
             zoom_focus: [None, None],
+            precision_modes: [PrecisionMode::F32; 2],
+            probes: [ProbeCache::default(); 2],
             frame_ms: 0.0,
             frame_start: Instant::now(),
         })
@@ -170,14 +179,10 @@ impl App {
                         .logarithmic(true)
                         .text("bailout"),
                 );
-                ui.horizontal(|ui| {
-                    ui.label("precision");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        badge(ui, "GPU f32", BLUE);
-                    });
-                });
+                precision_row(ui, "Parameter", self.precision_modes[0]);
+                precision_row(ui, "Julia", self.precision_modes[1]);
                 ui.label(
-                    egui::RichText::new("Deep precision arrives in the next rendering stage.")
+                    egui::RichText::new("Precision switches automatically after instability.")
                         .small()
                         .color(MUTED),
                 );
@@ -186,9 +191,11 @@ impl App {
             section(ui, "View status", |ui| {
                 zoom_row(ui, "Parameter", self.parameter.magnification());
                 zoom_row(ui, "Julia", self.dynamical.magnification());
+                probe_row(ui, "P probe", self.probes[0].last_result());
+                probe_row(ui, "J probe", self.probes[1].last_result());
                 ui.label(
                     egui::RichText::new(
-                        "Pane headers warn when f32 can no longer distinguish adjacent pixels.",
+                        "Nine CPU orbit samples validate f32 only when a settled view changes.",
                     )
                     .small()
                     .color(MUTED),
@@ -275,12 +282,6 @@ impl App {
         } else {
             ("DYNAMICAL PLANE", "z -> z^2 + c")
         };
-        let magnification = if pane == 0 {
-            self.parameter.magnification()
-        } else {
-            self.dynamical.magnification()
-        };
-
         ui.painter().text(
             egui::pos2(header.min.x + 11.0, header.center().y),
             egui::Align2::LEFT_CENTER,
@@ -297,32 +298,10 @@ impl App {
                 egui::Color32::WHITE,
             );
         }
-        let f32_limited = view_is_f32_limited(
-            if pane == 0 {
-                &self.parameter
-            } else {
-                &self.dynamical
-            },
-            (pane == 1).then_some(self.julia_c),
-            viewport,
-            ui.ctx().pixels_per_point(),
-        );
-        let zoom_colour = if f32_limited { CORAL } else { CREAM };
-        ui.painter().text(
-            egui::pos2(header.max.x - 10.0, header.center().y),
-            egui::Align2::RIGHT_CENTER,
-            if f32_limited {
-                format!("F32 LIMIT  ·  ZOOM ×{magnification:.4e}")
-            } else {
-                format!("ZOOM ×{magnification:.4e}")
-            },
-            egui::FontId::new(11.0, egui::FontFamily::Monospace),
-            zoom_colour,
-        );
-
         let response = ui.allocate_rect(viewport, egui::Sense::click_and_drag());
         let pinch_delta = ui.input(|input| input.zoom_delta());
         let pinching = (pinch_delta - 1.0).abs() > 0.001;
+        let mut interacting = pinching || response.dragged();
         if response.dragged() && !pinching {
             let delta = ui.input(|input| input.pointer.delta());
             if pane == 0 {
@@ -342,6 +321,7 @@ impl App {
                 None
             };
             if let Some(factor) = factor {
+                interacting = true;
                 if pane == 0 {
                     self.parameter.zoom_from(self.zoom_focus[0], factor);
                 } else {
@@ -351,6 +331,7 @@ impl App {
         }
         if response.clicked() && !response.dragged() {
             if let Some(position) = response.interact_pointer_pos() {
+                interacting = true;
                 let point = if pane == 0 {
                     self.parameter.point_at(viewport, position)
                 } else {
@@ -373,6 +354,43 @@ impl App {
             self.dynamical
         };
         let aspect = viewport.width() / viewport.height().max(1.0);
+        let magnification = view.magnification();
+        let probe_input = ProbeInput {
+            centre: view.centre,
+            half_height: view.half_height,
+            aspect: aspect as f64,
+            julia_c: self.julia_c,
+            iterations: self.iterations,
+            bailout: self.bailout as f64,
+            pane,
+        };
+        let probe = if interacting {
+            self.probes[pane].current(probe_input).unwrap_or_default()
+        } else {
+            self.probes[pane].update(probe_input)
+        };
+        let coordinate_limited = view_is_f32_limited(
+            &view,
+            (pane == 1).then_some(self.julia_c),
+            viewport,
+            ui.ctx().pixels_per_point(),
+        );
+        let precision = choose_precision(magnification, coordinate_limited, probe);
+        self.precision_modes[pane] = precision;
+
+        let (precision_text, zoom_colour) = match precision {
+            PrecisionMode::DoubleSingle => ("DS ~48-BIT", BLUE),
+            PrecisionMode::F32 if probe.unstable() => ("F32 UNSTABLE", CORAL),
+            PrecisionMode::F32 => ("F32", CREAM),
+        };
+        ui.painter().text(
+            egui::pos2(header.max.x - 10.0, header.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{precision_text}  ·  ZOOM ×{magnification:.4e}"),
+            egui::FontId::new(11.0, egui::FontFamily::Monospace),
+            zoom_colour,
+        );
+
         let uniforms = Uniforms::new(
             view.centre,
             view.half_height,
@@ -384,13 +402,14 @@ impl App {
             self.palette_phase,
             self.smooth,
             self.grid,
+            precision,
         );
         ui.painter().add(render::callback(viewport, pane, uniforms));
 
         if let Some(focus) = self.zoom_focus[pane] {
             self.draw_focus_marker(ui, viewport, &view, focus);
         }
-        self.draw_readout(ui, viewport, response.hover_pos(), &view);
+        self.draw_readout(ui, viewport, response.hover_pos(), &view, precision);
     }
 
     fn reframe_dynamical_plane(&mut self) {
@@ -425,18 +444,20 @@ impl App {
         rect: egui::Rect,
         pointer: Option<egui::Pos2>,
         view: &PlaneView,
+        precision: PrecisionMode,
     ) {
         let Some(pointer) = pointer.filter(|position| rect.contains(*position)) else {
             return;
         };
-        let sample = coordinate_sample(view, rect, pointer, ui.ctx().pixels_per_point());
+        let sample = coordinate_sample(view, rect, pointer, ui.ctx().pixels_per_point(), precision);
         let text = format!(
             "NAV f64    {:+.15e}  {:+.15e}i\n\
-             GPU f32    {:+.15e}  {:+.15e}i\n\
+             {:<10} {:+.15e}  {:+.15e}i\n\
              Δ GPU-NAV  {:+.3e}  {:+.3e}i\n\
              PIXEL Δz   {:.3e}",
             sample.navigation[0],
             sample.navigation[1],
+            precision.label(),
             sample.rendered[0],
             sample.rendered[1],
             sample.delta[0],
@@ -573,6 +594,37 @@ fn zoom_row(ui: &mut egui::Ui, label: &str, magnification: f64) {
     });
 }
 
+fn precision_row(ui: &mut egui::Ui, label: &str, precision: PrecisionMode) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).color(MUTED));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            badge(
+                ui,
+                precision.label(),
+                if precision == PrecisionMode::DoubleSingle {
+                    BLUE
+                } else {
+                    CREAM
+                },
+            );
+        });
+    });
+}
+
+fn probe_row(ui: &mut egui::Ui, label: &str, result: Option<ProbeResult>) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).color(MUTED));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (text, colour) = match result {
+                Some(result) if result.unstable() => (result.summary(), CORAL),
+                Some(result) => (result.summary(), MUTED),
+                None => ("waiting for settled view".to_owned(), MUTED),
+            };
+            ui.label(egui::RichText::new(text).small().color(colour));
+        });
+    });
+}
+
 fn f32_spacing(value: f64) -> f64 {
     let value = (value as f32).abs();
     if value == 0.0 {
@@ -600,6 +652,7 @@ fn coordinate_sample(
     rect: egui::Rect,
     pointer: egui::Pos2,
     pixels_per_point: f32,
+    precision: PrecisionMode,
 ) -> CoordinateSample {
     let ppp = pixels_per_point.max(1e-6) as f64;
     let width = (rect.width() as f64 * ppp).round().max(1.0);
@@ -617,13 +670,28 @@ fn coordinate_sample(
         view.centre[0] + local[0] * view.half_height,
         view.centre[1] + local[1] * view.half_height,
     ];
-    // Mirror the WGSL expression after each uniform and interpolant has been
+    // Mirror the selected WGSL expression after the interpolant has been
     // rounded to f32. Back-convert only for display and delta calculation.
-    let scale = view.half_height as f32;
-    let rendered = [
-        (view.centre[0] as f32 + local[0] as f32 * scale) as f64,
-        (view.centre[1] as f32 + local[1] as f32 * scale) as f64,
-    ];
+    let rendered = match precision {
+        PrecisionMode::F32 => {
+            let scale = view.half_height as f32;
+            [
+                (view.centre[0] as f32 + local[0] as f32 * scale) as f64,
+                (view.centre[1] as f32 + local[1] as f32 * scale) as f64,
+            ]
+        }
+        PrecisionMode::DoubleSingle => {
+            let scale = DoubleSingle::from_f64(view.half_height);
+            [
+                DoubleSingle::from_f64(view.centre[0])
+                    .add(DoubleSingle::from_f32(local[0] as f32).mul(scale))
+                    .as_f64(),
+                DoubleSingle::from_f64(view.centre[1])
+                    .add(DoubleSingle::from_f32(local[1] as f32).mul(scale))
+                    .as_f64(),
+            ]
+        }
+    };
     let delta = [rendered[0] - navigation[0], rendered[1] - navigation[1]];
 
     CoordinateSample {
@@ -653,6 +721,20 @@ fn view_is_f32_limited(
     }
     // Warn before adjacent pixels fully collapse onto the same f32 value.
     arithmetic_spacing >= world_per_pixel * 0.5
+}
+
+fn choose_precision(
+    magnification: f64,
+    coordinate_limited: bool,
+    probe: ProbeResult,
+) -> PrecisionMode {
+    let classification_failed = probe.classification_mismatches > 0;
+    let orbit_failed = magnification >= PROBE_DS_MIN_ZOOM && probe.unstable();
+    if coordinate_limited || classification_failed || orbit_failed {
+        PrecisionMode::DoubleSingle
+    } else {
+        PrecisionMode::F32
+    }
 }
 
 fn preset_button(ui: &mut egui::Ui, label: &str, c: [f64; 2], selected: &mut [f64; 2]) -> bool {
@@ -734,7 +816,7 @@ mod tests {
     fn coordinate_sample_reports_f32_rounding_and_pixel_scale() {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let view = PlaneView::new([-0.745123456789, 0.113987654321], 1.45e-5);
-        let sample = coordinate_sample(&view, rect, rect.center(), 2.0);
+        let sample = coordinate_sample(&view, rect, rect.center(), 2.0, PrecisionMode::F32);
         assert_eq!(sample.rendered[0], sample.navigation[0] as f32 as f64);
         assert_eq!(sample.rendered[1], sample.navigation[1] as f32 as f64);
         assert_eq!(sample.delta[0], sample.rendered[0] - sample.navigation[0]);
@@ -748,5 +830,39 @@ mod tests {
         assert!(pinch_zoom_factor(0.8) > 1.0);
         assert_eq!(pinch_zoom_factor(1.0), 1.0);
         assert!(pinch_zoom_factor(2.0) > 0.5);
+    }
+
+    #[test]
+    fn automatic_precision_responds_to_probe_and_coordinate_limits() {
+        assert_eq!(
+            choose_precision(1.0, false, ProbeResult::default()),
+            PrecisionMode::F32
+        );
+        assert_eq!(
+            choose_precision(1.0, true, ProbeResult::default()),
+            PrecisionMode::DoubleSingle
+        );
+        assert_eq!(
+            choose_precision(
+                512.0,
+                false,
+                ProbeResult {
+                    unstable_samples: 2,
+                    ..Default::default()
+                }
+            ),
+            PrecisionMode::DoubleSingle
+        );
+    }
+
+    #[test]
+    fn double_single_readout_is_closer_to_navigation_coordinate() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let view = PlaneView::new([-0.745_123_456_789, 0.113_987_654_321], 1.45e-9);
+        let f32_sample = coordinate_sample(&view, rect, rect.center(), 2.0, PrecisionMode::F32);
+        let ds_sample =
+            coordinate_sample(&view, rect, rect.center(), 2.0, PrecisionMode::DoubleSingle);
+        assert!(ds_sample.delta[0].abs() < f32_sample.delta[0].abs());
+        assert!(ds_sample.delta[1].abs() < f32_sample.delta[1].abs());
     }
 }

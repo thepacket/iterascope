@@ -5,6 +5,7 @@
 //! uses, while the CPU only maintains the view and experiment parameters.
 
 mod app;
+mod precision;
 pub mod render;
 
 pub use app::App;

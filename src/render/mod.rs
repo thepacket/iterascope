@@ -3,20 +3,24 @@
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use eframe::wgpu;
 
+use crate::precision::{PrecisionMode, split_f64};
+
 const SHADER: &str = include_str!("fractal.wgsl");
 const PANE_COUNT: usize = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
-    view: [f32; 4],
-    dynamics: [f32; 4],
+    view_hi: [f32; 4],
+    view_lo: [f32; 4],
+    dynamics_hi: [f32; 4],
+    dynamics_lo: [f32; 4],
     display: [f32; 4],
 }
 
 impl Uniforms {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         centre: [f64; 2],
         half_height: f64,
         aspect: f32,
@@ -27,20 +31,18 @@ impl Uniforms {
         palette_phase: f32,
         smooth: bool,
         grid: bool,
+        precision: PrecisionMode,
     ) -> Self {
+        let centre_x = split_f64(centre[0]);
+        let centre_y = split_f64(centre[1]);
+        let scale = split_f64(half_height);
+        let julia_x = split_f64(julia_c[0]);
+        let julia_y = split_f64(julia_c[1]);
         Self {
-            view: [
-                centre[0] as f32,
-                centre[1] as f32,
-                half_height as f32,
-                aspect,
-            ],
-            dynamics: [
-                julia_c[0] as f32,
-                julia_c[1] as f32,
-                iterations as f32,
-                bailout * bailout,
-            ],
+            view_hi: [centre_x[0], centre_y[0], scale[0], aspect],
+            view_lo: [centre_x[1], centre_y[1], scale[1], precision.shader_flag()],
+            dynamics_hi: [julia_x[0], julia_y[0], iterations as f32, bailout * bailout],
+            dynamics_lo: [julia_x[1], julia_y[1], 0.0, 0.0],
             display: [
                 pane as f32,
                 palette_phase,
@@ -196,7 +198,28 @@ mod tests {
     }
 
     #[test]
-    fn uniform_layout_is_three_vec4s() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 48);
+    fn uniform_layout_is_five_vec4s() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 80);
+    }
+
+    #[test]
+    fn uniforms_preserve_low_coordinate_words() {
+        let uniforms = Uniforms::new(
+            [-0.745_123_456_789, 0.113_987_654_321],
+            1.45e-9,
+            1.6,
+            [-0.745, 0.113],
+            256,
+            4.0,
+            0,
+            0.0,
+            true,
+            false,
+            PrecisionMode::DoubleSingle,
+        );
+        assert_ne!(uniforms.view_lo[0], 0.0);
+        assert_ne!(uniforms.view_lo[1], 0.0);
+        assert_ne!(uniforms.view_lo[2], 0.0);
+        assert_eq!(uniforms.view_lo[3], 1.0);
     }
 }

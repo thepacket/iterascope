@@ -22,14 +22,19 @@ runs entirely in WGSL.
 - Adjustable iteration limit, bailout, palette phase and smooth colouring
 - Optional scale-aware coordinate grid
 - Live coordinate and magnification readouts
+- Automatic GPU precision switching between fast `f32` and a centred
+  double-single recurrence with adaptive per-pixel rebasing (approximately
+  48-bit reference coordinates)
+- A cached 3×3 CPU instability probe comparing `f32` and `f64` orbit behavior
 - Responsive side-by-side or stacked layout
 - Native and WASM entry points from the same codebase
 - Offline WGSL parsing and validation using the exact Naga version used by wgpu
 
-This first rendering path is intentionally `f32`. The interface reports that
-fact instead of implying precision it does not yet provide. Double-single
-arithmetic, perturbation and reference-orbit infrastructure are subsequent
-rendering stages.
+The interface reports the active arithmetic for each pane. Navigation remains
+in CPU `f64`; rendering starts with fast GPU `f32` and switches automatically
+to GPU double-single when coordinate resolution is at risk or the lightweight
+orbit probe detects divergent escape behavior. Perturbation and
+reference-orbit infrastructure remain subsequent rendering stages.
 
 ## Run natively
 
@@ -93,9 +98,8 @@ cargo check --target wasm32-unknown-unknown
 
 1. Deterministic experiment documents and view import/export
 2. Orbit inspector and critical-orbit diagnostics
-3. Double-single GPU arithmetic for the intermediate zoom range
-4. Perturbation with a small arbitrary-precision CPU reference orbit
-5. Period detection, multipliers and Newton refinement
+3. Perturbation with a small arbitrary-precision CPU reference orbit
+4. Period detection, multipliers and Newton refinement
 
 ## Project status
 
