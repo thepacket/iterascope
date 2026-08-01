@@ -49,6 +49,38 @@ trunk serve
 
 Open `http://127.0.0.1:8080` in a browser with WebGPU enabled.
 
+For a production bundle, with Binaryen's `wasm-opt` installed when available:
+
+```sh
+./build-release.sh
+```
+
+## Deploy on Fly.io
+
+IteraScope deploys as a static bundle served by Caddy. The multi-stage
+[`Dockerfile`](Dockerfile) compiles the WASM application, optimizes it with
+Binaryen, and precompresses the browser assets. [`fly.toml`](fly.toml) runs the
+small serving container in Toronto (`yyz`), enforces HTTPS for WebGPU, performs
+HTTP health checks, and stops the Machine when it is idle.
+
+For the first deployment:
+
+```sh
+fly auth login
+fly apps create iterascope
+fly deploy
+```
+
+Subsequent deployments only require:
+
+```sh
+fly deploy
+```
+
+The app will be available at `https://iterascope.fly.dev`. If the global Fly
+app name is no longer available, choose another name with `fly apps create` and
+change the `app` value in `fly.toml` to match.
+
 ## Validate
 
 ```sh

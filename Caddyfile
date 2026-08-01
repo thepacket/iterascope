@@ -1,0 +1,27 @@
+:8080 {
+	root * /srv
+
+	encode zstd gzip
+
+	# Trunk fingerprints application assets. Their URLs are immutable, while
+	# index.html must be revalidated so every deployment becomes visible.
+	@hashed path *.wasm *.js *.css
+	header @hashed Cache-Control "public, max-age=31536000, immutable"
+	header /index.html Cache-Control "no-cache"
+	header / Cache-Control "no-cache"
+
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	file_server {
+		precompressed br gzip
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

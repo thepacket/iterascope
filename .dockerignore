@@ -1,0 +1,7 @@
+.git
+.github
+.trunk
+dist
+target
+*.log
+.DS_Store
