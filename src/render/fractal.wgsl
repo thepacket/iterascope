@@ -53,8 +53,11 @@ fn grid(world: vec2<f32>) -> f32 {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    // The rasterizer presents the top of the viewport with uv.y near 1. The
+    // complex plane is y-up too, so the top must map to positive imaginary
+    // values. This matches the CPU-side click and pan coordinate conversion.
     let local = vec2<f32>((in.uv.x * 2.0 - 1.0) * u.view.w,
-                         (1.0 - in.uv.y * 2.0));
+                         (in.uv.y * 2.0 - 1.0));
     let world = u.view.xy + local * u.view.z;
 
     let julia = u.display.x > 0.5;

@@ -5,6 +5,10 @@ use crate::render::{self, FractalPipeline, Uniforms};
 const PANEL_WIDTH: f32 = 286.0;
 const HEADER_HEIGHT: f32 = 33.0;
 const PANE_GAP: f32 = 6.0;
+/// Trackpad pinch is reported every frame as a multiplicative scale. Applying
+/// it one-for-one feels abrupt on a high-resolution trackpad, so temper it
+/// without introducing lag or accumulating hidden state.
+const PINCH_SENSITIVITY: f64 = 0.65;
 
 const BG: egui::Color32 = egui::Color32::from_rgb(10, 13, 18);
 const PANEL: egui::Color32 = egui::Color32::from_rgb(22, 24, 29);
@@ -53,12 +57,15 @@ impl PlaneView {
         self.centre[1] += delta.y as f64 * units_per_point;
     }
 
-    fn zoom_at(&mut self, rect: egui::Rect, position: egui::Pos2, factor: f64) {
-        let before = self.point_at(rect, position);
+    fn zoom(&mut self, factor: f64) {
         self.half_height = (self.half_height * factor).clamp(1e-14, 1e6);
-        let after = self.point_at(rect, position);
-        self.centre[0] += before[0] - after[0];
-        self.centre[1] += before[1] - after[1];
+    }
+
+    fn zoom_from(&mut self, focus: Option<[f64; 2]>, factor: f64) {
+        if let Some(focus) = focus {
+            self.centre = focus;
+        }
+        self.zoom(factor);
     }
 
     fn magnification(&self) -> f64 {
@@ -75,6 +82,7 @@ pub struct App {
     palette_phase: f32,
     smooth: bool,
     grid: bool,
+    zoom_focus: [Option<[f64; 2]>; 2],
     frame_ms: f32,
     frame_start: Instant,
 }
@@ -102,6 +110,7 @@ impl App {
             palette_phase: 0.0,
             smooth: true,
             grid: false,
+            zoom_focus: [None, None],
             frame_ms: 0.0,
             frame_start: Instant::now(),
         })
@@ -130,16 +139,24 @@ impl App {
             });
 
             section(ui, "Selected parameter", |ui| {
-                coordinate_row(ui, "Re(c)", &mut self.julia_c[0]);
-                coordinate_row(ui, "Im(c)", &mut self.julia_c[1]);
+                let mut parameter_changed = false;
+                parameter_changed |= coordinate_row(ui, "Re(c)", &mut self.julia_c[0]);
+                parameter_changed |= coordinate_row(ui, "Im(c)", &mut self.julia_c[1]);
                 ui.horizontal(|ui| {
-                    preset_button(ui, "Seahorse", [-0.745, 0.113], &mut self.julia_c);
-                    preset_button(ui, "Dendrite", [0.0, 1.0], &mut self.julia_c);
+                    parameter_changed |=
+                        preset_button(ui, "Seahorse", [-0.745, 0.113], &mut self.julia_c);
+                    parameter_changed |=
+                        preset_button(ui, "Dendrite", [0.0, 1.0], &mut self.julia_c);
                 });
                 ui.horizontal(|ui| {
-                    preset_button(ui, "Rabbit", [-0.123, 0.745], &mut self.julia_c);
-                    preset_button(ui, "Basilica", [-1.0, 0.0], &mut self.julia_c);
+                    parameter_changed |=
+                        preset_button(ui, "Rabbit", [-0.123, 0.745], &mut self.julia_c);
+                    parameter_changed |=
+                        preset_button(ui, "Basilica", [-1.0, 0.0], &mut self.julia_c);
                 });
+                if parameter_changed {
+                    self.reframe_dynamical_plane();
+                }
             });
 
             section(ui, "Computation", |ui| {
@@ -166,6 +183,18 @@ impl App {
                 );
             });
 
+            section(ui, "View status", |ui| {
+                zoom_row(ui, "Parameter", self.parameter.magnification());
+                zoom_row(ui, "Julia", self.dynamical.magnification());
+                ui.label(
+                    egui::RichText::new(
+                        "Pane headers warn when f32 can no longer distinguish adjacent pixels.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+            });
+
             section(ui, "Display", |ui| {
                 ui.checkbox(&mut self.smooth, "Smooth escape-time colouring");
                 ui.checkbox(&mut self.grid, "Coordinate grid");
@@ -178,18 +207,22 @@ impl App {
             });
 
             section(ui, "Navigation", |ui| {
-                ui.label(egui::RichText::new("Drag to pan · wheel to zoom").color(TEXT));
+                ui.label(egui::RichText::new("Click: centre + ×2 zoom").color(TEXT));
                 ui.label(
-                    egui::RichText::new("Click the parameter plane to choose c.")
-                        .small()
-                        .color(MUTED),
+                    egui::RichText::new(
+                        "Wheel or pinch to zoom. Drag to pan. Left clicks also choose c.",
+                    )
+                    .small()
+                    .color(MUTED),
                 );
                 ui.horizontal(|ui| {
                     if ui.button("Reset parameter").clicked() {
                         self.parameter.reset_parameter();
+                        self.zoom_focus[0] = None;
                     }
                     if ui.button("Reset Julia").clicked() {
                         self.dynamical.reset_dynamical();
+                        self.zoom_focus[1] = None;
                     }
                 });
             });
@@ -238,9 +271,9 @@ impl App {
         );
 
         let (title, subtitle) = if pane == 0 {
-            ("PARAMETER PLANE", "c ↦ bounded critical orbit")
+            ("PARAMETER PLANE", "c -> bounded critical orbit")
         } else {
-            ("DYNAMICAL PLANE", "z ↦ z² + c")
+            ("DYNAMICAL PLANE", "z -> z^2 + c")
         };
         let magnification = if pane == 0 {
             self.parameter.magnification()
@@ -255,46 +288,82 @@ impl App {
             egui::FontId::new(11.0, egui::FontFamily::Monospace),
             TEXT,
         );
-        ui.painter().text(
-            egui::pos2(header.center().x, header.center().y),
-            egui::Align2::CENTER_CENTER,
-            subtitle,
-            egui::FontId::new(11.0, egui::FontFamily::Proportional),
-            MUTED,
+        if outer.width() > 520.0 {
+            ui.painter().text(
+                egui::pos2(header.center().x, header.center().y),
+                egui::Align2::CENTER_CENTER,
+                subtitle,
+                egui::FontId::new(14.0, egui::FontFamily::Proportional),
+                egui::Color32::WHITE,
+            );
+        }
+        let f32_limited = view_is_f32_limited(
+            if pane == 0 {
+                &self.parameter
+            } else {
+                &self.dynamical
+            },
+            (pane == 1).then_some(self.julia_c),
+            viewport,
+            ui.ctx().pixels_per_point(),
         );
+        let zoom_colour = if f32_limited { CORAL } else { CREAM };
         ui.painter().text(
             egui::pos2(header.max.x - 10.0, header.center().y),
             egui::Align2::RIGHT_CENTER,
-            format!("×{magnification:.3e}"),
-            egui::FontId::new(10.5, egui::FontFamily::Monospace),
-            MUTED,
+            if f32_limited {
+                format!("F32 LIMIT  ·  ZOOM ×{magnification:.4e}")
+            } else {
+                format!("ZOOM ×{magnification:.4e}")
+            },
+            egui::FontId::new(11.0, egui::FontFamily::Monospace),
+            zoom_colour,
         );
 
         let response = ui.allocate_rect(viewport, egui::Sense::click_and_drag());
-        if response.dragged() {
+        let pinch_delta = ui.input(|input| input.zoom_delta());
+        let pinching = (pinch_delta - 1.0).abs() > 0.001;
+        if response.dragged() && !pinching {
             let delta = ui.input(|input| input.pointer.delta());
             if pane == 0 {
                 self.parameter.pan(viewport, delta);
             } else {
                 self.dynamical.pan(viewport, delta);
             }
+            self.zoom_focus[pane] = None;
         }
         if response.hovered() {
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-            if scroll.abs() > 0.0 {
-                if let Some(position) = response.hover_pos() {
-                    let factor = (-scroll as f64 * 0.0025).exp();
-                    if pane == 0 {
-                        self.parameter.zoom_at(viewport, position, factor);
-                    } else {
-                        self.dynamical.zoom_at(viewport, position, factor);
-                    }
+            let factor = if pinching {
+                Some(pinch_zoom_factor(pinch_delta))
+            } else if scroll.abs() > 0.0 {
+                Some((-scroll as f64 * 0.0025).exp())
+            } else {
+                None
+            };
+            if let Some(factor) = factor {
+                if pane == 0 {
+                    self.parameter.zoom_from(self.zoom_focus[0], factor);
+                } else {
+                    self.dynamical.zoom_from(self.zoom_focus[1], factor);
                 }
             }
         }
-        if pane == 0 && response.clicked() && !response.dragged() {
+        if response.clicked() && !response.dragged() {
             if let Some(position) = response.interact_pointer_pos() {
-                self.julia_c = self.parameter.point_at(viewport, position);
+                let point = if pane == 0 {
+                    self.parameter.point_at(viewport, position)
+                } else {
+                    self.dynamical.point_at(viewport, position)
+                };
+                self.zoom_focus[pane] = Some(point);
+                if pane == 0 {
+                    self.julia_c = point;
+                    self.parameter.zoom_from(Some(point), 0.5);
+                    self.reframe_dynamical_plane();
+                } else {
+                    self.dynamical.zoom_from(Some(point), 0.5);
+                }
             }
         }
 
@@ -318,17 +387,27 @@ impl App {
         );
         ui.painter().add(render::callback(viewport, pane, uniforms));
 
-        if pane == 0 {
-            self.draw_parameter_marker(ui, viewport);
+        if let Some(focus) = self.zoom_focus[pane] {
+            self.draw_focus_marker(ui, viewport, &view, focus);
         }
         self.draw_readout(ui, viewport, response.hover_pos(), &view);
     }
 
-    fn draw_parameter_marker(&self, ui: &egui::Ui, rect: egui::Rect) {
+    fn reframe_dynamical_plane(&mut self) {
+        self.dynamical.reset_dynamical();
+        self.zoom_focus[1] = None;
+    }
+
+    fn draw_focus_marker(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        view: &PlaneView,
+        focus: [f64; 2],
+    ) {
         let aspect = rect.width() as f64 / rect.height().max(1.0) as f64;
-        let nx =
-            (self.julia_c[0] - self.parameter.centre[0]) / (self.parameter.half_height * aspect);
-        let ny = (self.julia_c[1] - self.parameter.centre[1]) / self.parameter.half_height;
+        let nx = (focus[0] - view.centre[0]) / (view.half_height * aspect);
+        let ny = (focus[1] - view.centre[1]) / view.half_height;
         let position = egui::pos2(
             rect.center().x + nx as f32 * rect.width() * 0.5,
             rect.center().y - ny as f32 * rect.height() * 0.5,
@@ -350,11 +429,23 @@ impl App {
         let Some(pointer) = pointer.filter(|position| rect.contains(*position)) else {
             return;
         };
-        let world = view.point_at(rect, pointer);
-        let text = format!("{:+.9}  {:+.9}i", world[0], world[1]);
+        let sample = coordinate_sample(view, rect, pointer, ui.ctx().pixels_per_point());
+        let text = format!(
+            "NAV f64    {:+.15e}  {:+.15e}i\n\
+             GPU f32    {:+.15e}  {:+.15e}i\n\
+             Δ GPU-NAV  {:+.3e}  {:+.3e}i\n\
+             PIXEL Δz   {:.3e}",
+            sample.navigation[0],
+            sample.navigation[1],
+            sample.rendered[0],
+            sample.rendered[1],
+            sample.delta[0],
+            sample.delta[1],
+            sample.world_per_pixel,
+        );
         let galley = ui.painter().layout_no_wrap(
             text,
-            egui::FontId::new(10.5, egui::FontFamily::Monospace),
+            egui::FontId::new(12.0, egui::FontFamily::Monospace),
             TEXT,
         );
         let box_rect = egui::Rect::from_min_size(
@@ -455,7 +546,7 @@ fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.separator();
 }
 
-fn coordinate_row(ui: &mut egui::Ui, label: &str, value: &mut f64) {
+fn coordinate_row(ui: &mut egui::Ui, label: &str, value: &mut f64) -> bool {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).monospace().color(MUTED));
         ui.add(
@@ -463,13 +554,113 @@ fn coordinate_row(ui: &mut egui::Ui, label: &str, value: &mut f64) {
                 .speed(0.0001)
                 .range(-2.0..=2.0)
                 .max_decimals(12),
-        );
+        )
+        .changed()
+    })
+    .inner
+}
+
+fn zoom_row(ui: &mut egui::Ui, label: &str, magnification: f64) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).color(MUTED));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(format!("×{magnification:.6e}"))
+                    .monospace()
+                    .color(CREAM),
+            );
+        });
     });
 }
 
-fn preset_button(ui: &mut egui::Ui, label: &str, c: [f64; 2], selected: &mut [f64; 2]) {
+fn f32_spacing(value: f64) -> f64 {
+    let value = (value as f32).abs();
+    if value == 0.0 {
+        return f32::from_bits(1) as f64;
+    }
+    (f32::from_bits(value.to_bits() + 1) - value) as f64
+}
+
+fn pinch_zoom_factor(zoom_delta: f32) -> f64 {
+    // Spreading fingers reports >1 and should reduce half-height (zoom in).
+    // Clamp a single frame so an OS gesture spike cannot discard the view.
+    (zoom_delta as f64).clamp(0.5, 2.0).powf(-PINCH_SENSITIVITY)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CoordinateSample {
+    navigation: [f64; 2],
+    rendered: [f64; 2],
+    delta: [f64; 2],
+    world_per_pixel: f64,
+}
+
+fn coordinate_sample(
+    view: &PlaneView,
+    rect: egui::Rect,
+    pointer: egui::Pos2,
+    pixels_per_point: f32,
+) -> CoordinateSample {
+    let ppp = pixels_per_point.max(1e-6) as f64;
+    let width = (rect.width() as f64 * ppp).round().max(1.0);
+    let height = (rect.height() as f64 * ppp).round().max(1.0);
+    // Report the fragment that is actually shaded, not an infinitely precise
+    // point between pixels. Pixel centres are half-integer physical positions.
+    let pixel_x = (((pointer.x - rect.min.x) as f64 * ppp).floor() + 0.5).clamp(0.5, width - 0.5);
+    let pixel_y = (((pointer.y - rect.min.y) as f64 * ppp).floor() + 0.5).clamp(0.5, height - 0.5);
+    let local = [
+        (2.0 * pixel_x - width) / height,
+        1.0 - 2.0 * pixel_y / height,
+    ];
+
+    let navigation = [
+        view.centre[0] + local[0] * view.half_height,
+        view.centre[1] + local[1] * view.half_height,
+    ];
+    // Mirror the WGSL expression after each uniform and interpolant has been
+    // rounded to f32. Back-convert only for display and delta calculation.
+    let scale = view.half_height as f32;
+    let rendered = [
+        (view.centre[0] as f32 + local[0] as f32 * scale) as f64,
+        (view.centre[1] as f32 + local[1] as f32 * scale) as f64,
+    ];
+    let delta = [rendered[0] - navigation[0], rendered[1] - navigation[1]];
+
+    CoordinateSample {
+        navigation,
+        rendered,
+        delta,
+        world_per_pixel: 2.0 * view.half_height / height,
+    }
+}
+
+fn view_is_f32_limited(
+    view: &PlaneView,
+    dynamics_parameter: Option<[f64; 2]>,
+    rect: egui::Rect,
+    pixels_per_point: f32,
+) -> bool {
+    let physical_height = (rect.height() * pixels_per_point).max(1.0) as f64;
+    let world_per_pixel = 2.0 * view.half_height / physical_height;
+    let mut arithmetic_spacing = f32_spacing(view.centre[0]).max(f32_spacing(view.centre[1]));
+    if let Some(c) = dynamics_parameter {
+        // In a Julia iteration, small spatial differences eventually meet the
+        // much larger fixed c in z²+c. Include c's spacing so a view centred
+        // near zero does not incorrectly claim unlimited useful precision.
+        arithmetic_spacing = arithmetic_spacing
+            .max(f32_spacing(c[0]))
+            .max(f32_spacing(c[1]));
+    }
+    // Warn before adjacent pixels fully collapse onto the same f32 value.
+    arithmetic_spacing >= world_per_pixel * 0.5
+}
+
+fn preset_button(ui: &mut egui::Ui, label: &str, c: [f64; 2], selected: &mut [f64; 2]) -> bool {
     if ui.small_button(label).clicked() {
         *selected = c;
+        true
+    } else {
+        false
     }
 }
 
@@ -489,14 +680,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zoom_keeps_the_point_under_the_cursor_fixed() {
+    fn click_target_can_recentre_and_zoom_two_times() {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let pointer = egui::pos2(625.0, 172.0);
         let mut view = PlaneView::new([-0.5, 0.0], 1.45);
-        let before = view.point_at(rect, pointer);
-        view.zoom_at(rect, pointer, 0.4);
-        let after = view.point_at(rect, pointer);
-        assert!((before[0] - after[0]).abs() < 1e-12);
-        assert!((before[1] - after[1]).abs() < 1e-12);
+        let selected = view.point_at(rect, pointer);
+        view.zoom_from(Some(selected), 0.5);
+        assert_eq!(view.centre, selected);
+        assert!((view.half_height - 0.725).abs() < 1e-12);
+    }
+
+    #[test]
+    fn zoom_preserves_the_chosen_centre() {
+        let mut view = PlaneView::new([-0.745, 0.113], 1.45);
+        let centre = view.centre;
+        view.zoom_from(None, 0.4);
+        assert_eq!(view.centre, centre);
+        assert!((view.half_height - 0.58).abs() < 1e-12);
+    }
+
+    #[test]
+    fn first_zoom_uses_the_selected_focus() {
+        let mut view = PlaneView::new([-0.5, 0.0], 1.45);
+        let focus = [-0.745, 0.113];
+        view.zoom_from(Some(focus), 0.5);
+        assert_eq!(view.centre, focus);
+        assert!((view.half_height - 0.725).abs() < 1e-12);
+    }
+
+    #[test]
+    fn f32_limit_warning_tracks_world_units_per_pixel() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let ordinary = PlaneView::new([-0.745, 0.113], 1.45);
+        let deep = PlaneView::new([-0.745, 0.113], 1.45e-8);
+        assert!(!view_is_f32_limited(&ordinary, None, rect, 2.0));
+        assert!(view_is_f32_limited(&deep, None, rect, 2.0));
+    }
+
+    #[test]
+    fn julia_warning_accounts_for_the_fixed_parameter() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let near_zero = PlaneView::new([0.0, 0.0], 1.45e-8);
+        assert!(!view_is_f32_limited(&near_zero, None, rect, 2.0));
+        assert!(view_is_f32_limited(
+            &near_zero,
+            Some([-0.745, 0.113]),
+            rect,
+            2.0,
+        ));
+    }
+
+    #[test]
+    fn coordinate_sample_reports_f32_rounding_and_pixel_scale() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let view = PlaneView::new([-0.745123456789, 0.113987654321], 1.45e-5);
+        let sample = coordinate_sample(&view, rect, rect.center(), 2.0);
+        assert_eq!(sample.rendered[0], sample.navigation[0] as f32 as f64);
+        assert_eq!(sample.rendered[1], sample.navigation[1] as f32 as f64);
+        assert_eq!(sample.delta[0], sample.rendered[0] - sample.navigation[0]);
+        assert_eq!(sample.delta[1], sample.rendered[1] - sample.navigation[1]);
+        assert!((sample.world_per_pixel - 2.0 * 1.45e-5 / 1200.0).abs() < 1e-18);
+    }
+
+    #[test]
+    fn pinch_direction_and_sensitivity_are_predictable() {
+        assert!(pinch_zoom_factor(1.2) < 1.0);
+        assert!(pinch_zoom_factor(0.8) > 1.0);
+        assert_eq!(pinch_zoom_factor(1.0), 1.0);
+        assert!(pinch_zoom_factor(2.0) > 0.5);
     }
 }

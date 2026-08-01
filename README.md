@@ -18,7 +18,7 @@ runs entirely in WGSL.
 
 - Linked Mandelbrot parameter plane and Julia dynamical plane
 - Click-to-select the Julia parameter
-- Cursor-centred zoom and drag navigation in either plane
+- Click-to-centre 2× zoom and drag navigation in either plane
 - Adjustable iteration limit, bailout, palette phase and smooth colouring
 - Optional scale-aware coordinate grid
 - Live coordinate and magnification readouts
