@@ -22,6 +22,9 @@ runs entirely in WGSL.
 - Adjustable iteration limit, bailout, palette phase and smooth colouring
 - Optional scale-aware coordinate grid
 - Live coordinate and magnification readouts
+- Versioned JSON experiment documents with cross-platform copy/paste import and export
+- Cached `f64` critical-orbit inspector with escape and parameter-sensitivity diagnostics
+- Synchronized critical-orbit trajectory and selected-step overlay in the Julia plane
 - Automatic GPU precision switching between fast `f32` and a centred
   double-single recurrence with adaptive per-pixel rebasing (approximately
   48-bit reference coordinates)
@@ -96,12 +99,20 @@ cargo test
 cargo check --target wasm32-unknown-unknown
 ```
 
+## Experiment documents
+
+Open **Document → Export / Import JSON** to capture the complete reproducible
+experiment state. The versioned document records the quadratic family, both
+plane centres and scales, the selected parameter, computation limits, and
+display settings. Runtime diagnostics and frame timing are deliberately not
+stored. Copy the JSON to export it; paste another IteraScope document into the
+editor and choose **Load JSON** to import it.
+
 ## Near-term roadmap
 
-1. Deterministic experiment documents and view import/export
-2. Orbit inspector and critical-orbit diagnostics
-3. Perturbation with a small arbitrary-precision CPU reference orbit
-4. Period detection, multipliers and Newton refinement
+1. Perturbation with a small arbitrary-precision CPU reference orbit
+2. Period detection, multipliers and Newton refinement
+3. Exportable orbit data and scientific reports
 
 ## Project status
 

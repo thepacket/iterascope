@@ -1,5 +1,10 @@
 use web_time::Instant;
 
+use crate::experiment::{
+    ComplexDocument, ComputationDocument, DisplayDocument, ExperimentDocument, PlaneDocument,
+    FAMILY_ID, FORMAT_ID, FORMAT_VERSION,
+};
+use crate::orbit::{CriticalOrbit, CriticalOrbitCache, OrbitInput};
 use crate::precision::{
     DoubleSingle, DsValidity, PathProbeResult, PrecisionMode, ProbeCache, ProbeInput, ProbeResult,
     ValidityLevel,
@@ -65,6 +70,12 @@ impl PlaneView {
         self.centre[1] += delta.y as f64 * units_per_point;
     }
 
+    fn pan_tenth(&mut self, rect: egui::Rect, delta: [f64; 2]) {
+        let aspect = rect.width() as f64 / rect.height().max(1.0) as f64;
+        self.centre[0] += delta[0] * 0.2 * self.half_height * aspect;
+        self.centre[1] += delta[1] * 0.2 * self.half_height;
+    }
+
     fn zoom(&mut self, factor: f64) {
         self.half_height = (self.half_height * factor).clamp(1e-14, 1e6);
     }
@@ -91,6 +102,15 @@ pub struct App {
     smooth: bool,
     grid: bool,
     zoom_focus: [Option<[f64; 2]>; 2],
+    active_pane: usize,
+    pending_pan_steps: [f64; 2],
+    experiment_editor_open: bool,
+    experiment_json: String,
+    experiment_message: Option<(String, bool)>,
+    orbit_inspector_open: bool,
+    show_orbit_overlay: bool,
+    orbit_step: usize,
+    orbit_cache: CriticalOrbitCache,
     precision_modes: [PrecisionMode; 2],
     ds_validity: [DsValidity; 2],
     probes: [ProbeCache; 2],
@@ -122,6 +142,15 @@ impl App {
             smooth: true,
             grid: false,
             zoom_focus: [None, None],
+            active_pane: 0,
+            pending_pan_steps: [0.0; 2],
+            experiment_editor_open: false,
+            experiment_json: String::new(),
+            experiment_message: None,
+            orbit_inspector_open: false,
+            show_orbit_overlay: true,
+            orbit_step: 0,
+            orbit_cache: CriticalOrbitCache::default(),
             precision_modes: [PrecisionMode::F32; 2],
             ds_validity: [DsValidity::default(); 2],
             probes: [ProbeCache::default(); 2],
@@ -148,6 +177,20 @@ impl App {
                     egui::RichText::new(
                         "Select c in the parameter plane to inspect its dynamical plane.",
                     )
+                    .color(MUTED),
+                );
+            });
+
+            section(ui, "Document", |ui| {
+                if ui.button("Export / Import JSON").clicked() {
+                    self.refresh_experiment_json();
+                    self.experiment_editor_open = true;
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Versioned experiment documents reproduce both views and their scientific settings.",
+                    )
+                    .small()
                     .color(MUTED),
                 );
             });
@@ -203,6 +246,60 @@ impl App {
                 );
             });
 
+            let orbit_input = OrbitInput {
+                c: self.julia_c,
+                iterations: self.iterations,
+                bailout: self.bailout as f64,
+            };
+            let orbit = self.orbit_cache.update(orbit_input);
+            let orbit_status = match orbit.escape_iteration {
+                Some(iteration) => format!("Critical orbit escapes at n = {iteration}"),
+                None => format!("No escape through n = {}", orbit.last_iteration()),
+            };
+            let orbit_last = orbit.last_iteration();
+            let orbit_colour = if orbit.escape_iteration.is_some() {
+                CREAM
+            } else {
+                BLUE
+            };
+            let mut orbit_step = self.orbit_step.min(orbit_last);
+            let mut show_orbit_overlay = self.show_orbit_overlay;
+            let mut open_orbit_inspector = false;
+            let mut centre_on_orbit_step = false;
+            section(ui, "Critical orbit", |ui| {
+                ui.label(egui::RichText::new(orbit_status).color(orbit_colour));
+                ui.checkbox(&mut show_orbit_overlay, "Show in Julia plane");
+                ui.horizontal(|ui| {
+                    if ui.button("<").on_hover_text("Previous orbit point").clicked() {
+                        orbit_step = orbit_step.saturating_sub(1);
+                    }
+                    if ui.button(">").on_hover_text("Next orbit point").clicked() {
+                        orbit_step = (orbit_step + 1).min(orbit_last);
+                    }
+                    ui.monospace(format!("z_{orbit_step}"));
+                });
+                ui.add(egui::Slider::new(&mut orbit_step, 0..=orbit_last).text("iteration n"));
+                if ui.button("Center Julia on selected z_n").clicked() {
+                    centre_on_orbit_step = true;
+                }
+                if ui.button("Inspect orbit").clicked() {
+                    open_orbit_inspector = true;
+                }
+                ui.label(
+                    egui::RichText::new("f64 diagnostic for z_0 = 0 and z_(n+1) = z_n^2 + c.")
+                        .small()
+                        .color(MUTED),
+                );
+            });
+            self.orbit_step = orbit_step;
+            self.show_orbit_overlay = show_orbit_overlay;
+            self.orbit_inspector_open |= open_orbit_inspector;
+            if centre_on_orbit_step {
+                let orbit = self.orbit_cache.update(orbit_input);
+                self.dynamical.centre = orbit.points[orbit_step].z;
+                self.zoom_focus[1] = None;
+            }
+
             section(ui, "View status", |ui| {
                 zoom_row(ui, "Parameter", self.parameter.magnification());
                 zoom_row(ui, "Julia", self.dynamical.magnification());
@@ -247,6 +344,33 @@ impl App {
                     .small()
                     .color(MUTED),
                 );
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Fine pan target").color(TEXT));
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.active_pane, 0, "Parameter");
+                    ui.selectable_value(&mut self.active_pane, 1, "Julia");
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("<").on_hover_text("Pan view left by 1/10").clicked() {
+                        self.pending_pan_steps[0] -= 1.0;
+                    }
+                    if ui.button("^").on_hover_text("Pan view up by 1/10").clicked() {
+                        self.pending_pan_steps[1] += 1.0;
+                    }
+                    if ui.button("v").on_hover_text("Pan view down by 1/10").clicked() {
+                        self.pending_pan_steps[1] -= 1.0;
+                    }
+                    if ui.button(">").on_hover_text("Pan view right by 1/10").clicked() {
+                        self.pending_pan_steps[0] += 1.0;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Buttons and arrow keys pan by 1/10 of the displayed range. Hover a pane or select its target above.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
                 ui.horizontal(|ui| {
                     if ui.button("Reset parameter").clicked() {
                         self.parameter.reset_parameter();
@@ -259,6 +383,171 @@ impl App {
                 });
             });
         });
+    }
+
+    fn experiment_document(&self) -> ExperimentDocument {
+        ExperimentDocument {
+            format: FORMAT_ID.to_owned(),
+            version: FORMAT_VERSION,
+            family: FAMILY_ID.to_owned(),
+            parameter_plane: PlaneDocument {
+                centre: ComplexDocument {
+                    re: self.parameter.centre[0],
+                    im: self.parameter.centre[1],
+                },
+                half_height: self.parameter.half_height,
+            },
+            dynamical_plane: PlaneDocument {
+                centre: ComplexDocument {
+                    re: self.dynamical.centre[0],
+                    im: self.dynamical.centre[1],
+                },
+                half_height: self.dynamical.half_height,
+            },
+            parameter_c: ComplexDocument {
+                re: self.julia_c[0],
+                im: self.julia_c[1],
+            },
+            computation: ComputationDocument {
+                iterations: self.iterations,
+                bailout: self.bailout,
+            },
+            display: DisplayDocument {
+                smooth_escape_time: self.smooth,
+                coordinate_grid: self.grid,
+                palette_phase: self.palette_phase,
+                critical_orbit_overlay: self.show_orbit_overlay,
+            },
+        }
+    }
+
+    fn refresh_experiment_json(&mut self) {
+        match self.experiment_document().to_pretty_json() {
+            Ok(json) => {
+                self.experiment_json = json;
+                self.experiment_message = None;
+            }
+            Err(error) => self.experiment_message = Some((error, true)),
+        }
+    }
+
+    fn apply_experiment(&mut self, document: ExperimentDocument) {
+        self.parameter = PlaneView::new(
+            [
+                document.parameter_plane.centre.re,
+                document.parameter_plane.centre.im,
+            ],
+            document.parameter_plane.half_height,
+        );
+        self.dynamical = PlaneView::new(
+            [
+                document.dynamical_plane.centre.re,
+                document.dynamical_plane.centre.im,
+            ],
+            document.dynamical_plane.half_height,
+        );
+        self.julia_c = [document.parameter_c.re, document.parameter_c.im];
+        self.iterations = document.computation.iterations;
+        self.bailout = document.computation.bailout;
+        self.smooth = document.display.smooth_escape_time;
+        self.grid = document.display.coordinate_grid;
+        self.palette_phase = document.display.palette_phase;
+        self.show_orbit_overlay = document.display.critical_orbit_overlay;
+
+        self.zoom_focus = [None, None];
+        self.pending_pan_steps = [0.0; 2];
+        self.orbit_step = 0;
+        self.precision_modes = [PrecisionMode::F32; 2];
+        self.ds_validity = [DsValidity::default(); 2];
+        self.probes = [ProbeCache::default(); 2];
+    }
+
+    fn experiment_editor(&mut self, ctx: &egui::Context) {
+        if !self.experiment_editor_open {
+            return;
+        }
+
+        let mut open = self.experiment_editor_open;
+        let mut close_requested = false;
+        egui::Window::new("Experiment document")
+            .open(&mut open)
+            .default_width(680.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("IteraScope JSON · format version 1")
+                        .monospace()
+                        .color(CREAM),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Copy this document to export it. To import, replace the text with another IteraScope document and choose Load JSON.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.experiment_json)
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(22),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh current").clicked() {
+                        self.refresh_experiment_json();
+                    }
+                    if ui.button("Copy JSON").clicked() {
+                        ui.ctx().copy_text(self.experiment_json.clone());
+                        self.experiment_message = Some(("JSON copied to clipboard".to_owned(), false));
+                    }
+                    if ui.button("Load JSON").clicked() {
+                        match ExperimentDocument::from_json(&self.experiment_json) {
+                            Ok(document) => {
+                                self.apply_experiment(document);
+                                self.experiment_message =
+                                    Some(("Experiment loaded".to_owned(), false));
+                            }
+                            Err(error) => {
+                                self.experiment_message = Some((format!("Import failed: {error}"), true));
+                            }
+                        }
+                    }
+                    if ui.button("Close").clicked() {
+                        close_requested = true;
+                    }
+                });
+                if let Some((message, error)) = &self.experiment_message {
+                    let colour = if *error { CORAL } else { BLUE };
+                    ui.label(egui::RichText::new(message).color(colour));
+                }
+            });
+        self.experiment_editor_open = open && !close_requested;
+    }
+
+    fn orbit_inspector(&mut self, ctx: &egui::Context) {
+        if !self.orbit_inspector_open {
+            return;
+        }
+
+        let input = OrbitInput {
+            c: self.julia_c,
+            iterations: self.iterations,
+            bailout: self.bailout as f64,
+        };
+        let orbit = self.orbit_cache.update(input);
+        let centre_request = show_orbit_inspector(
+            ctx,
+            orbit,
+            input.c,
+            &mut self.orbit_step,
+            &mut self.orbit_inspector_open,
+        );
+        if let Some(centre) = centre_request {
+            self.dynamical.centre = centre;
+            self.zoom_focus[1] = None;
+        }
     }
 
     fn workspace(&mut self, ui: &mut egui::Ui) {
@@ -324,9 +613,42 @@ impl App {
             );
         }
         let response = ui.allocate_rect(viewport, egui::Sense::click_and_drag());
+        if response.hovered() {
+            self.active_pane = pane;
+        }
         let pinch_delta = ui.input(|input| input.zoom_delta());
         let pinching = (pinch_delta - 1.0).abs() > 0.001;
         let mut interacting = pinching || response.dragged();
+
+        let mut fine_pan = [0.0; 2];
+        if pane == self.active_pane {
+            fine_pan = self.pending_pan_steps;
+            self.pending_pan_steps = [0.0; 2];
+            if !ui.ctx().egui_wants_keyboard_input() {
+                let keyboard_pan = ui.input(|input| {
+                    [
+                        (input.key_pressed(egui::Key::ArrowRight) as i8
+                            - input.key_pressed(egui::Key::ArrowLeft) as i8)
+                            as f64,
+                        (input.key_pressed(egui::Key::ArrowUp) as i8
+                            - input.key_pressed(egui::Key::ArrowDown) as i8)
+                            as f64,
+                    ]
+                });
+                fine_pan[0] += keyboard_pan[0];
+                fine_pan[1] += keyboard_pan[1];
+            }
+        }
+        if fine_pan != [0.0; 2] {
+            interacting = true;
+            if pane == 0 {
+                self.parameter.pan_tenth(viewport, fine_pan);
+            } else {
+                self.dynamical.pan_tenth(viewport, fine_pan);
+            }
+            self.zoom_focus[pane] = None;
+        }
+
         if response.dragged() && !pinching {
             let delta = ui.input(|input| input.pointer.delta());
             if pane == 0 {
@@ -448,6 +770,17 @@ impl App {
         );
         ui.painter().add(render::callback(viewport, pane, uniforms));
 
+        if pane == 1 && self.show_orbit_overlay {
+            let orbit = self.orbit_cache.update(OrbitInput {
+                c: self.julia_c,
+                iterations: self.iterations,
+                bailout: self.bailout as f64,
+            });
+            let selected = self.orbit_step.min(orbit.last_iteration());
+            self.orbit_step = selected;
+            draw_orbit_overlay(ui, viewport, &view, orbit, selected);
+        }
+
         if let Some(focus) = self.zoom_focus[pane] {
             self.draw_focus_marker(ui, viewport, &view, focus);
         }
@@ -457,6 +790,7 @@ impl App {
     fn reframe_dynamical_plane(&mut self) {
         self.dynamical.reset_dynamical();
         self.zoom_focus[1] = None;
+        self.orbit_step = 0;
     }
 
     fn draw_focus_marker(
@@ -525,6 +859,287 @@ impl App {
     }
 }
 
+fn complex_to_screen(view: &PlaneView, rect: egui::Rect, z: [f64; 2]) -> Option<egui::Pos2> {
+    if !z[0].is_finite() || !z[1].is_finite() || view.half_height <= 0.0 {
+        return None;
+    }
+    let aspect = rect.width() as f64 / rect.height().max(1.0) as f64;
+    let nx = (z[0] - view.centre[0]) / (view.half_height * aspect);
+    let ny = (z[1] - view.centre[1]) / view.half_height;
+    if !nx.is_finite() || !ny.is_finite() || nx.abs() > 8.0 || ny.abs() > 8.0 {
+        return None;
+    }
+    Some(egui::pos2(
+        rect.center().x + nx as f32 * rect.width() * 0.5,
+        rect.center().y - ny as f32 * rect.height() * 0.5,
+    ))
+}
+
+fn draw_orbit_overlay(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    view: &PlaneView,
+    orbit: &CriticalOrbit,
+    selected: usize,
+) {
+    if orbit.points.is_empty() {
+        return;
+    }
+    let painter = ui.painter_at(rect);
+    const ORBIT_TAIL_POINTS: usize = 9;
+    let trail_rgb = [255, 74, 190];
+    let trail_colour = egui::Color32::from_rgb(trail_rgb[0], trail_rgb[1], trail_rgb[2]);
+    let trail_shadow = egui::Color32::from_rgba_unmultiplied(5, 8, 12, 210);
+    let visible_range = orbit_tail_range(orbit.points.len(), selected, ORBIT_TAIL_POINTS);
+    let visible_points = &orbit.points[visible_range];
+    let fade_denominator = visible_points.len().saturating_sub(1).max(1) as f32;
+
+    for (index, pair) in visible_points.windows(2).enumerate() {
+        if let (Some(from), Some(to)) = (
+            complex_to_screen(view, rect, pair[0].z),
+            complex_to_screen(view, rect, pair[1].z),
+        ) {
+            let age = (index + 1) as f32 / fade_denominator;
+            let alpha = (55.0 + 200.0 * age).round() as u8;
+            let colour = egui::Color32::from_rgba_unmultiplied(
+                trail_rgb[0],
+                trail_rgb[1],
+                trail_rgb[2],
+                alpha,
+            );
+            painter.line_segment([from, to], egui::Stroke::new(4.0, trail_shadow));
+            painter.line_segment([from, to], egui::Stroke::new(2.25, colour));
+        }
+    }
+
+    for (index, point) in visible_points.iter().enumerate() {
+        if let Some(position) = complex_to_screen(view, rect, point.z) {
+            if rect.contains(position) {
+                let age = index as f32 / fade_denominator;
+                let alpha = (80.0 + 175.0 * age).round() as u8;
+                let point_colour = egui::Color32::from_rgba_unmultiplied(
+                    trail_rgb[0],
+                    trail_rgb[1],
+                    trail_rgb[2],
+                    alpha,
+                );
+                let radius = if point.iteration as usize == selected {
+                    3.5
+                } else {
+                    2.5
+                };
+                painter.circle_filled(position, radius + 1.5, trail_shadow);
+                painter.circle_filled(position, radius, point_colour);
+            }
+        }
+    }
+
+    if let Some(escape) = orbit.escape_iteration {
+        if escape as usize <= selected {
+            if let Some(position) = complex_to_screen(view, rect, orbit.points[escape as usize].z) {
+                if rect.contains(position) {
+                    let offset = egui::vec2(5.0, 5.0);
+                    painter.line_segment(
+                        [position - offset, position + offset],
+                        egui::Stroke::new(2.0, CORAL),
+                    );
+                    painter.line_segment(
+                        [
+                            position + egui::vec2(-offset.x, offset.y),
+                            position + egui::vec2(offset.x, -offset.y),
+                        ],
+                        egui::Stroke::new(2.0, CORAL),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(point) = orbit.points.get(selected) {
+        if let Some(position) = complex_to_screen(view, rect, point.z) {
+            if rect.contains(position) {
+                painter.circle_filled(position, 4.0, CORAL);
+                painter.circle_stroke(position, 9.0, egui::Stroke::new(2.5, CREAM));
+                painter.text(
+                    position + egui::vec2(12.0, -11.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("z_{}", point.iteration),
+                    egui::FontId::new(11.0, egui::FontFamily::Monospace),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+    }
+
+    let badge = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), egui::vec2(112.0, 24.0));
+    painter.rect_filled(
+        badge,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(10, 13, 18, 220),
+    );
+    painter.rect_stroke(
+        badge,
+        3.0,
+        egui::Stroke::new(1.0, trail_colour),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        badge.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("ORBIT  z_{selected}"),
+        egui::FontId::new(11.0, egui::FontFamily::Monospace),
+        egui::Color32::WHITE,
+    );
+}
+
+fn orbit_tail_range(
+    point_count: usize,
+    selected: usize,
+    tail_points: usize,
+) -> std::ops::Range<usize> {
+    let end = selected.saturating_add(1).min(point_count);
+    let start = end.saturating_sub(tail_points.max(1));
+    start..end
+}
+
+fn show_orbit_inspector(
+    ctx: &egui::Context,
+    orbit: &CriticalOrbit,
+    c: [f64; 2],
+    selected_step: &mut usize,
+    open: &mut bool,
+) -> Option<[f64; 2]> {
+    let last = orbit.last_iteration();
+    *selected_step = (*selected_step).min(last);
+    let mut centre_request = None;
+
+    egui::Window::new("Critical orbit inspector")
+        .open(open)
+        .default_pos(egui::pos2(PANEL_WIDTH + 24.0, 52.0))
+        .default_size(egui::vec2(680.0, 700.0))
+        .max_width(760.0)
+        .max_height(760.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            ui.monospace(format!("c = {:+.17e} {:+.17e}i", c[0], c[1]));
+            match orbit.escape_iteration {
+                Some(iteration) => {
+                    ui.label(
+                        egui::RichText::new(format!("Escaped at iteration {iteration}"))
+                            .color(CREAM)
+                            .strong(),
+                    );
+                    if let Some(smooth) = orbit.smooth_escape_iteration {
+                        ui.label(
+                            egui::RichText::new(format!("Smooth escape iteration: {smooth:.12}"))
+                                .monospace()
+                                .color(TEXT),
+                        );
+                    }
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new(format!("No escape through iteration {last}"))
+                            .color(BLUE)
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Finite iteration does not prove that the orbit is bounded.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                }
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("|<").on_hover_text("First point").clicked() {
+                    *selected_step = 0;
+                }
+                if ui.button("<").on_hover_text("Previous point").clicked() {
+                    *selected_step = selected_step.saturating_sub(1);
+                }
+                if ui.button(">").on_hover_text("Next point").clicked() {
+                    *selected_step = (*selected_step + 1).min(last);
+                }
+                if ui
+                    .button(">|")
+                    .on_hover_text("Last computed point")
+                    .clicked()
+                {
+                    *selected_step = last;
+                }
+                if let Some(escape) = orbit.escape_iteration {
+                    if ui.button("Escape").clicked() {
+                        *selected_step = escape as usize;
+                    }
+                }
+            });
+            ui.add(egui::Slider::new(selected_step, 0..=last).text("iteration n"));
+
+            let point = orbit.points[*selected_step];
+            if ui.button("Center Julia view on z_n").clicked() {
+                centre_request = Some(point.z);
+            }
+            let derivative_magnitude =
+                point.parameter_derivative[0].hypot(point.parameter_derivative[1]);
+            egui::Grid::new("iterascope.orbit.point")
+                .num_columns(2)
+                .spacing([14.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("n");
+                    ui.monospace(point.iteration.to_string());
+                    ui.end_row();
+                    ui.label("Re(z_n)");
+                    ui.monospace(format!("{:+.17e}", point.z[0]));
+                    ui.end_row();
+                    ui.label("Im(z_n)");
+                    ui.monospace(format!("{:+.17e}", point.z[1]));
+                    ui.end_row();
+                    ui.label("|z_n|");
+                    ui.monospace(format!("{:.17e}", point.magnitude));
+                    ui.end_row();
+                    ui.label("arg(z_n)");
+                    ui.monospace(format!("{:+.17e} rad", point.z[1].atan2(point.z[0])));
+                    ui.end_row();
+                    ui.label("Re(dz_n/dc)");
+                    ui.monospace(format!("{:+.17e}", point.parameter_derivative[0]));
+                    ui.end_row();
+                    ui.label("Im(dz_n/dc)");
+                    ui.monospace(format!("{:+.17e}", point.parameter_derivative[1]));
+                    ui.end_row();
+                    ui.label("|dz_n/dc|");
+                    ui.monospace(format!("{:.17e}", derivative_magnitude));
+                    ui.end_row();
+                });
+
+            ui.separator();
+            ui.label(egui::RichText::new("Nearby orbit points").color(TEXT));
+            let start = selected_step.saturating_sub(3);
+            let end = (*selected_step + 4).min(orbit.points.len());
+            egui::Grid::new("iterascope.orbit.nearby")
+                .striped(true)
+                .spacing([12.0, 3.0])
+                .show(ui, |ui| {
+                    ui.strong("n");
+                    ui.strong("Re(z_n)");
+                    ui.strong("Im(z_n)");
+                    ui.strong("|z_n|");
+                    ui.end_row();
+                    for point in &orbit.points[start..end] {
+                        ui.monospace(point.iteration.to_string());
+                        ui.monospace(format!("{:+.9e}", point.z[0]));
+                        ui.monospace(format!("{:+.9e}", point.z[1]));
+                        ui.monospace(format!("{:.9e}", point.magnitude));
+                        ui.end_row();
+                    }
+                });
+        });
+    centre_request
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = Instant::now();
@@ -564,6 +1179,9 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG))
             .show(ui, |ui| self.workspace(ui));
+
+        self.experiment_editor(ui.ctx());
+        self.orbit_inspector(ui.ctx());
 
         ui.ctx().request_repaint();
     }
@@ -860,6 +1478,56 @@ mod tests {
         view.zoom_from(None, 0.4);
         assert_eq!(view.centre, centre);
         assert!((view.half_height - 0.58).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fine_pan_uses_tenths_of_the_displayed_range() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut view = PlaneView::new([-0.228_155_5, 1.115_143], 1.45e-8);
+        let original = view.centre;
+        let tenth_width = 2.0 * view.half_height * (800.0 / 600.0) * 0.1;
+        let tenth_height = 2.0 * view.half_height * 0.1;
+
+        view.pan_tenth(rect, [1.0, -1.0]);
+
+        assert!((view.centre[0] - (original[0] + tenth_width)).abs() < 1e-18);
+        assert!((view.centre[1] - (original[1] - tenth_height)).abs() < 1e-18);
+    }
+
+    #[test]
+    fn orbit_projection_matches_the_dynamical_view() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(800.0, 600.0));
+        let view = PlaneView::new([0.25, -0.5], 1.5);
+        let aspect = 800.0 / 600.0;
+
+        assert_eq!(
+            complex_to_screen(&view, rect, view.centre),
+            Some(rect.center())
+        );
+        assert_eq!(
+            complex_to_screen(
+                &view,
+                rect,
+                [view.centre[0] + view.half_height * aspect, view.centre[1]],
+            ),
+            Some(egui::pos2(rect.right(), rect.center().y)),
+        );
+        assert_eq!(
+            complex_to_screen(
+                &view,
+                rect,
+                [view.centre[0], view.centre[1] + view.half_height],
+            ),
+            Some(egui::pos2(rect.center().x, rect.top())),
+        );
+    }
+
+    #[test]
+    fn orbit_overlay_keeps_only_the_recent_tail() {
+        assert_eq!(orbit_tail_range(129, 0, 9), 0..1);
+        assert_eq!(orbit_tail_range(129, 7, 9), 0..8);
+        assert_eq!(orbit_tail_range(129, 27, 9), 19..28);
+        assert_eq!(orbit_tail_range(5, usize::MAX, 9), 0..5);
     }
 
     #[test]
