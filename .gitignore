@@ -1,0 +1,5 @@
+/target/
+/dist/
+/.trunk/
+.DS_Store
+*.log
