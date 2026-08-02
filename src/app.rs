@@ -1,5 +1,6 @@
 use web_time::Instant;
 
+use crate::arbitrary::ARBITRARY_HANDOFF_ZOOM;
 use crate::experiment::{
     ComplexDocument, ComputationDocument, DisplayDocument, ExperimentDocument, PlaneDocument,
     FAMILY_ID, FORMAT_ID, FORMAT_VERSION,
@@ -78,7 +79,8 @@ impl PlaneView {
     }
 
     fn zoom(&mut self, factor: f64) {
-        self.half_height = (self.half_height * factor).clamp(1e-14, 1e6);
+        let handoff_half_height = 1.45 / ARBITRARY_HANDOFF_ZOOM;
+        self.half_height = (self.half_height * factor).clamp(handoff_half_height, 1e6);
     }
 
     fn zoom_from(&mut self, focus: Option<[f64; 2]>, factor: f64) {

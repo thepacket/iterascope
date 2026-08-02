@@ -5,6 +5,7 @@
 //! uses, while the CPU only maintains the view and experiment parameters.
 
 mod app;
+pub mod arbitrary;
 mod experiment;
 mod orbit;
 mod precision;

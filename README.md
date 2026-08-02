@@ -70,14 +70,13 @@ orbit probe detects divergent escape behaviour. The `DS STABLE`, `DS RISK` and
 `DS LIMIT` labels describe agreement with sampled `f64` orbits and coordinate
 resolution—they are more meaningful than visual smoothness alone.
 
-The current view scale is clamped at a half-height of `1e-14`, corresponding to
-approximately `1.45e14×` magnification from the initial view. Reaching that
-number means reaching the present software ceiling, not proving every rendered
-pixel is numerically distinct. The next numerical architecture targets
-validated exploration through at least `1e1000×`: arbitrary-precision CPU
-coordinates and reference orbits paired with exponent-scaled GPU perturbation,
-glitch detection, and rebasing. CPU work will scale with reference precision
-and iteration count rather than pixel count.
+The current stable raster path hands off at the experimentally confirmed
+`1.14e14×` boundary. IteraScope now has pure-Rust arbitrary-precision decimal
+coordinates, a zoom-dependent precision policy and arbitrary-precision
+quadratic reference orbits sized for the `1e1000×` acceptance target. Connecting
+those reference orbits to exponent-scaled GPU perturbation is the next active
+step. CPU work scales with reference precision and iteration count rather than
+pixel count.
 
 ## Run natively
 
