@@ -21,7 +21,7 @@ runs entirely in WGSL.
 - Wheel, trackpad pinch and drag navigation in either plane
 - Keyboard arrows and four on-screen buttons for deterministic fine panning by
   one tenth of the displayed range
-- Adjustable iteration limit, bailout, palette phase and smooth colouring
+- Adjustable iteration limit up to 50,000, bailout, palette phase and smooth colouring
 - Optional scale-aware coordinate grid
 - Live magnification plus navigation, rendered-coordinate, rounding-delta and
   pixel-scale readouts
@@ -35,11 +35,7 @@ runs entirely in WGSL.
   48-bit reference coordinates)
 - A cached 3×3 CPU instability probe comparing both GPU arithmetic paths with
   `f64`, including adaptive rebasing and non-finite detection
-- Explicit `DS STABLE`, `DS RISK`, `DS COORD LIMIT`, `NAV LIMIT`, and
-  `RENDER LIMIT` states with diagnostic reasons
-- Cached `f64` reference orbits uploaded to WebGPU for parameter-plane
-  perturbation rendering, with cancellation and truncated-reference fallback
-  to the established DS path
+- Explicit `DS STABLE`, `DS RISK`, and `DS LIMIT` states with diagnostic reasons
 - Responsive side-by-side or stacked layout
 - Native and WASM entry points from the same codebase
 - Offline WGSL parsing and validation using the exact Naga version used by wgpu
@@ -71,38 +67,17 @@ The interface reports the active arithmetic for each pane. Navigation remains
 in CPU `f64`; rendering starts with fast GPU `f32` and switches automatically
 to GPU double-single when coordinate resolution is at risk or the lightweight
 orbit probe detects divergent escape behaviour. The `DS STABLE`, `DS RISK` and
-`DS COORD LIMIT` labels describe agreement with sampled `f64` orbits and
-coordinate resolution—they are more meaningful than visual smoothness alone.
-Julia views also promote around the visible critical point when `f32` could
-round the small `z²` correction out of `z² + c`, preventing a false bounded
-neighborhood around an exactly preperiodic orbit such as `c = i`.
+`DS LIMIT` labels describe agreement with sampled `f64` orbits and coordinate
+resolution—they are more meaningful than visual smoothness alone.
 
-At deep parameter-plane views, IteraScope computes one `f64` reference orbit on
-the CPU and uploads its high and low words to WebGPU. Fragments evolve `δc`, so
-the per-pixel recurrence remains on the GPU. The cached reference follows
-navigation immediately, preventing a deep view from temporarily flashing
-through a resolution-limited DS image. Detected cancellation or an exhausted
-reference rejects perturbation for the whole pane and uses the ordinary DS
-renderer consistently; mixed arithmetic regions are not displayed. The Julia
-plane retains the proven DS renderer until robust reference rebasing is
-available.
-
-The deep-zoom scale is capped at a half-height of `1e-16`, corresponding to
-approximately `1.45e16×` magnification from the initial view. Beyond this point
-the current Julia DS path can form a false bounded region that begins as a
-single black pixel and grows with further zoom, so IteraScope does not present
-that range as meaningful imagery.
-
-Below the cap, `NAV LIMIT` means a displayed pixel's world-space displacement
-is smaller than the spacing of the CPU `f64` centre. `RENDER LIMIT` is reserved
-for sampled orbit failures, non-finite arithmetic, classification disagreement,
-or a view scale that the GPU's two `f32` words can no longer carry. A DS
-coordinate-spacing warning remains conservative because the shader keeps pixel
-displacement separate from the larger reference coordinate.
-
-This first perturbation stage still uses `f64` reference coordinates.
-Arbitrary-precision navigation and references are subsequent stages. CPU
-reference work scales with iteration count rather than pixel count.
+The current view scale is clamped at a half-height of `1e-14`, corresponding to
+approximately `1.45e14×` magnification from the initial view. Reaching that
+number means reaching the present software ceiling, not proving every rendered
+pixel is numerically distinct. The next numerical architecture targets
+validated exploration through at least `1e1000×`: arbitrary-precision CPU
+coordinates and reference orbits paired with exponent-scaled GPU perturbation,
+glitch detection, and rebasing. CPU work will scale with reference precision
+and iteration count rather than pixel count.
 
 ## Run natively
 
@@ -175,10 +150,10 @@ live state is changed.
 
 ## Near-term roadmap
 
-1. Arbitrary-precision perturbation references, robust Julia reference
-   rebasing and perturbation-specific validity diagnostics
-2. Period detection, multipliers and Newton refinement
-3. Exportable orbit data and scientific reports
+1. Arbitrary-precision coordinates and reference orbits supporting the
+   `1e1000×` acceptance target
+2. Exponent-scaled GPU perturbation, glitch detection and automatic rebasing
+3. Deterministic validation against direct arbitrary-precision sample orbits
 
 ## Project status
 

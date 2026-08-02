@@ -7,8 +7,9 @@
 mod app;
 mod experiment;
 mod orbit;
-mod perturbation;
 mod precision;
 pub mod render;
+
+pub(crate) const MAX_ITERATIONS: u32 = 50_000;
 
 pub use app::App;

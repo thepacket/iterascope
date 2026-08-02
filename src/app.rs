@@ -5,12 +5,12 @@ use crate::experiment::{
     FAMILY_ID, FORMAT_ID, FORMAT_VERSION,
 };
 use crate::orbit::{CriticalOrbit, CriticalOrbitCache, OrbitInput};
-use crate::perturbation::{ReferenceInput, ReferenceOrbitCache};
 use crate::precision::{
     DoubleSingle, DsValidity, PathProbeResult, PrecisionMode, ProbeCache, ProbeInput, ProbeResult,
     ValidityLevel,
 };
 use crate::render::{self, FractalPipeline, Uniforms};
+use crate::MAX_ITERATIONS;
 
 const PANEL_WIDTH: f32 = 286.0;
 const HEADER_HEIGHT: f32 = 33.0;
@@ -23,10 +23,6 @@ const PINCH_SENSITIVITY: f64 = 0.65;
 /// view is meaningfully zoomed. Classification disagreement and coordinate
 /// collapse always override this floor.
 const PROBE_DS_MIN_ZOOM: f64 = 256.0;
-/// Start sharing a CPU `f64` reference orbit before double-single coordinate
-/// spacing reaches its hard limit. The reference remains current during
-/// navigation so a deep view never flashes through a resolution-limited path.
-const PERTURBATION_MIN_ZOOM: f64 = 1.0e12;
 
 const BG: egui::Color32 = egui::Color32::from_rgb(10, 13, 18);
 const PANEL: egui::Color32 = egui::Color32::from_rgb(22, 24, 29);
@@ -82,14 +78,7 @@ impl PlaneView {
     }
 
     fn zoom(&mut self, factor: f64) {
-        let candidate = self.half_height * factor;
-        self.half_height = if candidate.is_finite() {
-            candidate.clamp(1e-16, 1e6)
-        } else if candidate.is_sign_positive() {
-            1e6
-        } else {
-            1e-16
-        };
+        self.half_height = (self.half_height * factor).clamp(1e-14, 1e6);
     }
 
     fn zoom_from(&mut self, focus: Option<[f64; 2]>, factor: f64) {
@@ -123,10 +112,6 @@ pub struct App {
     show_orbit_overlay: bool,
     orbit_step: usize,
     orbit_cache: CriticalOrbitCache,
-    reference_orbits: [ReferenceOrbitCache; 2],
-    perturbation_complete: [bool; 2],
-    navigation_limited: [bool; 2],
-    render_limited: [bool; 2],
     precision_modes: [PrecisionMode; 2],
     ds_validity: [DsValidity; 2],
     probes: [ProbeCache; 2],
@@ -167,10 +152,6 @@ impl App {
             show_orbit_overlay: true,
             orbit_step: 0,
             orbit_cache: CriticalOrbitCache::default(),
-            reference_orbits: std::array::from_fn(|_| ReferenceOrbitCache::default()),
-            perturbation_complete: [false; 2],
-            navigation_limited: [false; 2],
-            render_limited: [false; 2],
             precision_modes: [PrecisionMode::F32; 2],
             ds_validity: [DsValidity::default(); 2],
             probes: [ProbeCache::default(); 2],
@@ -238,7 +219,7 @@ impl App {
 
             section(ui, "Computation", |ui| {
                 ui.add(
-                    egui::Slider::new(&mut self.iterations, 32..=2048)
+                    egui::Slider::new(&mut self.iterations, 32..=MAX_ITERATIONS)
                         .logarithmic(true)
                         .text("iterations"),
                 );
@@ -252,14 +233,12 @@ impl App {
                     "Parameter",
                     self.precision_modes[0],
                     self.ds_validity[0],
-                    self.perturbation_complete[0],
                 );
                 precision_row(
                     ui,
                     "Julia",
                     self.precision_modes[1],
                     self.ds_validity[1],
-                    self.perturbation_complete[1],
                 );
                 ui.label(
                     egui::RichText::new("Precision switches automatically after instability.")
@@ -337,21 +316,9 @@ impl App {
                     self.probes[1].last_result(),
                     self.ds_validity[1],
                 );
-                limit_row(
-                    ui,
-                    "P limits",
-                    self.navigation_limited[0],
-                    self.render_limited[0],
-                );
-                limit_row(
-                    ui,
-                    "J limits",
-                    self.navigation_limited[1],
-                    self.render_limited[1],
-                );
                 ui.label(
                     egui::RichText::new(
-                        "Nine CPU samples compare the baseline f32 and DS paths with f64. Perturbation uses a shared f64 reference with per-fragment DS fallback.",
+                        "Nine CPU samples compare both GPU arithmetic paths with f64 after a settled view change.",
                     )
                     .small()
                     .color(MUTED),
@@ -494,12 +461,6 @@ impl App {
         self.precision_modes = [PrecisionMode::F32; 2];
         self.ds_validity = [DsValidity::default(); 2];
         self.probes = [ProbeCache::default(); 2];
-        for cache in &mut self.reference_orbits {
-            cache.invalidate();
-        }
-        self.perturbation_complete = [false; 2];
-        self.navigation_limited = [false; 2];
-        self.render_limited = [false; 2];
     }
 
     fn experiment_editor(&mut self, ctx: &egui::Context) {
@@ -751,7 +712,11 @@ impl App {
             bailout: self.bailout as f64,
             pane,
         };
-        let probe = probe_for_frame(&mut self.probes[pane], probe_input, interacting);
+        let probe = if interacting {
+            self.probes[pane].current(probe_input).unwrap_or_default()
+        } else {
+            self.probes[pane].update(probe_input)
+        };
         let coordinate_limited = view_is_f32_limited(
             &view,
             (pane == 1).then_some(self.julia_c),
@@ -764,7 +729,8 @@ impl App {
                 viewport,
                 ui.ctx().pixels_per_point(),
             ));
-        let base_precision = choose_precision(magnification, coordinate_limited, probe);
+        let precision = choose_precision(magnification, coordinate_limited, probe);
+        self.precision_modes[pane] = precision;
         let ds_validity = DsValidity::from_probe(
             probe.ds,
             ds_coordinate_ratio(
@@ -775,56 +741,14 @@ impl App {
             ),
         );
         self.ds_validity[pane] = ds_validity;
-        let navigation_limited =
-            navigation_is_limited(&view, viewport, ui.ctx().pixels_per_point());
-        let render_limited = ds_validity.render_limited() || render_scale_is_limited(&view);
-        self.navigation_limited[pane] = navigation_limited;
-        self.render_limited[pane] = render_limited;
-
-        let requested_precision = choose_render_mode(
-            base_precision,
-            ds_validity,
-            magnification,
-            coordinate_limited,
-            pane,
-        );
-        let mut perturbation_complete = false;
-        let reference = if requested_precision == PrecisionMode::Perturbation {
-            let orbit = self.reference_orbits[pane]
-                .update(ReferenceInput {
-                    centre: view.centre,
-                    julia_c: self.julia_c,
-                    iterations: self.iterations,
-                    pane,
-                })
-                .clone();
-            perturbation_complete = orbit.complete;
-            orbit.complete.then_some(orbit)
-        } else {
-            None
-        };
-        let precision = require_complete_reference(requested_precision, perturbation_complete);
-        self.perturbation_complete[pane] = perturbation_complete;
-        self.precision_modes[pane] = precision;
 
         let (precision_text, zoom_colour) = match precision {
-            PrecisionMode::Perturbation if self.perturbation_complete[pane] => {
-                if render_limited {
-                    ("RENDER LIMIT", CORAL)
-                } else {
-                    ("PERT f64 REF", BLUE)
-                }
-            }
-            PrecisionMode::Perturbation => ("PERT + DS FALLBACK", CREAM),
             PrecisionMode::DoubleSingle => (
                 ds_validity.label(),
-                if ds_validity.render_limited() || render_scale_is_limited(&view) {
-                    CORAL
-                } else {
-                    match ds_validity.level {
-                        ValidityLevel::Stable => BLUE,
-                        ValidityLevel::Risk | ValidityLevel::Limit => CREAM,
-                    }
+                match ds_validity.level {
+                    ValidityLevel::Stable => BLUE,
+                    ValidityLevel::Risk => CREAM,
+                    ValidityLevel::Limit => CORAL,
                 },
             ),
             PrecisionMode::F32 if probe.f32.unstable() => ("F32 UNSTABLE", CORAL),
@@ -833,14 +757,7 @@ impl App {
         ui.painter().text(
             egui::pos2(header.max.x - 10.0, header.center().y),
             egui::Align2::RIGHT_CENTER,
-            format!(
-                "{precision_text}{}  ·  ZOOM ×{magnification:.4e}",
-                if navigation_limited {
-                    "  ·  NAV LIMIT"
-                } else {
-                    ""
-                },
-            ),
+            format!("{precision_text}  ·  ZOOM ×{magnification:.4e}"),
             egui::FontId::new(11.0, egui::FontFamily::Monospace),
             zoom_colour,
         );
@@ -857,10 +774,8 @@ impl App {
             self.smooth,
             self.grid,
             precision,
-            reference.as_ref().map_or(0, |orbit| orbit.point_count()),
         );
-        ui.painter()
-            .add(render::callback(viewport, pane, uniforms, reference));
+        ui.painter().add(render::callback(viewport, pane, uniforms));
 
         if pane == 1 && self.show_orbit_overlay {
             let orbit = self.orbit_cache.update(OrbitInput {
@@ -1346,29 +1261,18 @@ fn zoom_row(ui: &mut egui::Ui, label: &str, magnification: f64) {
     });
 }
 
-fn precision_row(
-    ui: &mut egui::Ui,
-    label: &str,
-    precision: PrecisionMode,
-    validity: DsValidity,
-    perturbation_complete: bool,
-) {
+fn precision_row(ui: &mut egui::Ui, label: &str, precision: PrecisionMode, validity: DsValidity) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).color(MUTED));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let (text, colour) = match precision {
                 PrecisionMode::F32 => (precision.label(), CREAM),
-                PrecisionMode::Perturbation if perturbation_complete => (precision.label(), BLUE),
-                PrecisionMode::Perturbation => ("GPU PERT + fallback", CREAM),
                 PrecisionMode::DoubleSingle => (
                     validity.label(),
-                    if validity.render_limited() {
-                        CORAL
-                    } else {
-                        match validity.level {
-                            ValidityLevel::Stable => BLUE,
-                            ValidityLevel::Risk | ValidityLevel::Limit => CREAM,
-                        }
+                    match validity.level {
+                        ValidityLevel::Stable => BLUE,
+                        ValidityLevel::Risk => CREAM,
+                        ValidityLevel::Limit => CORAL,
                     },
                 ),
             };
@@ -1383,31 +1287,12 @@ fn probe_rows(ui: &mut egui::Ui, label: &str, result: Option<ProbeResult>, valid
     ui.label(
         egui::RichText::new(validity.summary())
             .small()
-            .color(if validity.render_limited() {
-                CORAL
-            } else {
-                match validity.level {
-                    ValidityLevel::Stable => MUTED,
-                    ValidityLevel::Risk | ValidityLevel::Limit => CREAM,
-                }
+            .color(match validity.level {
+                ValidityLevel::Stable => MUTED,
+                ValidityLevel::Risk => CREAM,
+                ValidityLevel::Limit => CORAL,
             }),
     );
-}
-
-fn limit_row(ui: &mut egui::Ui, label: &str, navigation: bool, render: bool) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).color(MUTED));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (text, colour) = if render {
-                ("RENDER LIMIT", CORAL)
-            } else if navigation {
-                ("NAV LIMIT", CREAM)
-            } else {
-                ("none", MUTED)
-            };
-            ui.label(egui::RichText::new(text).small().monospace().color(colour));
-        });
-    });
 }
 
 fn path_probe_row(ui: &mut egui::Ui, label: &str, result: Option<PathProbeResult>) {
@@ -1430,28 +1315,6 @@ fn f32_spacing(value: f64) -> f64 {
         return f32::from_bits(1) as f64;
     }
     (f32::from_bits(value.to_bits() + 1) - value) as f64
-}
-
-fn f64_spacing(value: f64) -> f64 {
-    let value = value.abs();
-    if value == 0.0 {
-        return f64::from_bits(1);
-    }
-    if !value.is_finite() {
-        return f64::INFINITY;
-    }
-    f64::from_bits(value.to_bits() + 1) - value
-}
-
-fn navigation_is_limited(view: &PlaneView, rect: egui::Rect, pixels_per_point: f32) -> bool {
-    let physical_height = (rect.height() * pixels_per_point).max(1.0) as f64;
-    let world_per_pixel = 2.0 * view.half_height / physical_height;
-    f64_spacing(view.centre[0]).max(f64_spacing(view.centre[1])) >= world_per_pixel * 0.5
-}
-
-fn render_scale_is_limited(view: &PlaneView) -> bool {
-    let scale = DoubleSingle::from_f64(view.half_height);
-    scale.hi == 0.0 && scale.lo == 0.0
 }
 
 fn pinch_zoom_factor(zoom_delta: f32) -> f64 {
@@ -1501,7 +1364,7 @@ fn coordinate_sample(
                 (view.centre[1] as f32 + local[1] as f32 * scale) as f64,
             ]
         }
-        PrecisionMode::DoubleSingle | PrecisionMode::Perturbation => {
+        PrecisionMode::DoubleSingle => {
             let scale = DoubleSingle::from_f64(view.half_height);
             [
                 DoubleSingle::from_f64(view.centre[0])
@@ -1557,10 +1420,9 @@ fn julia_critical_roundoff_risk(
         return false;
     }
 
-    // Near z = 0, the next orbit value is z² + c. If z² is below one f32
-    // spacing of c, it can be rounded away and a neighborhood can collapse
+    // Near z = 0, f32 can round z² out of z²+c and collapse a neighborhood
     // onto the exactly bounded critical orbit. Promote before that false basin
-    // becomes as large as a displayed pixel.
+    // reaches the size of a displayed pixel.
     let c_spacing = f32_spacing(c[0]).max(f32_spacing(c[1]));
     let collapse_radius = c_spacing.sqrt();
     let physical_height = (rect.height() * pixels_per_point).max(1.0) as f64;
@@ -1601,44 +1463,6 @@ fn choose_precision(
         PrecisionMode::DoubleSingle
     } else {
         PrecisionMode::F32
-    }
-}
-
-fn probe_for_frame(cache: &mut ProbeCache, input: ProbeInput, interacting: bool) -> ProbeResult {
-    if interacting {
-        cache
-            .current(input)
-            .or_else(|| cache.last_result())
-            .unwrap_or_default()
-    } else {
-        cache.update(input)
-    }
-}
-
-fn choose_render_mode(
-    base: PrecisionMode,
-    ds_validity: DsValidity,
-    magnification: f64,
-    coordinate_limited: bool,
-    pane: usize,
-) -> PrecisionMode {
-    if pane == 0
-        && base == PrecisionMode::DoubleSingle
-        && (coordinate_limited
-            || magnification >= PERTURBATION_MIN_ZOOM
-            || ds_validity.level != ValidityLevel::Stable)
-    {
-        PrecisionMode::Perturbation
-    } else {
-        base
-    }
-}
-
-fn require_complete_reference(requested: PrecisionMode, complete: bool) -> PrecisionMode {
-    if requested == PrecisionMode::Perturbation && !complete {
-        PrecisionMode::DoubleSingle
-    } else {
-        requested
     }
 }
 
@@ -1768,7 +1592,7 @@ mod tests {
     }
 
     #[test]
-    fn julia_cancellation_risk_detects_the_false_basin_around_z_zero() {
+    fn julia_cancellation_risk_prevents_the_false_basin_around_zero() {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1000.0));
         let close_view = PlaneView::new([0.0, 0.0], 1.45 / 766.0);
         assert!(julia_critical_roundoff_risk(
@@ -1781,14 +1605,6 @@ mod tests {
         let initial_view = PlaneView::new([0.0, 0.0], 1.45);
         assert!(!julia_critical_roundoff_risk(
             &initial_view,
-            [0.0, 1.0],
-            rect,
-            1.0,
-        ));
-
-        let away_from_critical_point = PlaneView::new([0.5, 0.5], 1e-3);
-        assert!(!julia_critical_roundoff_risk(
-            &away_from_critical_point,
             [0.0, 1.0],
             rect,
             1.0,
@@ -1839,118 +1655,6 @@ mod tests {
             ),
             PrecisionMode::DoubleSingle
         );
-    }
-
-    #[test]
-    fn navigation_reuses_the_last_probe_instead_of_flashing_to_f32() {
-        let input = ProbeInput {
-            centre: [-0.745, 0.113],
-            half_height: 1.45e-7,
-            aspect: 1.5,
-            julia_c: [-0.745, 0.113],
-            iterations: 256,
-            bailout: 4.0,
-            pane: 1,
-        };
-        let mut cache = ProbeCache::default();
-        let settled = probe_for_frame(&mut cache, input, false);
-        let moved = ProbeInput {
-            half_height: input.half_height * 0.9,
-            ..input
-        };
-
-        let during_navigation = probe_for_frame(&mut cache, moved, true);
-        assert_eq!(during_navigation, settled);
-        assert!(cache.current(moved).is_none());
-
-        let _ = probe_for_frame(&mut cache, moved, false);
-        assert!(cache.current(moved).is_some());
-    }
-
-    #[test]
-    fn deep_views_use_perturbation_during_navigation_too() {
-        assert_eq!(
-            choose_render_mode(
-                PrecisionMode::DoubleSingle,
-                DsValidity::default(),
-                PERTURBATION_MIN_ZOOM,
-                false,
-                0,
-            ),
-            PrecisionMode::Perturbation,
-        );
-    }
-
-    #[test]
-    fn coordinate_limited_views_enter_perturbation_before_the_deep_threshold() {
-        assert_eq!(
-            choose_render_mode(
-                PrecisionMode::DoubleSingle,
-                DsValidity::default(),
-                1.0e6,
-                true,
-                0,
-            ),
-            PrecisionMode::Perturbation,
-        );
-    }
-
-    #[test]
-    fn julia_keeps_the_proven_ds_path_until_rebasing_is_available() {
-        assert_eq!(
-            choose_render_mode(
-                PrecisionMode::DoubleSingle,
-                DsValidity {
-                    level: ValidityLevel::Limit,
-                    ..Default::default()
-                },
-                1.0e16,
-                true,
-                1,
-            ),
-            PrecisionMode::DoubleSingle,
-        );
-    }
-
-    #[test]
-    fn incomplete_reference_rejects_perturbation_for_the_whole_pane() {
-        assert_eq!(
-            require_complete_reference(PrecisionMode::Perturbation, false),
-            PrecisionMode::DoubleSingle,
-        );
-        assert_eq!(
-            require_complete_reference(PrecisionMode::Perturbation, true),
-            PrecisionMode::Perturbation,
-        );
-    }
-
-    #[test]
-    fn zoom_stops_at_the_validated_deep_scale_cap() {
-        let mut view = PlaneView::new([-0.745, 0.113], 1.45);
-        view.zoom(1e-30);
-        assert_eq!(view.half_height, 1e-16);
-        assert_eq!(view.magnification(), 1.45e16);
-    }
-
-    #[test]
-    fn navigation_limit_tracks_f64_centre_spacing() {
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1000.0));
-        assert!(!navigation_is_limited(
-            &PlaneView::new([1.0, 0.5], 1e-12),
-            rect,
-            1.0,
-        ));
-        assert!(navigation_is_limited(
-            &PlaneView::new([1.0, 0.5], 1e-13),
-            rect,
-            1.0,
-        ));
-    }
-
-    #[test]
-    fn renderer_limit_detects_a_scale_that_f32_words_cannot_carry() {
-        assert!(!render_scale_is_limited(&PlaneView::new([0.0, 0.0], 1e-40)));
-        assert!(render_scale_is_limited(&PlaneView::new([0.0, 0.0], 1e-50)));
     }
 
     #[test]

@@ -3,12 +3,13 @@
 //! Rendering remains GPU-first. The CPU probe evaluates only nine orbits when
 //! a settled view changes; it never renders pixels or builds reference images.
 
+use crate::MAX_ITERATIONS;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PrecisionMode {
     #[default]
     F32,
     DoubleSingle,
-    Perturbation,
 }
 
 impl PrecisionMode {
@@ -16,7 +17,6 @@ impl PrecisionMode {
         match self {
             Self::F32 => "GPU f32",
             Self::DoubleSingle => "GPU DS ~48-bit",
-            Self::Perturbation => "GPU PERT f64-ref",
         }
     }
 
@@ -24,7 +24,6 @@ impl PrecisionMode {
         match self {
             Self::F32 => 0.0,
             Self::DoubleSingle => 1.0,
-            Self::Perturbation => 2.0,
         }
     }
 }
@@ -102,7 +101,7 @@ pub(crate) struct ProbeInput {
     pub(crate) pane: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PathProbeResult {
     pub(crate) unstable_samples: u8,
     pub(crate) classification_mismatches: u8,
@@ -134,7 +133,7 @@ impl PathProbeResult {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ProbeResult {
     pub(crate) f32: PathProbeResult,
     pub(crate) ds: PathProbeResult,
@@ -213,17 +212,11 @@ impl DsValidity {
     }
 
     pub(crate) fn label(self) -> &'static str {
-        match (self.level, self.reason) {
-            (ValidityLevel::Stable, _) => "DS STABLE",
-            (ValidityLevel::Risk, _) => "DS RISK",
-            (ValidityLevel::Limit, ValidityReason::CoordinateCollapse) => "DS COORD LIMIT",
-            (ValidityLevel::Limit, _) => "RENDER LIMIT",
+        match self.level {
+            ValidityLevel::Stable => "DS STABLE",
+            ValidityLevel::Risk => "DS RISK",
+            ValidityLevel::Limit => "DS LIMIT",
         }
-    }
-
-    pub(crate) fn render_limited(self) -> bool {
-        self.level == ValidityLevel::Limit
-            && !matches!(self.reason, ValidityReason::CoordinateCollapse)
     }
 
     pub(crate) fn summary(self) -> String {
@@ -423,7 +416,7 @@ fn orbit_adaptive_ds(input: ProbeInput, local_offset: [f32; 2]) -> OrbitOutcome 
     let bailout_squared = (input.bailout as f32) * (input.bailout as f32);
     let mut approximate = ds2_approx(reference_z);
 
-    for iteration in 1..=input.iterations.min(4096) {
+    for iteration in 1..=input.iterations.min(MAX_ITERATIONS) {
         let reference_before = ds2_approx(reference_z);
         let coupling = complex_mul_f32(reference_before, delta_z);
         let delta_square = complex_square_f32(delta_z);
@@ -600,19 +593,9 @@ mod tests {
             .level,
             ValidityLevel::Risk
         );
-        let coordinate_limit = DsValidity::from_probe(PathProbeResult::default(), 0.5);
-        assert_eq!(coordinate_limit.level, ValidityLevel::Limit);
-        assert_eq!(coordinate_limit.label(), "DS COORD LIMIT");
-        assert!(!coordinate_limit.render_limited());
-
-        let arithmetic_limit = DsValidity::from_probe(
-            PathProbeResult {
-                non_finite_samples: 1,
-                ..Default::default()
-            },
-            0.0,
+        assert_eq!(
+            DsValidity::from_probe(PathProbeResult::default(), 0.5).level,
+            ValidityLevel::Limit
         );
-        assert_eq!(arithmetic_limit.label(), "RENDER LIMIT");
-        assert!(arithmetic_limit.render_limited());
     }
 }

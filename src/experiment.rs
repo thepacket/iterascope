@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::MAX_ITERATIONS;
+
 pub(crate) const FORMAT_ID: &str = "iterascope-experiment";
 pub(crate) const FORMAT_VERSION: u32 = 1;
 pub(crate) const FAMILY_ID: &str = "quadratic";
@@ -81,8 +83,10 @@ impl ExperimentDocument {
         validate_plane("parameter_plane", self.parameter_plane)?;
         validate_plane("dynamical_plane", self.dynamical_plane)?;
         validate_complex("parameter_c", self.parameter_c)?;
-        if !(32..=2048).contains(&self.computation.iterations) {
-            return Err("iterations must be between 32 and 2048".to_owned());
+        if !(32..=MAX_ITERATIONS).contains(&self.computation.iterations) {
+            return Err(format!(
+                "iterations must be between 32 and {MAX_ITERATIONS}"
+            ));
         }
         if !self.computation.bailout.is_finite()
             || !(2.0..=32.0).contains(&self.computation.bailout)
@@ -178,5 +182,16 @@ mod tests {
         let loaded =
             ExperimentDocument::from_json(&serde_json::to_string(&value).unwrap()).unwrap();
         assert!(loaded.display.critical_orbit_overlay);
+    }
+
+    #[test]
+    fn iteration_limit_accepts_fifty_thousand_and_rejects_more() {
+        let mut document = example();
+        document.computation.iterations = MAX_ITERATIONS;
+        assert!(ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).is_ok());
+
+        document.computation.iterations = MAX_ITERATIONS + 1;
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("50000"));
     }
 }

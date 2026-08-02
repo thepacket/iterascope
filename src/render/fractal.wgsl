@@ -5,7 +5,7 @@ struct Uniforms {
     view_lo: vec4<f32>,
     // Julia c high words, maximum iterations, bailout squared.
     dynamics_hi: vec4<f32>,
-    // Julia c low words; z = uploaded reference-orbit point count.
+    // Julia c low words; zw reserved.
     dynamics_lo: vec4<f32>,
     // x = 0 parameter plane / 1 dynamical plane, y = palette phase,
     // z = smooth colouring, w = show grid.
@@ -13,8 +13,6 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-// Each point is `[re_hi, im_hi, re_lo, im_lo]`.
-@group(0) @binding(1) var<storage, read> reference_orbit: array<vec4<f32>>;
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
@@ -99,22 +97,6 @@ fn ds2_add_f32(a: Ds2, b: vec2<f32>) -> Ds2 {
     );
 }
 
-fn ds2_add(a: Ds2, b: Ds2) -> Ds2 {
-    return Ds2(ds_add(a.x, b.x), ds_add(a.y, b.y));
-}
-
-fn ds_complex_mul(a: Ds2, b: Ds2) -> Ds2 {
-    return Ds2(
-        ds_sub(ds_mul(a.x, b.x), ds_mul(a.y, b.y)),
-        ds_add(ds_mul(a.x, b.y), ds_mul(a.y, b.x)),
-    );
-}
-
-fn ds2_twice(a: Ds2) -> Ds2 {
-    let two = Ds(2.0, 0.0);
-    return Ds2(ds_mul(two, a.x), ds_mul(two, a.y));
-}
-
 fn ds_complex_square(z: Ds2) -> Ds2 {
     let xx = ds_mul(z.x, z.x);
     let yy = ds_mul(z.y, z.y);
@@ -137,10 +119,10 @@ fn complex_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 fn iterate_f32(world: vec2<f32>, julia: bool) -> EscapeResult {
     var z = select(vec2<f32>(0.0), world, julia);
     let c = select(world, u.dynamics_hi.xy, julia);
-    let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 4096.0));
+    let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
     var escaped = false;
     var iteration = 0u;
-    for (var i = 0u; i < 4096u; i = i + 1u) {
+    for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
         z = complex_square(z) + c;
         iteration = i + 1u;
@@ -173,11 +155,11 @@ fn iterate_ds(centre: Ds2, local_offset: vec2<f32>, julia: bool) -> EscapeResult
         delta_c = vec2<f32>(0.0);
     }
 
-    let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 4096.0));
+    let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
     var escaped = false;
     var iteration = 0u;
     var approximate = ds2_approx(reference_z) + delta_z;
-    for (var i = 0u; i < 4096u; i = i + 1u) {
+    for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
         let reference_before = ds2_approx(reference_z);
         delta_z = 2.0 * complex_mul(reference_before, delta_z)
@@ -217,64 +199,6 @@ fn iterate_ds(centre: Ds2, local_offset: vec2<f32>, julia: bool) -> EscapeResult
     return EscapeResult(escaped, iteration, approximate);
 }
 
-fn load_reference(index: u32) -> Ds2 {
-    let point = reference_orbit[index];
-    return Ds2(Ds(point.x, point.z), Ds(point.y, point.w));
-}
-
-fn iterate_perturbation(centre: Ds2, local_offset: vec2<f32>, julia: bool) -> EscapeResult {
-    let zero = Ds2(Ds(0.0, 0.0), Ds(0.0, 0.0));
-    let local_ds = Ds2(Ds(local_offset.x, 0.0), Ds(local_offset.y, 0.0));
-    var delta_z = zero;
-    var delta_c = local_ds;
-    if (julia) {
-        delta_z = local_ds;
-        delta_c = zero;
-    }
-    let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 4096.0));
-    let reference_count = u32(max(u.dynamics_lo.z, 0.0));
-    if (reference_count < 2u) {
-        return iterate_ds(centre, local_offset, julia);
-    }
-
-    var approximate = ds2_approx(load_reference(0u));
-    for (var i = 0u; i < 4096u; i = i + 1u) {
-        if (i >= max_iterations) { break; }
-        if (i + 1u >= reference_count) {
-            return iterate_ds(centre, local_offset, julia);
-        }
-
-        let reference_before = load_reference(i);
-        let coupling = ds2_twice(ds_complex_mul(reference_before, delta_z));
-        delta_z = ds2_add(ds2_add(coupling, ds_complex_square(delta_z)), delta_c);
-        let reference_after = load_reference(i + 1u);
-        let approximate_ds = ds2_add(reference_after, delta_z);
-        approximate = ds2_approx(approximate_ds);
-        let magnitude_squared = dot(approximate, approximate);
-        let iteration = i + 1u;
-        if (magnitude_squared > u.dynamics_hi.w) {
-            return EscapeResult(true, iteration, approximate);
-        }
-
-        // A very small perturbed value produced by cancellation of much
-        // larger terms is the standard perturbation "glitch" condition. The
-        // ordinary centred DS path is slower but safe as a per-fragment
-        // fallback, so no questionable classification is silently displayed.
-        let reference_approx = ds2_approx(reference_after);
-        let reference_squared = dot(reference_approx, reference_approx);
-        let cancellation = reference_squared > 1e-20
-            && magnitude_squared < 1e-6 * reference_squared;
-        let non_finite = approximate.x != approximate.x
-            || approximate.y != approximate.y
-            || abs(approximate.x) > 3e37
-            || abs(approximate.y) > 3e37;
-        if (cancellation || non_finite) {
-            return iterate_ds(centre, local_offset, julia);
-        }
-    }
-    return EscapeResult(false, max_iterations, approximate);
-}
-
 fn palette(t: f32) -> vec3<f32> {
     let a = vec3<f32>(0.47, 0.49, 0.52);
     let b = vec3<f32>(0.42, 0.39, 0.36);
@@ -309,13 +233,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let world_f32 = u.view_hi.xy + local * u.view_hi.z;
 
     let julia = u.display.x > 0.5;
-    let precision_mode = u.view_lo.w;
+    let double_single = u.view_lo.w > 0.5;
     var result: EscapeResult;
     var world = world_f32;
-    if (precision_mode > 1.5) {
-        result = iterate_perturbation(centre_ds, local_offset, julia);
-        world = world_ds_approx;
-    } else if (precision_mode > 0.5) {
+    if (double_single) {
         result = iterate_ds(centre_ds, local_offset, julia);
         world = world_ds_approx;
     } else {

@@ -3,7 +3,6 @@
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use eframe::wgpu;
 
-use crate::perturbation::{ReferenceOrbit, ReferencePoint, MAX_REFERENCE_POINTS};
 use crate::precision::{split_f64, PrecisionMode};
 
 const SHADER: &str = include_str!("fractal.wgsl");
@@ -33,7 +32,6 @@ impl Uniforms {
         smooth: bool,
         grid: bool,
         precision: PrecisionMode,
-        reference_point_count: u32,
     ) -> Self {
         let centre_x = split_f64(centre[0]);
         let centre_y = split_f64(centre[1]);
@@ -44,7 +42,7 @@ impl Uniforms {
             view_hi: [centre_x[0], centre_y[0], scale[0], aspect],
             view_lo: [centre_x[1], centre_y[1], scale[1], precision.shader_flag()],
             dynamics_hi: [julia_x[0], julia_y[0], iterations as f32, bailout * bailout],
-            dynamics_lo: [julia_x[1], julia_y[1], reference_point_count as f32, 0.0],
+            dynamics_lo: [julia_x[1], julia_y[1], 0.0, 0.0],
             display: [
                 pane as f32,
                 palette_phase,
@@ -57,8 +55,6 @@ impl Uniforms {
 
 struct PaneResources {
     buffer: wgpu::Buffer,
-    reference_buffer: wgpu::Buffer,
-    reference_revision: Option<u64>,
     bind_group: wgpu::BindGroup,
 }
 
@@ -75,32 +71,16 @@ impl FractalPipeline {
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("iterascope.fractal.bind-group-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(
-                            std::mem::size_of::<Uniforms>() as u64
-                        ),
-                    },
-                    count: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<Uniforms>() as u64),
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(
-                            std::mem::size_of::<ReferencePoint>() as u64,
-                        ),
-                    },
-                    count: None,
-                },
-            ],
+                count: None,
+            }],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("iterascope.fractal.pipeline-layout"),
@@ -144,46 +124,24 @@ impl FractalPipeline {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            let reference_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(if index == 0 {
-                    "iterascope.parameter.reference-orbit"
-                } else {
-                    "iterascope.dynamical.reference-orbit"
-                }),
-                size: (MAX_REFERENCE_POINTS * std::mem::size_of::<ReferencePoint>()) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("iterascope.fractal.bind-group"),
                 layout: &bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: reference_buffer.as_entire_binding(),
-                    },
-                ],
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
             });
-            PaneResources {
-                buffer,
-                reference_buffer,
-                reference_revision: None,
-                bind_group,
-            }
+            PaneResources { buffer, bind_group }
         });
 
         Self { pipeline, panes }
     }
 }
 
-struct FractalCallback {
-    pane: usize,
-    uniforms: Uniforms,
-    reference: Option<ReferenceOrbit>,
+pub struct FractalCallback {
+    pub pane: usize,
+    pub uniforms: Uniforms,
 }
 
 impl CallbackTrait for FractalCallback {
@@ -195,23 +153,12 @@ impl CallbackTrait for FractalCallback {
         _encoder: &mut wgpu::CommandEncoder,
         resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        if let Some(renderer) = resources.get_mut::<FractalPipeline>() {
+        if let Some(renderer) = resources.get::<FractalPipeline>() {
             queue.write_buffer(
                 &renderer.panes[self.pane].buffer,
                 0,
                 bytemuck::bytes_of(&self.uniforms),
             );
-            if let Some(reference) = &self.reference {
-                let pane = &mut renderer.panes[self.pane];
-                if pane.reference_revision != Some(reference.revision) {
-                    queue.write_buffer(
-                        &pane.reference_buffer,
-                        0,
-                        bytemuck::cast_slice(reference.points.as_ref()),
-                    );
-                    pane.reference_revision = Some(reference.revision);
-                }
-            }
         }
         Vec::new()
     }
@@ -231,20 +178,8 @@ impl CallbackTrait for FractalCallback {
     }
 }
 
-pub(crate) fn callback(
-    rect: egui::Rect,
-    pane: usize,
-    uniforms: Uniforms,
-    reference: Option<ReferenceOrbit>,
-) -> egui::PaintCallback {
-    egui_wgpu::Callback::new_paint_callback(
-        rect,
-        FractalCallback {
-            pane,
-            uniforms,
-            reference,
-        },
-    )
+pub fn callback(rect: egui::Rect, pane: usize, uniforms: Uniforms) -> egui::PaintCallback {
+    egui_wgpu::Callback::new_paint_callback(rect, FractalCallback { pane, uniforms })
 }
 
 #[cfg(test)]
@@ -281,31 +216,10 @@ mod tests {
             true,
             false,
             PrecisionMode::DoubleSingle,
-            0,
         );
         assert_ne!(uniforms.view_lo[0], 0.0);
         assert_ne!(uniforms.view_lo[1], 0.0);
         assert_ne!(uniforms.view_lo[2], 0.0);
         assert_eq!(uniforms.view_lo[3], 1.0);
-    }
-
-    #[test]
-    fn uniforms_enable_the_uploaded_reference_orbit() {
-        let uniforms = Uniforms::new(
-            [-0.745, 0.113],
-            1.45e-15,
-            1.6,
-            [-0.745, 0.113],
-            256,
-            4.0,
-            0,
-            0.0,
-            true,
-            false,
-            PrecisionMode::Perturbation,
-            257,
-        );
-        assert_eq!(uniforms.view_lo[3], 2.0);
-        assert_eq!(uniforms.dynamics_lo[2], 257.0);
     }
 }
