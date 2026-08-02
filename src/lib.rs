@@ -7,6 +7,7 @@
 mod app;
 mod experiment;
 mod orbit;
+mod perturbation;
 mod precision;
 pub mod render;
 
