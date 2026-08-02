@@ -12,6 +12,8 @@ use dashu_float::DBig;
 pub const ARBITRARY_HANDOFF_ZOOM: f64 = 1.14e14;
 /// Concrete acceptance target for the deep renderer.
 pub const TARGET_DECIMAL_ZOOM_EXPONENT: u32 = 1_000;
+/// Current user-selectable arbitrary-precision navigation ceiling.
+pub const MAX_DECIMAL_ZOOM_EXPONENT: u32 = 5_000;
 
 const GUARD_DECIMAL_DIGITS: u32 = 32;
 const MIN_DECIMAL_DIGITS: u32 = 48;
@@ -71,10 +73,27 @@ impl DeepReal {
         format!("{:e}", self.value)
     }
 
+    pub fn scientific(&self, fractional_digits: usize) -> String {
+        format!("{:.*e}", fractional_digits, self.value)
+    }
+
     /// A lossy projection for diagnostics and GPU reference-orbit upload.
     /// It must never be used to update an authoritative deep coordinate.
     pub fn to_f64(&self) -> f64 {
         self.value.to_f64().value()
+    }
+
+    /// Return `mantissa × 2^exponent` without first squeezing the value into
+    /// an IEEE float. The mantissa is zero or has magnitude in `[1, 2)`.
+    pub fn scaled_f32(&self) -> (f32, i32) {
+        if self.value == DBig::ZERO {
+            return (0.0, 0);
+        }
+        let binary = self.value.to_binary().value();
+        let exponent = binary.repr().exponent() + binary.repr().digits() as isize - 1;
+        let normalized = binary >> exponent;
+        let exponent = i32::try_from(exponent).expect("deep exponent exceeds GPU i32 range");
+        (normalized.to_f32().value(), exponent)
     }
 
     pub fn add(&self, other: &Self) -> Self {
@@ -93,6 +112,15 @@ impl DeepReal {
         self.rounded(&self.value * factor)
     }
 
+    pub fn with_zoom_exponent(&self, zoom_exponent: u32) -> Self {
+        let decimal_digits = decimal_digits_for_zoom_exponent(zoom_exponent);
+        let value = self.value.clone().with_precision(decimal_digits).value();
+        Self {
+            value,
+            decimal_digits,
+        }
+    }
+
     fn rounded(&self, value: DBig) -> Self {
         let value = value.with_precision(self.decimal_digits).value();
         Self {
@@ -109,6 +137,13 @@ pub struct DeepComplex {
 }
 
 impl DeepComplex {
+    pub fn parse(re: &str, im: &str, zoom_exponent: u32) -> Result<Self, String> {
+        Ok(Self {
+            re: DeepReal::parse(re, zoom_exponent)?,
+            im: DeepReal::parse(im, zoom_exponent)?,
+        })
+    }
+
     pub fn from_f64(value: [f64; 2], zoom_exponent: u32) -> Result<Self, String> {
         Ok(Self {
             re: DeepReal::from_f64(value[0], zoom_exponent)?,
@@ -120,6 +155,13 @@ impl DeepComplex {
         let re = self.re.mul(&self.re).sub(&self.im.mul(&self.im)).add(&c.re);
         let im = self.re.mul(&self.im).mul_i32(2).add(&c.im);
         Self { re, im }
+    }
+
+    fn with_zoom_exponent(&self, zoom_exponent: u32) -> Self {
+        Self {
+            re: self.re.with_zoom_exponent(zoom_exponent),
+            im: self.im.with_zoom_exponent(zoom_exponent),
+        }
     }
 
     fn zero_like(value: &Self) -> Result<Self, String> {
@@ -195,14 +237,43 @@ impl ReferenceOrbit {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DeepView {
     pub centre: DeepComplex,
     pub half_height: DeepReal,
     pub zoom_exponent: u32,
+    pub magnification_log10: f64,
 }
 
 impl DeepView {
+    pub fn parse(
+        centre_re: &str,
+        centre_im: &str,
+        half_height: &str,
+        magnification_log10: f64,
+    ) -> Result<Self, String> {
+        let handoff_log = ARBITRARY_HANDOFF_ZOOM.log10();
+        if !magnification_log10.is_finite()
+            || !(handoff_log..=MAX_DECIMAL_ZOOM_EXPONENT as f64).contains(&magnification_log10)
+        {
+            return Err(format!(
+                "deep magnification log10 must be between {handoff_log} and {}",
+                MAX_DECIMAL_ZOOM_EXPONENT
+            ));
+        }
+        let zoom_exponent = magnification_log10.ceil() as u32;
+        let half_height = DeepReal::parse(half_height, zoom_exponent)?;
+        if half_height.value <= DBig::ZERO {
+            return Err("deep half-height must be positive".to_owned());
+        }
+        Ok(Self {
+            centre: DeepComplex::parse(centre_re, centre_im, zoom_exponent)?,
+            half_height,
+            zoom_exponent,
+            magnification_log10,
+        })
+    }
+
     pub fn at_handoff(centre: [f64; 2]) -> Result<Self, String> {
         let zoom_exponent = ARBITRARY_HANDOFF_ZOOM.log10().ceil() as u32;
         Ok(Self {
@@ -212,6 +283,7 @@ impl DeepView {
                 zoom_exponent,
             )?,
             zoom_exponent,
+            magnification_log10: ARBITRARY_HANDOFF_ZOOM.log10(),
         })
     }
 
@@ -221,7 +293,69 @@ impl DeepView {
             centre: DeepComplex::from_f64(centre, zoom_exponent)?,
             half_height: DeepReal::parse("1.45e-1000", zoom_exponent)?,
             zoom_exponent,
+            magnification_log10: TARGET_DECIMAL_ZOOM_EXPONENT as f64,
         })
+    }
+
+    pub fn at_zoom_exponent(centre: [f64; 2], zoom_exponent: u32) -> Result<Self, String> {
+        let minimum = ARBITRARY_HANDOFF_ZOOM.log10().ceil() as u32;
+        if !(minimum..=MAX_DECIMAL_ZOOM_EXPONENT).contains(&zoom_exponent) {
+            return Err(format!(
+                "deep zoom exponent must be between {minimum} and {MAX_DECIMAL_ZOOM_EXPONENT}"
+            ));
+        }
+        Ok(Self {
+            centre: DeepComplex::from_f64(centre, zoom_exponent)?,
+            half_height: DeepReal::parse(&format!("1.45e-{zoom_exponent}"), zoom_exponent)?,
+            zoom_exponent,
+            magnification_log10: zoom_exponent as f64,
+        })
+    }
+
+    pub fn zoom(&mut self, factor: f64) -> Result<(), String> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err("deep zoom factor must be positive and finite".to_owned());
+        }
+        let next_log =
+            (self.magnification_log10 - factor.log10()).min(MAX_DECIMAL_ZOOM_EXPONENT as f64);
+        let next_exponent = next_log.ceil() as u32;
+        self.centre = self.centre.with_zoom_exponent(next_exponent);
+        self.half_height = self.half_height.with_zoom_exponent(next_exponent);
+        if next_log >= MAX_DECIMAL_ZOOM_EXPONENT as f64 {
+            self.half_height = DeepReal::parse("1.45e-5000", next_exponent)?;
+        } else {
+            let factor = DeepReal::from_f64(factor, next_exponent)?;
+            self.half_height = self.half_height.mul(&factor);
+        }
+        self.zoom_exponent = next_exponent;
+        self.magnification_log10 = next_log;
+        Ok(())
+    }
+
+    pub fn recenter_local(&mut self, local: [f64; 2]) -> Result<(), String> {
+        let x = DeepReal::from_f64(local[0], self.zoom_exponent)?;
+        let y = DeepReal::from_f64(local[1], self.zoom_exponent)?;
+        self.centre.re = self.centre.re.add(&self.half_height.mul(&x));
+        self.centre.im = self.centre.im.add(&self.half_height.mul(&y));
+        Ok(())
+    }
+
+    pub fn pan_local(&mut self, local: [f64; 2]) -> Result<(), String> {
+        self.recenter_local(local)
+    }
+
+    pub fn centre_preview(&self) -> [f64; 2] {
+        [self.centre.re.to_f64(), self.centre.im.to_f64()]
+    }
+
+    pub fn half_height_preview(&self) -> f64 {
+        self.half_height.to_f64()
+    }
+
+    pub fn magnification_label(&self) -> String {
+        let exponent = self.magnification_log10.floor();
+        let mantissa = 10.0_f64.powf(self.magnification_log10 - exponent);
+        format!("{mantissa:.6}e{exponent:.0}")
     }
 }
 
@@ -243,10 +377,54 @@ mod tests {
     }
 
     #[test]
+    fn target_scale_converts_to_a_nonzero_scaled_gpu_number() {
+        let scale = DeepReal::parse("1.45e-1000", 1_000).unwrap();
+        let (mantissa, exponent) = scale.scaled_f32();
+        assert!((1.0..2.0).contains(&mantissa));
+        assert_eq!(exponent, -3_322);
+    }
+
+    #[test]
     fn handoff_matches_the_confirmed_renderer_boundary() {
         let view = DeepView::at_handoff([-0.745, 0.113]).unwrap();
         assert_eq!(view.zoom_exponent, 15);
         assert_eq!(view.half_height.precision(), 48);
+        assert!((view.magnification_log10 - ARBITRARY_HANDOFF_ZOOM.log10()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn deep_zoom_and_recentre_never_round_trip_through_f64() {
+        let mut view = DeepView::target_scale([-0.745, 0.113]).unwrap();
+        let before = view.centre.clone();
+        view.recenter_local([0.25, -0.5]).unwrap();
+        assert_eq!(
+            view.centre.re.sub(&before.re).exact_decimal(),
+            "3.625e-1001"
+        );
+        assert_eq!(
+            view.centre.im.sub(&before.im).exact_decimal(),
+            "-7.25e-1001"
+        );
+    }
+
+    #[test]
+    fn zoom_clamps_at_the_configured_maximum() {
+        let mut view = DeepView::at_handoff([-0.745, 0.113]).unwrap();
+        for _ in 0..20 {
+            view.zoom(1e-300).unwrap();
+        }
+        assert_eq!(view.magnification_log10, 5_000.0);
+        assert_eq!(view.half_height.exact_decimal(), "1.45e-5000");
+    }
+
+    #[test]
+    fn direct_five_thousand_exponent_view_is_representable() {
+        let view = DeepView::at_zoom_exponent([0.0, 0.0], 5_000).unwrap();
+        assert_eq!(view.half_height.exact_decimal(), "1.45e-5000");
+        assert_eq!(view.half_height.precision(), 5_032);
+        let (mantissa, exponent) = view.half_height.scaled_f32();
+        assert!((1.0..2.0).contains(&mantissa));
+        assert!(exponent < -16_000);
     }
 
     #[test]

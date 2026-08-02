@@ -10,9 +10,19 @@ struct Uniforms {
     // x = 0 parameter plane / 1 dynamical plane, y = palette phase,
     // z = smooth colouring, w = show grid.
     display: vec4<f32>,
+    // x = perturbation enabled, y = scale mantissa, z = base-2 scale
+    // exponent, w = number of uploaded reference points.
+    deep: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct ReferencePoint {
+    z_hi: vec2<f32>,
+    z_lo: vec2<f32>,
+};
+
+@group(0) @binding(1) var<storage, read> reference_orbit: array<ReferencePoint>;
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
@@ -33,6 +43,11 @@ struct EscapeResult {
     escaped: bool,
     iteration: u32,
     z: vec2<f32>,
+};
+
+struct ScaledComplex {
+    mantissa: vec2<f32>,
+    exponent: i32,
 };
 
 @vertex
@@ -116,6 +131,59 @@ fn complex_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
                      a.x * b.y + a.y * b.x);
 }
 
+fn scaled_normalize(value: ScaledComplex) -> ScaledComplex {
+    let size = max(abs(value.mantissa.x), abs(value.mantissa.y));
+    if (size == 0.0) {
+        return ScaledComplex(vec2<f32>(0.0), 0);
+    }
+    let shift = i32(floor(log2(size)));
+    return ScaledComplex(
+        value.mantissa * exp2(-f32(shift)),
+        value.exponent + shift,
+    );
+}
+
+fn scaled_add(a: ScaledComplex, b: ScaledComplex) -> ScaledComplex {
+    if (all(a.mantissa == vec2<f32>(0.0))) { return b; }
+    if (all(b.mantissa == vec2<f32>(0.0))) { return a; }
+    if (a.exponent >= b.exponent) {
+        let difference = min(a.exponent - b.exponent, 150);
+        return scaled_normalize(ScaledComplex(
+            a.mantissa + b.mantissa * exp2(-f32(difference)),
+            a.exponent,
+        ));
+    }
+    let difference = min(b.exponent - a.exponent, 150);
+    return scaled_normalize(ScaledComplex(
+        a.mantissa * exp2(-f32(difference)) + b.mantissa,
+        b.exponent,
+    ));
+}
+
+fn scaled_complex_mul(a: ScaledComplex, b: ScaledComplex) -> ScaledComplex {
+    return scaled_normalize(ScaledComplex(
+        complex_mul(a.mantissa, b.mantissa),
+        a.exponent + b.exponent,
+    ));
+}
+
+fn scaled_mul_plain(a: ScaledComplex, b: vec2<f32>) -> ScaledComplex {
+    return scaled_normalize(ScaledComplex(complex_mul(a.mantissa, b), a.exponent));
+}
+
+fn scaled_to_f32(a: ScaledComplex) -> vec2<f32> {
+    if (a.exponent < -126) { return vec2<f32>(0.0); }
+    if (a.exponent > 120) {
+        return a.mantissa * 1e20;
+    }
+    return a.mantissa * exp2(f32(a.exponent));
+}
+
+fn reference_value(index: u32) -> vec2<f32> {
+    let point = reference_orbit[index];
+    return point.z_hi + point.z_lo;
+}
+
 fn iterate_f32(world: vec2<f32>, julia: bool) -> EscapeResult {
     var z = select(vec2<f32>(0.0), world, julia);
     let c = select(world, u.dynamics_hi.xy, julia);
@@ -132,6 +200,23 @@ fn iterate_f32(world: vec2<f32>, julia: bool) -> EscapeResult {
         }
     }
     return EscapeResult(escaped, iteration, z);
+}
+
+fn continue_f32(
+    initial_z: vec2<f32>,
+    c: vec2<f32>,
+    first_iteration: u32,
+    max_iterations: u32,
+) -> EscapeResult {
+    var z = initial_z;
+    for (var i = first_iteration; i < 50000u; i = i + 1u) {
+        if (i >= max_iterations) { break; }
+        z = complex_square(z) + c;
+        if (dot(z, z) > u.dynamics_hi.w) {
+            return EscapeResult(true, i + 1u, z);
+        }
+    }
+    return EscapeResult(false, max_iterations, z);
 }
 
 fn iterate_ds(centre: Ds2, local_offset: vec2<f32>, julia: bool) -> EscapeResult {
@@ -199,6 +284,56 @@ fn iterate_ds(centre: Ds2, local_offset: vec2<f32>, julia: bool) -> EscapeResult
     return EscapeResult(escaped, iteration, approximate);
 }
 
+fn iterate_perturbation(
+    centre: Ds2,
+    local: vec2<f32>,
+    local_offset: vec2<f32>,
+    julia: bool,
+) -> EscapeResult {
+    let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
+    let reference_len = u32(max(u.deep.w, 1.0));
+    let available_iterations = min(max_iterations, reference_len - 1u);
+    let pixel_delta = scaled_normalize(ScaledComplex(
+        local * u.deep.y,
+        i32(u.deep.z),
+    ));
+    var delta_z = ScaledComplex(vec2<f32>(0.0), 0);
+    var delta_c = pixel_delta;
+    if (julia) {
+        delta_z = pixel_delta;
+        delta_c = ScaledComplex(vec2<f32>(0.0), 0);
+    }
+
+    var approximate = reference_value(0u);
+    for (var i = 0u; i < 50000u; i = i + 1u) {
+        if (i >= available_iterations) { break; }
+        let reference_before = reference_value(i);
+        let linear = scaled_mul_plain(delta_z, 2.0 * reference_before);
+        let quadratic = scaled_complex_mul(delta_z, delta_z);
+        delta_z = scaled_add(scaled_add(linear, quadratic), delta_c);
+        approximate = reference_value(i + 1u) + scaled_to_f32(delta_z);
+        if (dot(approximate, approximate) > u.dynamics_hi.w) {
+            return EscapeResult(true, i + 1u, approximate);
+        }
+    }
+
+    if (available_iterations < max_iterations && u.deep.x < 1.5) {
+        // An escaping reference can end before a nearby fragment. At the
+        // initial handoff the proven DS renderer is still a safe per-fragment
+        // fallback; deeper operation will replace this with orbit rebasing.
+        return iterate_ds(centre, local_offset, julia);
+    }
+    if (available_iterations < max_iterations) {
+        // Beyond the handoff the absolute pixel coordinate no longer fits in
+        // DS. Continue from the already-separated perturbed state instead of
+        // restarting from a collapsed coordinate. Automatic reference
+        // rebasing will ultimately replace this conservative visual tail.
+        let c = select(u.view_hi.xy, u.dynamics_hi.xy, julia);
+        return continue_f32(approximate, c, available_iterations, max_iterations);
+    }
+    return EscapeResult(false, max_iterations, approximate);
+}
+
 fn palette(t: f32) -> vec3<f32> {
     let a = vec3<f32>(0.47, 0.49, 0.52);
     let b = vec3<f32>(0.42, 0.39, 0.36);
@@ -234,9 +369,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 
     let julia = u.display.x > 0.5;
     let double_single = u.view_lo.w > 0.5;
+    let perturbation = u.deep.x > 0.5;
     var result: EscapeResult;
     var world = world_f32;
-    if (double_single) {
+    if (perturbation) {
+        result = iterate_perturbation(centre_ds, local, local_offset, julia);
+        world = world_ds_approx;
+    } else if (double_single) {
         result = iterate_ds(centre_ds, local_offset, julia);
         world = world_ds_approx;
     } else {

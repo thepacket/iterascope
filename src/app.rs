@@ -1,17 +1,21 @@
+use std::sync::Arc;
+
 use web_time::Instant;
 
-use crate::arbitrary::ARBITRARY_HANDOFF_ZOOM;
+use crate::MAX_ITERATIONS;
+use crate::arbitrary::{
+    ARBITRARY_HANDOFF_ZOOM, DeepComplex, DeepView, MAX_DECIMAL_ZOOM_EXPONENT, ReferenceOrbit,
+};
 use crate::experiment::{
-    ComplexDocument, ComputationDocument, DisplayDocument, ExperimentDocument, PlaneDocument,
-    FAMILY_ID, FORMAT_ID, FORMAT_VERSION,
+    ComplexDocument, ComputationDocument, DeepComplexDocument, DeepPlaneDocument, DisplayDocument,
+    ExperimentDocument, FAMILY_ID, FORMAT_ID, FORMAT_VERSION, PlaneDocument,
 };
 use crate::orbit::{CriticalOrbit, CriticalOrbitCache, OrbitInput};
 use crate::precision::{
     DoubleSingle, DsValidity, PathProbeResult, PrecisionMode, ProbeCache, ProbeInput, ProbeResult,
     ValidityLevel,
 };
-use crate::render::{self, FractalPipeline, Uniforms};
-use crate::MAX_ITERATIONS;
+use crate::render::{self, DeepRenderData, FractalPipeline, Uniforms};
 
 const PANEL_WIDTH: f32 = 286.0;
 const HEADER_HEIGHT: f32 = 33.0;
@@ -20,6 +24,16 @@ const PANE_GAP: f32 = 6.0;
 /// it one-for-one feels abrupt on a high-resolution trackpad, so temper it
 /// without introducing lag or accumulating hidden state.
 const PINCH_SENSITIVITY: f64 = 0.65;
+/// Shift multiplies logarithmic zoom velocity. This preserves direction and
+/// reversibility while crossing hundreds of decimal orders in a short gesture.
+const ACCELERATED_ZOOM_POWER: f64 = 64.0;
+/// Limit one accelerated input sample to twenty decimal orders so a noisy
+/// trackpad event cannot jump uncontrollably across the entire deep range.
+const MAX_ACCELERATED_DECADES_PER_EVENT: f64 = 20.0;
+/// Automatic progressive navigation advances only after the current stage has
+/// been submitted for painting. Ten decades per stage reaches extreme targets
+/// quickly while preserving a visible sequence of intermediate renders.
+const PROGRESSIVE_ZOOM_DECADES_PER_STAGE: f64 = 10.0;
 /// Orbit disagreement alone enables the more expensive DS path only once a
 /// view is meaningfully zoomed. Classification disagreement and coordinate
 /// collapse always override this floor.
@@ -39,6 +53,44 @@ const CORAL: egui::Color32 = egui::Color32::from_rgb(163, 78, 65);
 struct PlaneView {
     centre: [f64; 2],
     half_height: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeepReferenceKey {
+    centre_re: String,
+    centre_im: String,
+    half_height: String,
+    julia_re: String,
+    julia_im: String,
+    iterations: u32,
+    bailout: u32,
+    pane: usize,
+}
+
+impl DeepReferenceKey {
+    fn new(
+        pane: usize,
+        view: &DeepView,
+        julia_c: &DeepComplex,
+        iterations: u32,
+        bailout: f32,
+    ) -> Self {
+        Self {
+            centre_re: view.centre.re.exact_decimal(),
+            centre_im: view.centre.im.exact_decimal(),
+            half_height: view.half_height.exact_decimal(),
+            julia_re: julia_c.re.exact_decimal(),
+            julia_im: julia_c.im.exact_decimal(),
+            iterations,
+            bailout: bailout.to_bits(),
+            pane,
+        }
+    }
+}
+
+struct DeepReferenceCache {
+    key: DeepReferenceKey,
+    data: Arc<DeepRenderData>,
 }
 
 impl PlaneView {
@@ -99,6 +151,8 @@ pub struct App {
     parameter: PlaneView,
     dynamical: PlaneView,
     julia_c: [f64; 2],
+    progressive_julia_zoom_target_exponent: u32,
+    progressive_julia_zoom_active: bool,
     iterations: u32,
     bailout: f32,
     palette_phase: f32,
@@ -115,8 +169,13 @@ pub struct App {
     orbit_step: usize,
     orbit_cache: CriticalOrbitCache,
     precision_modes: [PrecisionMode; 2],
+    deep_active: [bool; 2],
     ds_validity: [DsValidity; 2],
     probes: [ProbeCache; 2],
+    deep_views: [Option<DeepView>; 2],
+    deep_julia_c: Option<DeepComplex>,
+    deep_references: [Option<DeepReferenceCache>; 2],
+    deep_generation: u64,
     frame_ms: f32,
     frame_start: Instant,
 }
@@ -139,6 +198,8 @@ impl App {
             parameter: PlaneView::new([-0.5, 0.0], 1.45),
             dynamical: PlaneView::new([0.0, 0.0], 1.45),
             julia_c: [-0.745, 0.113],
+            progressive_julia_zoom_target_exponent: 0,
+            progressive_julia_zoom_active: false,
             iterations: 256,
             bailout: 4.0,
             palette_phase: 0.0,
@@ -155,8 +216,13 @@ impl App {
             orbit_step: 0,
             orbit_cache: CriticalOrbitCache::default(),
             precision_modes: [PrecisionMode::F32; 2],
+            deep_active: [false; 2],
             ds_validity: [DsValidity::default(); 2],
             probes: [ProbeCache::default(); 2],
+            deep_views: [None, None],
+            deep_julia_c: None,
+            deep_references: [None, None],
+            deep_generation: 0,
             frame_ms: 0.0,
             frame_start: Instant::now(),
         })
@@ -203,6 +269,43 @@ impl App {
                 parameter_changed |= coordinate_row(ui, "Re(c)", &mut self.julia_c[0]);
                 parameter_changed |= coordinate_row(ui, "Im(c)", &mut self.julia_c[1]);
                 ui.horizontal(|ui| {
+                    ui.label("Progressive Julia target 10^");
+                    ui.add(
+                        egui::DragValue::new(
+                            &mut self.progressive_julia_zoom_target_exponent,
+                        )
+                        .range(0..=MAX_DECIMAL_ZOOM_EXPONENT)
+                        .speed(1),
+                    )
+                    .on_hover_text(
+                        "Select and centre a feature, then traverse rendered stages toward this exponent",
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.progressive_julia_zoom_active, egui::Button::new("Start"))
+                        .clicked()
+                    {
+                        self.progressive_julia_zoom_active = true;
+                    }
+                    if ui
+                        .add_enabled(self.progressive_julia_zoom_active, egui::Button::new("Stop"))
+                        .clicked()
+                    {
+                        self.progressive_julia_zoom_active = false;
+                    }
+                    let current = self.magnification_log10(1);
+                    ui.label(
+                        egui::RichText::new(format!("current 10^{current:.2}"))
+                            .small()
+                            .color(if self.progressive_julia_zoom_active {
+                                BLUE
+                            } else {
+                                MUTED
+                            }),
+                    );
+                });
+                ui.horizontal(|ui| {
                     parameter_changed |=
                         preset_button(ui, "Seahorse", [-0.745, 0.113], &mut self.julia_c);
                     parameter_changed |=
@@ -214,6 +317,9 @@ impl App {
                     parameter_changed |=
                         preset_button(ui, "Basilica", [-1.0, 0.0], &mut self.julia_c);
                 });
+                if parameter_changed {
+                    self.deep_julia_c = None;
+                }
                 if parameter_changed {
                     self.reframe_dynamical_plane();
                 }
@@ -235,12 +341,14 @@ impl App {
                     "Parameter",
                     self.precision_modes[0],
                     self.ds_validity[0],
+                    self.deep_active[0],
                 );
                 precision_row(
                     ui,
                     "Julia",
                     self.precision_modes[1],
                     self.ds_validity[1],
+                    self.deep_active[1],
                 );
                 ui.label(
                     egui::RichText::new("Precision switches automatically after instability.")
@@ -300,12 +408,27 @@ impl App {
             if centre_on_orbit_step {
                 let orbit = self.orbit_cache.update(orbit_input);
                 self.dynamical.centre = orbit.points[orbit_step].z;
+                self.deep_views[1] = None;
                 self.zoom_focus[1] = None;
             }
 
             section(ui, "View status", |ui| {
-                zoom_row(ui, "Parameter", self.parameter.magnification());
-                zoom_row(ui, "Julia", self.dynamical.magnification());
+                zoom_row(
+                    ui,
+                    "Parameter",
+                    self.deep_views[0].as_ref().map_or_else(
+                        || format!("{:.6e}", self.parameter.magnification()),
+                        DeepView::magnification_label,
+                    ),
+                );
+                zoom_row(
+                    ui,
+                    "Julia",
+                    self.deep_views[1].as_ref().map_or_else(
+                        || format!("{:.6e}", self.dynamical.magnification()),
+                        DeepView::magnification_label,
+                    ),
+                );
                 probe_rows(
                     ui,
                     "P",
@@ -347,6 +470,13 @@ impl App {
                     .small()
                     .color(MUTED),
                 );
+                ui.label(
+                    egui::RichText::new(
+                        "Hold Shift while zooming for accelerated deep navigation.",
+                    )
+                    .small()
+                    .color(BLUE),
+                );
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Fine pan target").color(TEXT));
                 ui.horizontal(|ui| {
@@ -377,11 +507,11 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui.button("Reset parameter").clicked() {
                         self.parameter.reset_parameter();
+                        self.deep_views[0] = None;
                         self.zoom_focus[0] = None;
                     }
                     if ui.button("Reset Julia").clicked() {
-                        self.dynamical.reset_dynamical();
-                        self.zoom_focus[1] = None;
+                        self.reframe_dynamical_plane();
                     }
                 });
             });
@@ -421,6 +551,13 @@ impl App {
                 palette_phase: self.palette_phase,
                 critical_orbit_overlay: self.show_orbit_overlay,
             },
+            progressive_julia_zoom_target_exponent: self.progressive_julia_zoom_target_exponent,
+            deep_parameter_plane: self.deep_views[0].as_ref().map(deep_plane_document),
+            deep_dynamical_plane: self.deep_views[1].as_ref().map(deep_plane_document),
+            deep_parameter_c: self.deep_julia_c.as_ref().map(|value| DeepComplexDocument {
+                re: value.re.exact_decimal(),
+                im: value.im.exact_decimal(),
+            }),
         }
     }
 
@@ -450,6 +587,9 @@ impl App {
             document.dynamical_plane.half_height,
         );
         self.julia_c = [document.parameter_c.re, document.parameter_c.im];
+        self.progressive_julia_zoom_target_exponent =
+            document.progressive_julia_zoom_target_exponent;
+        self.progressive_julia_zoom_active = false;
         self.iterations = document.computation.iterations;
         self.bailout = document.computation.bailout;
         self.smooth = document.display.smooth_escape_time;
@@ -463,6 +603,33 @@ impl App {
         self.precision_modes = [PrecisionMode::F32; 2];
         self.ds_validity = [DsValidity::default(); 2];
         self.probes = [ProbeCache::default(); 2];
+        self.deep_views = [None, None];
+        self.deep_julia_c = None;
+        self.deep_active = [false; 2];
+        if let Some(plane) = document.deep_parameter_plane {
+            self.deep_views[0] = DeepView::parse(
+                &plane.centre.re,
+                &plane.centre.im,
+                &plane.half_height,
+                plane.magnification_log10,
+            )
+            .ok();
+        }
+        if let Some(plane) = document.deep_dynamical_plane {
+            self.deep_views[1] = DeepView::parse(
+                &plane.centre.re,
+                &plane.centre.im,
+                &plane.half_height,
+                plane.magnification_log10,
+            )
+            .ok();
+        }
+        if let Some(value) = document.deep_parameter_c {
+            let exponent = self.deep_views[0]
+                .as_ref()
+                .map_or(15, |view| view.zoom_exponent);
+            self.deep_julia_c = DeepComplex::parse(&value.re, &value.im, exponent).ok();
+        }
     }
 
     fn experiment_editor(&mut self, ctx: &egui::Context) {
@@ -478,7 +645,9 @@ impl App {
             .resizable(true)
             .show(ctx, |ui| {
                 ui.label(
-                    egui::RichText::new("IteraScope JSON · format version 1")
+                    egui::RichText::new(format!(
+                        "IteraScope JSON · format version {FORMAT_VERSION}"
+                    ))
                         .monospace()
                         .color(CREAM),
                 );
@@ -644,7 +813,13 @@ impl App {
         }
         if fine_pan != [0.0; 2] {
             interacting = true;
-            if pane == 0 {
+            if pane == 1 {
+                self.progressive_julia_zoom_active = false;
+            }
+            if let Some(deep) = &mut self.deep_views[pane] {
+                let aspect = viewport.width() as f64 / viewport.height().max(1.0) as f64;
+                let _ = deep.pan_local([fine_pan[0] * 0.2 * aspect, fine_pan[1] * 0.2]);
+            } else if pane == 0 {
                 self.parameter.pan_tenth(viewport, fine_pan);
             } else {
                 self.dynamical.pan_tenth(viewport, fine_pan);
@@ -653,8 +828,17 @@ impl App {
         }
 
         if response.dragged() && !pinching {
+            if pane == 1 {
+                self.progressive_julia_zoom_active = false;
+            }
             let delta = ui.input(|input| input.pointer.delta());
-            if pane == 0 {
+            if let Some(deep) = &mut self.deep_views[pane] {
+                let height = viewport.height().max(1.0) as f64;
+                let _ = deep.pan_local([
+                    -2.0 * delta.x as f64 / height,
+                    2.0 * delta.y as f64 / height,
+                ]);
+            } else if pane == 0 {
                 self.parameter.pan(viewport, delta);
             } else {
                 self.dynamical.pan(viewport, delta);
@@ -672,28 +856,52 @@ impl App {
             };
             if let Some(factor) = factor {
                 interacting = true;
-                if pane == 0 {
-                    self.parameter.zoom_from(self.zoom_focus[0], factor);
-                } else {
-                    self.dynamical.zoom_from(self.zoom_focus[1], factor);
+                if pane == 1 {
+                    self.progressive_julia_zoom_active = false;
                 }
+                let accelerated = ui.input(|input| input.modifiers.shift);
+                self.zoom_pane(pane, accelerate_zoom_factor(factor, accelerated));
             }
         }
         if response.clicked() && !response.dragged() {
             if let Some(position) = response.interact_pointer_pos() {
                 interacting = true;
-                let point = if pane == 0 {
-                    self.parameter.point_at(viewport, position)
+                if pane == 1 {
+                    self.progressive_julia_zoom_active = false;
+                }
+                if let Some(deep) = &mut self.deep_views[pane] {
+                    let local = local_coordinate(viewport, position);
+                    let _ = deep.recenter_local(local);
+                    let accelerated = ui.input(|input| input.modifiers.shift);
+                    let _ = deep.zoom(accelerate_zoom_factor(0.5, accelerated));
+                    self.zoom_focus[pane] = None;
+                    if pane == 0 {
+                        self.deep_julia_c = Some(deep.centre.clone());
+                        self.julia_c = deep.centre_preview();
+                        self.reframe_dynamical_plane();
+                    }
                 } else {
-                    self.dynamical.point_at(viewport, position)
-                };
-                self.zoom_focus[pane] = Some(point);
-                if pane == 0 {
-                    self.julia_c = point;
-                    self.parameter.zoom_from(Some(point), 0.5);
-                    self.reframe_dynamical_plane();
-                } else {
-                    self.dynamical.zoom_from(Some(point), 0.5);
+                    let point = if pane == 0 {
+                        self.parameter.point_at(viewport, position)
+                    } else {
+                        self.dynamical.point_at(viewport, position)
+                    };
+                    self.zoom_focus[pane] = Some(point);
+                    if pane == 0 {
+                        self.julia_c = point;
+                        self.deep_julia_c = None;
+                        self.parameter.centre = point;
+                        let accelerated = ui.input(|input| input.modifiers.shift);
+                        self.zoom_pane(0, accelerate_zoom_factor(0.5, accelerated));
+                        if let Some(deep) = &self.deep_views[0] {
+                            self.deep_julia_c = Some(deep.centre.clone());
+                        }
+                        self.reframe_dynamical_plane();
+                    } else {
+                        self.dynamical.centre = point;
+                        let accelerated = ui.input(|input| input.modifiers.shift);
+                        self.zoom_pane(1, accelerate_zoom_factor(0.5, accelerated));
+                    }
                 }
             }
         }
@@ -704,7 +912,11 @@ impl App {
             self.dynamical
         };
         let aspect = viewport.width() / viewport.height().max(1.0);
-        let magnification = view.magnification();
+        let deep_view = self.deep_views[pane].clone();
+        let magnification = deep_view.as_ref().map_or_else(
+            || view.magnification(),
+            |deep| 10.0_f64.powf(deep.magnification_log10),
+        );
         let probe_input = ProbeInput {
             centre: view.centre,
             half_height: view.half_height,
@@ -714,7 +926,9 @@ impl App {
             bailout: self.bailout as f64,
             pane,
         };
-        let probe = if interacting {
+        let probe = if deep_view.is_some() {
+            ProbeResult::default()
+        } else if interacting {
             self.probes[pane].current(probe_input).unwrap_or_default()
         } else {
             self.probes[pane].update(probe_input)
@@ -744,27 +958,40 @@ impl App {
         );
         self.ds_validity[pane] = ds_validity;
 
-        let (precision_text, zoom_colour) = match precision {
-            PrecisionMode::DoubleSingle => (
-                ds_validity.label(),
-                match ds_validity.level {
-                    ValidityLevel::Stable => BLUE,
-                    ValidityLevel::Risk => CREAM,
-                    ValidityLevel::Limit => CORAL,
-                },
-            ),
-            PrecisionMode::F32 if probe.f32.unstable() => ("F32 UNSTABLE", CORAL),
-            PrecisionMode::F32 => ("F32", CREAM),
+        let deep = self.deep_reference(pane, deep_view.as_ref(), !interacting);
+        self.deep_active[pane] = deep.is_some();
+
+        let (precision_text, zoom_colour) = if deep.is_some() {
+            ("AP PERT", BLUE)
+        } else {
+            match precision {
+                PrecisionMode::DoubleSingle => (
+                    ds_validity.label(),
+                    match ds_validity.level {
+                        ValidityLevel::Stable => BLUE,
+                        ValidityLevel::Risk => CREAM,
+                        ValidityLevel::Limit => CORAL,
+                    },
+                ),
+                PrecisionMode::F32 if probe.f32.unstable() => ("F32 UNSTABLE", CORAL),
+                PrecisionMode::F32 => ("F32", CREAM),
+            }
         };
         ui.painter().text(
             egui::pos2(header.max.x - 10.0, header.center().y),
             egui::Align2::RIGHT_CENTER,
-            format!("{precision_text}  ·  ZOOM ×{magnification:.4e}"),
+            format!(
+                "{precision_text}  ·  ZOOM ×{}",
+                deep_view.as_ref().map_or_else(
+                    || format!("{magnification:.4e}"),
+                    |deep| deep.magnification_label()
+                )
+            ),
             egui::FontId::new(11.0, egui::FontFamily::Monospace),
             zoom_colour,
         );
 
-        let uniforms = Uniforms::new(
+        let mut uniforms = Uniforms::new(
             view.centre,
             view.half_height,
             aspect,
@@ -777,9 +1004,18 @@ impl App {
             self.grid,
             precision,
         );
-        ui.painter().add(render::callback(viewport, pane, uniforms));
+        if let Some(data) = &deep {
+            uniforms = uniforms.enable_perturbation(
+                data.scale_mantissa,
+                data.scale_exponent,
+                data.reference.len(),
+                data.ds_fallback,
+            );
+        }
+        ui.painter()
+            .add(render::callback(viewport, pane, uniforms, deep));
 
-        if pane == 1 && self.show_orbit_overlay {
+        if pane == 1 && self.show_orbit_overlay && deep_view.is_none() {
             let orbit = self.orbit_cache.update(OrbitInput {
                 c: self.julia_c,
                 iterations: self.iterations,
@@ -790,16 +1026,154 @@ impl App {
             draw_orbit_overlay(ui, viewport, &view, orbit, selected);
         }
 
-        if let Some(focus) = self.zoom_focus[pane] {
+        if let Some(focus) = self.zoom_focus[pane]
+            && deep_view.is_none()
+        {
             self.draw_focus_marker(ui, viewport, &view, focus);
         }
-        self.draw_readout(ui, viewport, response.hover_pos(), &view, precision);
+        if deep_view.is_none() {
+            self.draw_readout(ui, viewport, response.hover_pos(), &view, precision);
+        } else if let Some(deep_view) = &deep_view {
+            self.draw_deep_readout(ui, viewport, response.hover_pos(), deep_view);
+        }
     }
 
     fn reframe_dynamical_plane(&mut self) {
         self.dynamical.reset_dynamical();
+        self.deep_views[1] = None;
+        self.progressive_julia_zoom_active = false;
         self.zoom_focus[1] = None;
         self.orbit_step = 0;
+    }
+
+    fn magnification_log10(&self, pane: usize) -> f64 {
+        self.deep_views[pane].as_ref().map_or_else(
+            || {
+                let view = if pane == 0 {
+                    self.parameter
+                } else {
+                    self.dynamical
+                };
+                view.magnification().log10()
+            },
+            |view| view.magnification_log10,
+        )
+    }
+
+    fn advance_progressive_julia_zoom(&mut self) {
+        if !self.progressive_julia_zoom_active {
+            return;
+        }
+        let current = self.magnification_log10(1);
+        let target = self.progressive_julia_zoom_target_exponent as f64;
+        let Some(factor) = progressive_zoom_factor(current, target) else {
+            self.progressive_julia_zoom_active = false;
+            return;
+        };
+        self.zoom_pane(1, factor);
+    }
+
+    fn zoom_pane(&mut self, pane: usize, factor: f64) {
+        let handoff_log = ARBITRARY_HANDOFF_ZOOM.log10();
+        if let Some(deep) = &mut self.deep_views[pane] {
+            let next_log = deep.magnification_log10 - factor.log10();
+            if next_log < handoff_log {
+                let centre = deep.centre_preview();
+                let half_height = 1.45 / 10.0_f64.powf(next_log);
+                self.deep_views[pane] = None;
+                let view = if pane == 0 {
+                    &mut self.parameter
+                } else {
+                    &mut self.dynamical
+                };
+                view.centre = centre;
+                view.half_height = half_height;
+                self.zoom_focus[pane] = None;
+            } else {
+                let _ = deep.zoom(factor);
+            }
+            return;
+        }
+
+        let view = if pane == 0 {
+            &mut self.parameter
+        } else {
+            &mut self.dynamical
+        };
+        let desired_half_height = view.half_height * factor;
+        let handoff_half_height = 1.45 / ARBITRARY_HANDOFF_ZOOM;
+        if factor < 1.0 && desired_half_height <= handoff_half_height {
+            if let Some(focus) = self.zoom_focus[pane] {
+                view.centre = focus;
+            }
+            view.half_height = handoff_half_height;
+            if let Ok(mut deep) = DeepView::at_handoff(view.centre) {
+                let remaining_factor = desired_half_height / handoff_half_height;
+                if remaining_factor < 1.0 {
+                    let _ = deep.zoom(remaining_factor);
+                }
+                self.deep_views[pane] = Some(deep);
+                self.zoom_focus[pane] = None;
+            }
+        } else {
+            view.zoom_from(self.zoom_focus[pane], factor);
+        }
+    }
+
+    fn deep_reference(
+        &mut self,
+        pane: usize,
+        view: Option<&DeepView>,
+        may_build: bool,
+    ) -> Option<Arc<DeepRenderData>> {
+        let view = view?;
+        let julia_c = self.deep_julia_c.clone().unwrap_or_else(|| {
+            DeepComplex::from_f64(self.julia_c, view.zoom_exponent).expect("finite Julia parameter")
+        });
+        let key = DeepReferenceKey::new(pane, view, &julia_c, self.iterations, self.bailout);
+        if let Some(cached) = &self.deep_references[pane]
+            && cached.key == key
+        {
+            return Some(Arc::clone(&cached.data));
+        }
+        if !may_build {
+            // Keep the last completed deep frame on screen while navigation
+            // changes and a replacement reference orbit is not ready yet.
+            // Returning `None` here exposes the frozen DS handoff snapshot,
+            // which appears as a distracting 1.14e14× flash.
+            if let Some(cached) = &self.deep_references[pane] {
+                return Some(Arc::clone(&cached.data));
+            }
+            // On the first transition there is no deep frame to retain. Build
+            // synchronously so the previously presented shallow frame stays
+            // visible until the first AP frame can replace it atomically.
+        }
+
+        let orbit = if pane == 0 {
+            ReferenceOrbit::quadratic_parameter(&view.centre, self.iterations, self.bailout as f64)
+        } else {
+            ReferenceOrbit::quadratic_julia(
+                view.centre.clone(),
+                &julia_c,
+                self.iterations,
+                self.bailout as f64,
+            )
+        }
+        .ok()?;
+        let (scale_mantissa, scale_exponent) = view.half_height.scaled_f32();
+        self.deep_generation = self.deep_generation.wrapping_add(1).max(1);
+        let data = Arc::new(DeepRenderData::from_reference(
+            self.deep_generation,
+            scale_mantissa,
+            scale_exponent,
+            &orbit,
+            view.magnification_log10 <= ARBITRARY_HANDOFF_ZOOM.log10() + f64::EPSILON * 8.0,
+        ));
+        self.deep_references[pane] = Some(DeepReferenceCache {
+            key,
+            data: Arc::clone(&data),
+        });
+        Some(data)
     }
 
     fn draw_focus_marker(
@@ -865,6 +1239,44 @@ impl App {
         );
         ui.painter()
             .galley(box_rect.min + egui::vec2(6.0, 3.0), galley, TEXT);
+    }
+
+    fn draw_deep_readout(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        pointer: Option<egui::Pos2>,
+        view: &DeepView,
+    ) {
+        let mut sampled = view.clone();
+        if let Some(pointer) = pointer.filter(|pointer| rect.contains(*pointer)) {
+            let _ = sampled.recenter_local(local_coordinate(rect, pointer));
+        }
+        let text = format!(
+            "NAV AP   {}  {}i\nSCALE    {}\nPRECISION {} decimal digits",
+            sampled.centre.re.scientific(40),
+            sampled.centre.im.scientific(40),
+            view.half_height.scientific(8),
+            view.half_height.precision(),
+        );
+        let font = egui::FontId::new(12.0, egui::FontFamily::Monospace);
+        let galley =
+            ui.painter()
+                .layout_no_wrap(text, font, egui::Color32::from_rgb(218, 222, 230));
+        let background = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + 8.0, rect.max.y - galley.size().y - 12.0),
+            galley.size() + egui::vec2(12.0, 8.0),
+        );
+        ui.painter().rect_filled(
+            background,
+            3.0,
+            egui::Color32::from_rgba_unmultiplied(8, 11, 17, 232),
+        );
+        ui.painter().galley(
+            background.min + egui::vec2(6.0, 4.0),
+            galley,
+            egui::Color32::WHITE,
+        );
     }
 }
 
@@ -1189,6 +1601,11 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(BG))
             .show(ui, |ui| self.workspace(ui));
 
+        // The current stage has now produced its paint callback. Advance the
+        // authoritative view afterwards so every stage is presented for at
+        // least one frame before its successor is prepared.
+        self.advance_progressive_julia_zoom();
+
         self.experiment_editor(ui.ctx());
         self.orbit_inspector(ui.ctx());
 
@@ -1250,12 +1667,12 @@ fn coordinate_row(ui: &mut egui::Ui, label: &str, value: &mut f64) -> bool {
     .inner
 }
 
-fn zoom_row(ui: &mut egui::Ui, label: &str, magnification: f64) {
+fn zoom_row(ui: &mut egui::Ui, label: &str, magnification: String) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).color(MUTED));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
-                egui::RichText::new(format!("×{magnification:.6e}"))
+                egui::RichText::new(format!("×{magnification}"))
                     .monospace()
                     .color(CREAM),
             );
@@ -1263,20 +1680,30 @@ fn zoom_row(ui: &mut egui::Ui, label: &str, magnification: f64) {
     });
 }
 
-fn precision_row(ui: &mut egui::Ui, label: &str, precision: PrecisionMode, validity: DsValidity) {
+fn precision_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    precision: PrecisionMode,
+    validity: DsValidity,
+    deep_active: bool,
+) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).color(MUTED));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (text, colour) = match precision {
-                PrecisionMode::F32 => (precision.label(), CREAM),
-                PrecisionMode::DoubleSingle => (
-                    validity.label(),
-                    match validity.level {
-                        ValidityLevel::Stable => BLUE,
-                        ValidityLevel::Risk => CREAM,
-                        ValidityLevel::Limit => CORAL,
-                    },
-                ),
+            let (text, colour) = if deep_active {
+                ("AP PERT", BLUE)
+            } else {
+                match precision {
+                    PrecisionMode::F32 => (precision.label(), CREAM),
+                    PrecisionMode::DoubleSingle => (
+                        validity.label(),
+                        match validity.level {
+                            ValidityLevel::Stable => BLUE,
+                            ValidityLevel::Risk => CREAM,
+                            ValidityLevel::Limit => CORAL,
+                        },
+                    ),
+                }
             };
             badge(ui, text, colour);
         });
@@ -1323,6 +1750,47 @@ fn pinch_zoom_factor(zoom_delta: f32) -> f64 {
     // Spreading fingers reports >1 and should reduce half-height (zoom in).
     // Clamp a single frame so an OS gesture spike cannot discard the view.
     (zoom_delta as f64).clamp(0.5, 2.0).powf(-PINCH_SENSITIVITY)
+}
+
+fn accelerate_zoom_factor(factor: f64, accelerated: bool) -> f64 {
+    if !accelerated {
+        return factor;
+    }
+    let maximum_log = MAX_ACCELERATED_DECADES_PER_EVENT * std::f64::consts::LN_10;
+    (factor.ln() * ACCELERATED_ZOOM_POWER)
+        .clamp(-maximum_log, maximum_log)
+        .exp()
+}
+
+fn progressive_zoom_factor(current_log10: f64, target_log10: f64) -> Option<f64> {
+    let remaining = target_log10 - current_log10;
+    if remaining.abs() < 1e-9 {
+        return None;
+    }
+    let stage = remaining.clamp(
+        -PROGRESSIVE_ZOOM_DECADES_PER_STAGE,
+        PROGRESSIVE_ZOOM_DECADES_PER_STAGE,
+    );
+    Some(10.0_f64.powf(-stage))
+}
+
+fn local_coordinate(rect: egui::Rect, position: egui::Pos2) -> [f64; 2] {
+    let half_height = (rect.height() * 0.5).max(0.5);
+    [
+        ((position.x - rect.center().x) / half_height) as f64,
+        ((rect.center().y - position.y) / half_height) as f64,
+    ]
+}
+
+fn deep_plane_document(view: &DeepView) -> DeepPlaneDocument {
+    DeepPlaneDocument {
+        centre: DeepComplexDocument {
+            re: view.centre.re.exact_decimal(),
+            im: view.centre.im.exact_decimal(),
+        },
+        half_height: view.half_height.exact_decimal(),
+        magnification_log10: view.magnification_log10,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1631,6 +2099,26 @@ mod tests {
         assert!(pinch_zoom_factor(0.8) > 1.0);
         assert_eq!(pinch_zoom_factor(1.0), 1.0);
         assert!(pinch_zoom_factor(2.0) > 0.5);
+    }
+
+    #[test]
+    fn shift_acceleration_is_fast_symmetric_and_bounded() {
+        let zoom_in = accelerate_zoom_factor(0.5, true);
+        let zoom_out = accelerate_zoom_factor(2.0, true);
+        assert!(zoom_in < 1e-19);
+        assert!(zoom_out > 1e19);
+        assert!((zoom_in * zoom_out - 1.0).abs() < 1e-12);
+        assert_eq!(accelerate_zoom_factor(0.5, false), 0.5);
+        assert!(accelerate_zoom_factor(1e-100, true) >= 1e-20 * (1.0 - 1e-12));
+        assert!(accelerate_zoom_factor(1e100, true) <= 1e20 * (1.0 + 1e-12));
+    }
+
+    #[test]
+    fn progressive_zoom_uses_staged_symmetric_decades_and_lands_exactly() {
+        assert_eq!(progressive_zoom_factor(0.0, 5_000.0), Some(1e-10));
+        assert_eq!(progressive_zoom_factor(5_000.0, 0.0), Some(1e10));
+        assert_eq!(progressive_zoom_factor(995.0, 1_000.0), Some(1e-5));
+        assert_eq!(progressive_zoom_factor(1_000.0, 1_000.0), None);
     }
 
     #[test]

@@ -19,6 +19,10 @@ runs entirely in WGSL.
 - Linked Mandelbrot parameter plane and Julia dynamical plane
 - Click-to-centre 2× zoom; parameter-plane clicks also select the Julia parameter
 - Wheel, trackpad pinch and drag navigation in either plane
+- Shift-modified click, wheel or pinch for accelerated logarithmic zoom in
+  either direction
+- Automatic progressive Julia navigation to a selected `10^n` target, up to
+  `10^5000×`, with visible intermediate renders and Start/Stop controls
 - Keyboard arrows and four on-screen buttons for deterministic fine panning by
   one tenth of the displayed range
 - Adjustable iteration limit up to 50,000, bailout, palette phase and smooth colouring
@@ -73,10 +77,17 @@ resolution—they are more meaningful than visual smoothness alone.
 The current stable raster path hands off at the experimentally confirmed
 `1.14e14×` boundary. IteraScope now has pure-Rust arbitrary-precision decimal
 coordinates, a zoom-dependent precision policy and arbitrary-precision
-quadratic reference orbits sized for the `1e1000×` acceptance target. Connecting
-those reference orbits to exponent-scaled GPU perturbation is the next active
-step. CPU work scales with reference precision and iteration count rather than
-pixel count.
+quadratic reference orbits sized for the `1e1000×` acceptance target. At the
+handoff, those cached reference orbits now drive an exponent-scaled GPU
+perturbation path; an early-ending reference falls back per fragment to the
+stable DS renderer at the handoff. Beyond it, the pane centre, scale, click
+coordinates and tenth-range pans remain in arbitrary precision through the
+`1e1000×` acceptance target, with navigation currently available through
+`1e5000×`; experiment JSON records exact decimal values and the configured
+progressive Julia target. CPU
+work scales with reference precision and iteration count rather than pixel
+count. Automatic reference rebasing and formal glitch validation remain in
+development.
 
 ## Run natively
 
@@ -149,10 +160,10 @@ live state is changed.
 
 ## Near-term roadmap
 
-1. Arbitrary-precision coordinates and reference orbits supporting the
-   `1e1000×` acceptance target
-2. Exponent-scaled GPU perturbation, glitch detection and automatic rebasing
-3. Deterministic validation against direct arbitrary-precision sample orbits
+1. Automatic reference rebasing and perturbation glitch detection
+2. Deterministic validation against direct arbitrary-precision sample orbits
+3. Progressive/background reference-orbit generation at very high iteration
+   counts
 
 ## Project status
 

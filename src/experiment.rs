@@ -3,9 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::MAX_ITERATIONS;
+use crate::arbitrary::MAX_DECIMAL_ZOOM_EXPONENT;
 
 pub(crate) const FORMAT_ID: &str = "iterascope-experiment";
-pub(crate) const FORMAT_VERSION: u32 = 1;
+pub(crate) const FORMAT_VERSION: u32 = 2;
 pub(crate) const FAMILY_ID: &str = "quadratic";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -19,6 +20,33 @@ pub(crate) struct ExperimentDocument {
     pub(crate) parameter_c: ComplexDocument,
     pub(crate) computation: ComputationDocument,
     pub(crate) display: DisplayDocument,
+    #[serde(
+        default,
+        alias = "initial_julia_zoom_exponent",
+        skip_serializing_if = "is_zero"
+    )]
+    pub(crate) progressive_julia_zoom_target_exponent: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) deep_parameter_plane: Option<DeepPlaneDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) deep_dynamical_plane: Option<DeepPlaneDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) deep_parameter_c: Option<DeepComplexDocument>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeepPlaneDocument {
+    pub(crate) centre: DeepComplexDocument,
+    pub(crate) half_height: String,
+    pub(crate) magnification_log10: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeepComplexDocument {
+    pub(crate) re: String,
+    pub(crate) im: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -56,6 +84,10 @@ const fn default_true() -> bool {
     true
 }
 
+const fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 impl ExperimentDocument {
     pub(crate) fn to_pretty_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(self).map_err(|error| error.to_string())
@@ -71,10 +103,10 @@ impl ExperimentDocument {
         if self.format != FORMAT_ID {
             return Err(format!("unsupported document format {:?}", self.format));
         }
-        if self.version != FORMAT_VERSION {
+        if !(1..=FORMAT_VERSION).contains(&self.version) {
             return Err(format!(
-                "unsupported document version {}; expected {}",
-                self.version, FORMAT_VERSION
+                "unsupported document version {}; supported versions are 1 through {}",
+                self.version, FORMAT_VERSION,
             ));
         }
         if self.family != FAMILY_ID {
@@ -98,8 +130,46 @@ impl ExperimentDocument {
         {
             return Err("palette_phase must be finite and between -1 and 1".to_owned());
         }
+        if self.progressive_julia_zoom_target_exponent > MAX_DECIMAL_ZOOM_EXPONENT {
+            return Err(format!(
+                "progressive_julia_zoom_target_exponent must be between 0 and {MAX_DECIMAL_ZOOM_EXPONENT}"
+            ));
+        }
+        if let Some(plane) = &self.deep_parameter_plane {
+            validate_deep_plane("deep_parameter_plane", plane)?;
+        }
+        if let Some(plane) = &self.deep_dynamical_plane {
+            validate_deep_plane("deep_dynamical_plane", plane)?;
+        }
+        if let Some(value) = &self.deep_parameter_c {
+            let exponent = self
+                .deep_parameter_plane
+                .as_ref()
+                .map_or(15, |plane| plane.magnification_log10.ceil() as u32);
+            crate::arbitrary::DeepComplex::parse(&value.re, &value.im, exponent)
+                .map_err(|error| format!("deep_parameter_c: {error}"))?;
+        }
+        if self.version == 1
+            && (self.deep_parameter_plane.is_some()
+                || self.deep_dynamical_plane.is_some()
+                || self.deep_parameter_c.is_some()
+                || self.progressive_julia_zoom_target_exponent != 0)
+        {
+            return Err("deep arbitrary-precision state requires document version 2".to_owned());
+        }
         Ok(())
     }
+}
+
+fn validate_deep_plane(name: &str, plane: &DeepPlaneDocument) -> Result<(), String> {
+    crate::arbitrary::DeepView::parse(
+        &plane.centre.re,
+        &plane.centre.im,
+        &plane.half_height,
+        plane.magnification_log10,
+    )
+    .map(|_| ())
+    .map_err(|error| format!("{name}: {error}"))
 }
 
 fn validate_plane(name: &str, plane: PlaneDocument) -> Result<(), String> {
@@ -153,6 +223,10 @@ mod tests {
                 palette_phase: 0.25,
                 critical_orbit_overlay: true,
             },
+            progressive_julia_zoom_target_exponent: 0,
+            deep_parameter_plane: None,
+            deep_dynamical_plane: None,
+            deep_parameter_c: None,
         }
     }
 
@@ -161,6 +235,23 @@ mod tests {
         let document = example();
         let json = document.to_pretty_json().unwrap();
         assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
+    }
+
+    #[test]
+    fn thousand_digit_deep_state_round_trips_as_decimal_strings() {
+        let mut document = example();
+        document.deep_dynamical_plane = Some(DeepPlaneDocument {
+            centre: DeepComplexDocument {
+                re: "-7.45e-1".to_owned(),
+                im: "1.13e-1".to_owned(),
+            },
+            half_height: "1.45e-1000".to_owned(),
+            magnification_log10: 1_000.0,
+        });
+        let json = document.to_pretty_json().unwrap();
+        let restored = ExperimentDocument::from_json(&json).unwrap();
+        assert_eq!(restored, document);
+        assert!(json.contains("1.45e-1000"));
     }
 
     #[test]
@@ -173,7 +264,8 @@ mod tests {
 
     #[test]
     fn older_version_one_documents_enable_the_orbit_overlay() {
-        let document = example();
+        let mut document = example();
+        document.version = 1;
         let mut value = serde_json::to_value(document).unwrap();
         value["display"]
             .as_object_mut()
@@ -193,5 +285,16 @@ mod tests {
         document.computation.iterations = MAX_ITERATIONS + 1;
         let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
         assert!(error.contains("50000"));
+    }
+
+    #[test]
+    fn progressive_julia_target_accepts_five_thousand_and_rejects_more() {
+        let mut document = example();
+        document.progressive_julia_zoom_target_exponent = MAX_DECIMAL_ZOOM_EXPONENT;
+        assert!(ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).is_ok());
+
+        document.progressive_julia_zoom_target_exponent = MAX_DECIMAL_ZOOM_EXPONENT + 1;
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("5000"));
     }
 }
