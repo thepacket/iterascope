@@ -65,6 +65,21 @@ point and its eight immediate predecessors. These straight segments indicate
 iteration order; they are not continuous curves along the Julia set. The
 selected orbit point can also become the centre of the Julia view.
 
+### Live rendering and frame timing
+
+IteraScope currently requests another frame continuously, even when neither
+view has changed. The value beside **LIVE** is a smoothed interval between UI
+frames, not a direct measurement of shader execution time. For example,
+`16.7 ms` is approximately 60 frames per second and `33.3 ms` is approximately
+30 frames per second. The displayed value uses an exponential moving average
+that applies 8% of each newly measured interval.
+
+The measurement includes application work and scheduling delays between UI
+frames. WebGPU command completion is asynchronous, so it does not isolate GPU
+render time. A blocked UI thread cannot update the value. Separate CPU
+reference-orbit timings, GPU timestamps where supported, and presented-frame
+timings are planned for meaningful performance diagnostics.
+
 ## Numerical model and limits
 
 The interface reports the active arithmetic for each pane. Navigation remains
@@ -88,6 +103,16 @@ progressive Julia target. CPU
 work scales with reference precision and iteration count rather than pixel
 count. Automatic reference rebasing and formal glitch validation remain in
 development.
+
+At extreme depth, a uniformly black view is not yet proof that the sampled
+region is mathematically interior. Progressive zoom retains a finite selected
+centre, which can eventually fall entirely to one side of a boundary, and the
+current perturbation path does not yet implement automatic rebasing or glitch
+detection. Increasing the iteration limit also rebuilds the arbitrary-
+precision reference orbit synchronously and can ask every displayed pixel to
+execute up to 50,000 shader iterations. High iteration counts can therefore
+temporarily make the application unresponsive, especially for non-escaping
+views.
 
 ## Run natively
 
