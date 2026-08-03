@@ -2,17 +2,37 @@
 
 **An open laboratory for complex dynamics.**
 
-IteraScope is a GPU-first scientific viewer for exploring iterated maps. The
-first instrument links the parameter and dynamical planes of the quadratic
-family
+IteraScope is a GPU-first scientific laboratory for exploring iterated maps.
+It currently provides two linked instruments: a parameter/dynamical-plane
+viewer for the quadratic family
 
 \[
-f_c(z) = z^2 + c.
+f_c(z) = z^2 + c,
+\]
+
+and a Newton-basin/convergence viewer for
+
+\[
+p(z) = z^3 - 1.
 \]
 
 The same Rust application runs natively and in a WebGPU-capable browser. egui
 and the fractal renderer share one `wgpu` device; the escape-time calculation
-runs entirely in WGSL.
+and Newton iterations run entirely in WGSL. CPU calculations are reserved for
+pointwise diagnostics, precision validation and arbitrary-precision reference
+orbits rather than full-frame pixel rendering.
+
+## Scientific instruments
+
+| Instrument | Left pane | Right pane | Selected value |
+| --- | --- | --- | --- |
+| Quadratic | Mandelbrot parameter plane | Julia dynamical plane | Parameter `c` |
+| Newton cubic | Root-basin overview | Convergence and boundary-sensitivity detail | Initial value `z₀` |
+
+Both instruments link a global classification view to a local diagnostic view.
+They are intended for reproducible investigation: the selected value,
+viewports, numerical settings and display state can be exported together as a
+versioned experiment document.
 
 ## What works today
 
@@ -115,12 +135,14 @@ performance diagnostics.
 
 ## Numerical model and limits
 
-The interface reports the active arithmetic for each pane. Navigation remains
-in CPU `f64`; rendering starts with fast GPU `f32` and switches automatically
-to GPU double-single when coordinate resolution is at risk or the lightweight
-orbit probe detects divergent escape behaviour. The `DS STABLE`, `DS RISK` and
-`DS LIMIT` labels describe agreement with sampled `f64` orbits and coordinate
-resolution—they are more meaningful than visual smoothness alone.
+The interface reports the active arithmetic for each pane. Viewport navigation
+starts in CPU `f64` and moves to arbitrary-precision decimal coordinates for
+quadratic deep zoom. Rendering starts with fast GPU `f32` and switches
+automatically to GPU double-single when coordinate resolution is at risk or
+the lightweight orbit probe detects divergent escape behaviour. The
+`DS STABLE`, `DS RISK` and `DS LIMIT` labels describe agreement with sampled
+`f64` orbits and coordinate resolution—they are more meaningful than visual
+smoothness alone.
 
 The current stable raster path hands off at the experimentally confirmed
 `1.14e14×` boundary. IteraScope now has pure-Rust arbitrary-precision decimal
@@ -132,10 +154,9 @@ stable DS renderer at the handoff. Beyond it, the pane centre, scale, click
 coordinates and tenth-range pans remain in arbitrary precision through the
 `1e1000×` acceptance target, with navigation currently available through
 `1e5000×`; experiment JSON records exact decimal values and the configured
-progressive Julia target. CPU
-work scales with reference precision and iteration count rather than pixel
-count. Automatic reference rebasing and formal glitch validation remain in
-development.
+progressive Julia target. CPU work scales with reference precision and
+iteration count rather than pixel count. Automatic reference rebasing and
+formal glitch validation remain in development.
 
 At extreme depth, a uniformly black view is not yet proof that the sampled
 region is mathematically interior. Progressive zoom retains a finite selected
