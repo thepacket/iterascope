@@ -9,8 +9,10 @@ use crate::arbitrary::{
 };
 use crate::experiment::{
     ComplexDocument, ComputationDocument, DeepComplexDocument, DeepPlaneDocument, DisplayDocument,
-    ExperimentDocument, FAMILY_ID, FORMAT_ID, FORMAT_VERSION, PlaneDocument,
+    ExperimentDocument, FORMAT_ID, FORMAT_VERSION, NEWTON_FAMILY_ID, PlaneDocument,
+    QUADRATIC_FAMILY_ID,
 };
+use crate::newton::{NewtonResult, ROOTS};
 use crate::orbit::{CriticalOrbit, CriticalOrbitCache, OrbitInput};
 use crate::precision::{
     DoubleSingle, DsValidity, PathProbeResult, PrecisionMode, ProbeCache, ProbeInput, ProbeResult,
@@ -52,6 +54,36 @@ const MUTED: egui::Color32 = egui::Color32::from_rgb(130, 137, 150);
 const CREAM: egui::Color32 = egui::Color32::from_rgb(231, 220, 188);
 const BLUE: egui::Color32 = egui::Color32::from_rgb(101, 157, 195);
 const CORAL: egui::Color32 = egui::Color32::from_rgb(163, 78, 65);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FractalFamily {
+    #[default]
+    Quadratic,
+    NewtonCubic,
+}
+
+impl FractalFamily {
+    const fn document_id(self) -> &'static str {
+        match self {
+            Self::Quadratic => QUADRATIC_FAMILY_ID,
+            Self::NewtonCubic => NEWTON_FAMILY_ID,
+        }
+    }
+
+    const fn shader_flag(self) -> u32 {
+        match self {
+            Self::Quadratic => 0,
+            Self::NewtonCubic => 1,
+        }
+    }
+
+    fn from_document_id(value: &str) -> Self {
+        match value {
+            NEWTON_FAMILY_ID => Self::NewtonCubic,
+            _ => Self::Quadratic,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct PlaneView {
@@ -152,12 +184,14 @@ impl PlaneView {
 }
 
 pub struct App {
+    family: FractalFamily,
     parameter: PlaneView,
     dynamical: PlaneView,
     julia_c: [f64; 2],
     progressive_julia_zoom_target_exponent: u32,
     progressive_julia_zoom_active: bool,
     progressive_julia_next_stage_at: Option<Instant>,
+    newton_selected_z: [f64; 2],
     iterations: u32,
     bailout: f32,
     palette_phase: f32,
@@ -199,12 +233,14 @@ impl App {
         configure_style(&cc.egui_ctx);
 
         Some(Self {
+            family: FractalFamily::Quadratic,
             parameter: PlaneView::new([-0.5, 0.0], 1.45),
             dynamical: PlaneView::new([0.0, 0.0], 1.45),
             julia_c: [-0.745, 0.113],
             progressive_julia_zoom_target_exponent: 0,
             progressive_julia_zoom_active: false,
             progressive_julia_next_stage_at: None,
+            newton_selected_z: [0.5, 0.5],
             iterations: 256,
             bailout: 4.0,
             palette_phase: 0.0,
@@ -235,21 +271,50 @@ impl App {
     fn controls(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             section(ui, "Experiment", |ui| {
+                let previous_family = self.family;
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.family,
+                        FractalFamily::Quadratic,
+                        "Quadratic",
+                    );
+                    ui.selectable_value(
+                        &mut self.family,
+                        FractalFamily::NewtonCubic,
+                        "Newton",
+                    );
+                });
+                if self.family != previous_family {
+                    self.reset_for_family();
+                }
                 ui.label(
-                    egui::RichText::new("Quadratic family")
+                    egui::RichText::new(match self.family {
+                        FractalFamily::Quadratic => "Quadratic family",
+                        FractalFamily::NewtonCubic => "Newton basins",
+                    })
                         .color(CREAM)
                         .strong(),
                 );
                 ui.label(
-                    egui::RichText::new("f₍c₎(z) = z² + c")
+                    egui::RichText::new(match self.family {
+                        FractalFamily::Quadratic => "f₍c₎(z) = z² + c",
+                        FractalFamily::NewtonCubic => {
+                            "N(z) = z - (z³ - 1) / (3z²)"
+                        }
+                    })
                         .monospace()
                         .color(TEXT),
                 );
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(
-                        "Select c in the parameter plane to inspect its dynamical plane.",
-                    )
+                    egui::RichText::new(match self.family {
+                        FractalFamily::Quadratic => {
+                            "Select c in the parameter plane to inspect its dynamical plane."
+                        }
+                        FractalFamily::NewtonCubic => {
+                            "Compare root basins with a linked convergence-detail view."
+                        }
+                    })
                     .color(MUTED),
                 );
             });
@@ -268,7 +333,8 @@ impl App {
                 );
             });
 
-            section(ui, "Selected parameter", |ui| {
+            if self.family == FractalFamily::Quadratic {
+                section(ui, "Selected parameter", |ui| {
                 let mut parameter_changed = false;
                 parameter_changed |= coordinate_row(ui, "Re(c)", &mut self.julia_c[0]);
                 parameter_changed |= coordinate_row(ui, "Im(c)", &mut self.julia_c[1]);
@@ -329,41 +395,76 @@ impl App {
                 if parameter_changed {
                     self.reframe_dynamical_plane();
                 }
-            });
+                });
+            } else {
+                section(ui, "Selected initial value", |ui| {
+                    coordinate_row(ui, "Re(z₀)", &mut self.newton_selected_z[0]);
+                    coordinate_row(ui, "Im(z₀)", &mut self.newton_selected_z[1]);
+                    if ui.button("Center detail on z₀").clicked() {
+                        self.dynamical.centre = self.newton_selected_z;
+                        self.zoom_focus[1] = None;
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Click the overview to select z₀ and open a linked detail region.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                });
+            }
 
             section(ui, "Computation", |ui| {
+                let iteration_range = if self.family == FractalFamily::Quadratic {
+                    32..=MAX_ITERATIONS
+                } else {
+                    8..=2_048
+                };
                 ui.add(
-                    egui::Slider::new(&mut self.iterations, 32..=MAX_ITERATIONS)
+                    egui::Slider::new(&mut self.iterations, iteration_range)
                         .logarithmic(true)
                         .text("iterations"),
                 );
-                ui.add(
-                    egui::Slider::new(&mut self.bailout, 2.0..=32.0)
-                        .logarithmic(true)
-                        .text("bailout"),
-                );
-                precision_row(
-                    ui,
-                    "Parameter",
-                    self.precision_modes[0],
-                    self.ds_validity[0],
-                    self.deep_active[0],
-                );
-                precision_row(
-                    ui,
-                    "Julia",
-                    self.precision_modes[1],
-                    self.ds_validity[1],
-                    self.deep_active[1],
-                );
-                ui.label(
-                    egui::RichText::new("Precision switches automatically after instability.")
+                if self.family == FractalFamily::Quadratic {
+                    ui.add(
+                        egui::Slider::new(&mut self.bailout, 2.0..=32.0)
+                            .logarithmic(true)
+                            .text("bailout"),
+                    );
+                    precision_row(
+                        ui,
+                        "Parameter",
+                        self.precision_modes[0],
+                        self.ds_validity[0],
+                        self.deep_active[0],
+                    );
+                    precision_row(
+                        ui,
+                        "Julia",
+                        self.precision_modes[1],
+                        self.ds_validity[1],
+                        self.deep_active[1],
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Precision switches automatically after instability.",
+                        )
                         .small()
                         .color(MUTED),
-                );
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Newton rendering is capped at 2,048 iterations per pixel.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                }
             });
 
-            let orbit_input = OrbitInput {
+            if self.family == FractalFamily::Quadratic {
+                let orbit_input = OrbitInput {
                 c: self.julia_c,
                 iterations: self.iterations,
                 bailout: self.bailout as f64,
@@ -417,11 +518,51 @@ impl App {
                 self.deep_views[1] = None;
                 self.zoom_focus[1] = None;
             }
+            } else {
+                let result = NewtonResult::calculate(self.newton_selected_z, self.iterations);
+                section(ui, "Newton diagnostic", |ui| {
+                    let status = match result.root {
+                        Some(root) => format!("Converges to root {}", root + 1),
+                        None if result.singular => "Derivative singularity".to_owned(),
+                        None => format!("No convergence through n = {}", result.iterations),
+                    };
+                    ui.label(
+                        egui::RichText::new(status).color(if result.root.is_some() {
+                            CREAM
+                        } else {
+                            CORAL
+                        }),
+                    );
+                    diagnostic_row(ui, "iterations", &result.iterations.to_string());
+                    if let Some(root) = result.root {
+                        diagnostic_row(
+                            ui,
+                            "root",
+                            &format!("{:+.9e} {:+.9e}i", ROOTS[root][0], ROOTS[root][1]),
+                        );
+                    }
+                    diagnostic_row(ui, "residual |p(z)|", &format!("{:.9e}", result.residual));
+                    diagnostic_row(ui, "last step |Δz|", &format!("{:.9e}", result.last_step));
+                    diagnostic_row(ui, "Re(final z)", &format!("{:+.12e}", result.value[0]));
+                    diagnostic_row(ui, "Im(final z)", &format!("{:+.12e}", result.value[1]));
+                    ui.label(
+                        egui::RichText::new(
+                            "CPU f64 diagnostic for the selected starting value z₀.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                });
+            }
 
             section(ui, "View status", |ui| {
                 zoom_row(
                     ui,
-                    "Parameter",
+                    if self.family == FractalFamily::Quadratic {
+                        "Parameter"
+                    } else {
+                        "Overview"
+                    },
                     self.deep_views[0].as_ref().map_or_else(
                         || format!("{:.6e}", self.parameter.magnification()),
                         DeepView::magnification_label,
@@ -429,35 +570,56 @@ impl App {
                 );
                 zoom_row(
                     ui,
-                    "Julia",
+                    if self.family == FractalFamily::Quadratic {
+                        "Julia"
+                    } else {
+                        "Detail"
+                    },
                     self.deep_views[1].as_ref().map_or_else(
                         || format!("{:.6e}", self.dynamical.magnification()),
                         DeepView::magnification_label,
                     ),
                 );
-                probe_rows(
-                    ui,
-                    "P",
-                    self.probes[0].last_result(),
-                    self.ds_validity[0],
-                );
-                probe_rows(
-                    ui,
-                    "J",
-                    self.probes[1].last_result(),
-                    self.ds_validity[1],
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Nine CPU samples compare both GPU arithmetic paths with f64 after a settled view change.",
-                    )
-                    .small()
-                    .color(MUTED),
-                );
+                if self.family == FractalFamily::Quadratic {
+                    probe_rows(
+                        ui,
+                        "P",
+                        self.probes[0].last_result(),
+                        self.ds_validity[0],
+                    );
+                    probe_rows(
+                        ui,
+                        "J",
+                        self.probes[1].last_result(),
+                        self.ds_validity[1],
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Nine CPU samples compare both GPU arithmetic paths with f64 after a settled view change.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Overview classifies roots; detail emphasizes convergence time.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                }
             });
 
             section(ui, "Display", |ui| {
-                ui.checkbox(&mut self.smooth, "Smooth escape-time colouring");
+                ui.checkbox(
+                    &mut self.smooth,
+                    if self.family == FractalFamily::Quadratic {
+                        "Smooth escape-time colouring"
+                    } else {
+                        "Convergence shading"
+                    },
+                );
                 ui.checkbox(&mut self.grid, "Coordinate grid");
                 ui.add(
                     egui::Slider::new(&mut self.palette_phase, -1.0..=1.0).text("palette phase"),
@@ -468,26 +630,53 @@ impl App {
             });
 
             section(ui, "Navigation", |ui| {
-                ui.label(egui::RichText::new("Click: centre + ×2 zoom").color(TEXT));
                 ui.label(
-                    egui::RichText::new(
-                        "Wheel or pinch to zoom. Drag to pan. Left clicks also choose c.",
-                    )
+                    egui::RichText::new(if self.family == FractalFamily::Quadratic {
+                        "Click: centre + ×2 zoom"
+                    } else {
+                        "Overview click: select z₀ + open detail"
+                    })
+                    .color(TEXT),
+                );
+                ui.label(
+                    egui::RichText::new(if self.family == FractalFamily::Quadratic {
+                        "Wheel or pinch to zoom. Drag to pan. Left clicks also choose c."
+                    } else {
+                        "Wheel or pinch to zoom. Drag to pan. Click detail to centre + ×2."
+                    })
                     .small()
                     .color(MUTED),
                 );
-                ui.label(
-                    egui::RichText::new(
-                        "Hold Shift while zooming for accelerated deep navigation.",
-                    )
-                    .small()
-                    .color(BLUE),
-                );
+                if self.family == FractalFamily::Quadratic {
+                    ui.label(
+                        egui::RichText::new(
+                            "Hold Shift while zooming for accelerated deep navigation.",
+                        )
+                        .small()
+                        .color(BLUE),
+                    );
+                }
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Fine pan target").color(TEXT));
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.active_pane, 0, "Parameter");
-                    ui.selectable_value(&mut self.active_pane, 1, "Julia");
+                    ui.selectable_value(
+                        &mut self.active_pane,
+                        0,
+                        if self.family == FractalFamily::Quadratic {
+                            "Parameter"
+                        } else {
+                            "Overview"
+                        },
+                    );
+                    ui.selectable_value(
+                        &mut self.active_pane,
+                        1,
+                        if self.family == FractalFamily::Quadratic {
+                            "Julia"
+                        } else {
+                            "Detail"
+                        },
+                    );
                 });
                 ui.horizontal(|ui| {
                     if ui.button("<").on_hover_text("Pan view left by 1/10").clicked() {
@@ -511,13 +700,35 @@ impl App {
                     .color(MUTED),
                 );
                 ui.horizontal(|ui| {
-                    if ui.button("Reset parameter").clicked() {
+                    if ui
+                        .button(if self.family == FractalFamily::Quadratic {
+                            "Reset parameter"
+                        } else {
+                            "Reset overview"
+                        })
+                        .clicked()
+                    {
                         self.parameter.reset_parameter();
+                        if self.family == FractalFamily::NewtonCubic {
+                            self.parameter = PlaneView::new([0.0, 0.0], 1.65);
+                        }
                         self.deep_views[0] = None;
                         self.zoom_focus[0] = None;
                     }
-                    if ui.button("Reset Julia").clicked() {
-                        self.reframe_dynamical_plane();
+                    if ui
+                        .button(if self.family == FractalFamily::Quadratic {
+                            "Reset Julia"
+                        } else {
+                            "Reset detail"
+                        })
+                        .clicked()
+                    {
+                        if self.family == FractalFamily::Quadratic {
+                            self.reframe_dynamical_plane();
+                        } else {
+                            self.dynamical = PlaneView::new([0.0, 0.0], 1.65);
+                            self.zoom_focus[1] = None;
+                        }
                     }
                 });
             });
@@ -528,7 +739,7 @@ impl App {
         ExperimentDocument {
             format: FORMAT_ID.to_owned(),
             version: FORMAT_VERSION,
-            family: FAMILY_ID.to_owned(),
+            family: self.family.document_id().to_owned(),
             parameter_plane: PlaneDocument {
                 centre: ComplexDocument {
                     re: self.parameter.centre[0],
@@ -547,6 +758,12 @@ impl App {
                 re: self.julia_c[0],
                 im: self.julia_c[1],
             },
+            newton_initial_z: (self.family == FractalFamily::NewtonCubic).then_some(
+                ComplexDocument {
+                    re: self.newton_selected_z[0],
+                    im: self.newton_selected_z[1],
+                },
+            ),
             computation: ComputationDocument {
                 iterations: self.iterations,
                 bailout: self.bailout,
@@ -557,13 +774,29 @@ impl App {
                 palette_phase: self.palette_phase,
                 critical_orbit_overlay: self.show_orbit_overlay,
             },
-            progressive_julia_zoom_target_exponent: self.progressive_julia_zoom_target_exponent,
-            deep_parameter_plane: self.deep_views[0].as_ref().map(deep_plane_document),
-            deep_dynamical_plane: self.deep_views[1].as_ref().map(deep_plane_document),
-            deep_parameter_c: self.deep_julia_c.as_ref().map(|value| DeepComplexDocument {
-                re: value.re.exact_decimal(),
-                im: value.im.exact_decimal(),
-            }),
+            progressive_julia_zoom_target_exponent: if self.family == FractalFamily::Quadratic {
+                self.progressive_julia_zoom_target_exponent
+            } else {
+                0
+            },
+            deep_parameter_plane: if self.family == FractalFamily::Quadratic {
+                self.deep_views[0].as_ref().map(deep_plane_document)
+            } else {
+                None
+            },
+            deep_dynamical_plane: if self.family == FractalFamily::Quadratic {
+                self.deep_views[1].as_ref().map(deep_plane_document)
+            } else {
+                None
+            },
+            deep_parameter_c: if self.family == FractalFamily::Quadratic {
+                self.deep_julia_c.as_ref().map(|value| DeepComplexDocument {
+                    re: value.re.exact_decimal(),
+                    im: value.im.exact_decimal(),
+                })
+            } else {
+                None
+            },
         }
     }
 
@@ -578,6 +811,7 @@ impl App {
     }
 
     fn apply_experiment(&mut self, document: ExperimentDocument) {
+        self.family = FractalFamily::from_document_id(&document.family);
         self.parameter = PlaneView::new(
             [
                 document.parameter_plane.centre.re,
@@ -593,6 +827,9 @@ impl App {
             document.dynamical_plane.half_height,
         );
         self.julia_c = [document.parameter_c.re, document.parameter_c.im];
+        if let Some(value) = document.newton_initial_z {
+            self.newton_selected_z = [value.re, value.im];
+        }
         self.progressive_julia_zoom_target_exponent =
             document.progressive_julia_zoom_target_exponent;
         self.progressive_julia_zoom_active = false;
@@ -770,10 +1007,13 @@ impl App {
             egui::pos2(outer.max.x - 1.0, outer.max.y - 1.0),
         );
 
-        let (title, subtitle) = if pane == 0 {
-            ("PARAMETER PLANE", "c -> bounded critical orbit")
-        } else {
-            ("DYNAMICAL PLANE", "z -> z^2 + c")
+        let (title, subtitle) = match (self.family, pane) {
+            (FractalFamily::Quadratic, 0) => ("PARAMETER PLANE", "c -> bounded critical orbit"),
+            (FractalFamily::Quadratic, _) => ("DYNAMICAL PLANE", "z -> z^2 + c"),
+            (FractalFamily::NewtonCubic, 0) => ("ROOT BASINS", "z^3 - 1: attracting root"),
+            (FractalFamily::NewtonCubic, _) => {
+                ("CONVERGENCE DETAIL", "iterations and boundary sensitivity")
+            }
         };
         ui.painter().text(
             egui::pos2(header.min.x + 11.0, header.center().y),
@@ -880,7 +1120,25 @@ impl App {
                     self.progressive_julia_zoom_active = false;
                     self.progressive_julia_next_stage_at = None;
                 }
-                if let Some(deep) = &mut self.deep_views[pane] {
+                if self.family == FractalFamily::NewtonCubic {
+                    let point = if pane == 0 {
+                        self.parameter.point_at(viewport, position)
+                    } else {
+                        self.dynamical.point_at(viewport, position)
+                    };
+                    self.newton_selected_z = point;
+                    if pane == 0 {
+                        self.dynamical.centre = point;
+                        self.dynamical.half_height = (self.parameter.half_height * 0.22)
+                            .clamp(1.45 / ARBITRARY_HANDOFF_ZOOM, 1e6);
+                        self.zoom_focus[0] = Some(point);
+                        self.zoom_focus[1] = None;
+                    } else {
+                        self.dynamical.centre = point;
+                        self.zoom_focus[1] = Some(point);
+                        self.zoom_pane(1, 0.5);
+                    }
+                } else if let Some(deep) = &mut self.deep_views[pane] {
                     let local = local_coordinate(viewport, position);
                     let _ = deep.recenter_local(local);
                     let accelerated = ui.input(|input| input.modifiers.shift);
@@ -943,7 +1201,7 @@ impl App {
             bailout: self.bailout as f64,
             pane,
         };
-        let probe = if deep_view.is_some() {
+        let probe = if self.family == FractalFamily::NewtonCubic || deep_view.is_some() {
             ProbeResult::default()
         } else if interacting {
             self.probes[pane].current(probe_input).unwrap_or_default()
@@ -952,10 +1210,11 @@ impl App {
         };
         let coordinate_limited = view_is_f32_limited(
             &view,
-            (pane == 1).then_some(self.julia_c),
+            (self.family == FractalFamily::Quadratic && pane == 1).then_some(self.julia_c),
             viewport,
             ui.ctx().pixels_per_point(),
-        ) || (pane == 1
+        ) || (self.family == FractalFamily::Quadratic
+            && pane == 1
             && julia_critical_roundoff_risk(
                 &view,
                 self.julia_c,
@@ -968,14 +1227,18 @@ impl App {
             probe.ds,
             ds_coordinate_ratio(
                 &view,
-                (pane == 1).then_some(self.julia_c),
+                (self.family == FractalFamily::Quadratic && pane == 1).then_some(self.julia_c),
                 viewport,
                 ui.ctx().pixels_per_point(),
             ),
         );
         self.ds_validity[pane] = ds_validity;
 
-        let deep = self.deep_reference(pane, deep_view.as_ref(), !interacting);
+        let deep = if self.family == FractalFamily::Quadratic {
+            self.deep_reference(pane, deep_view.as_ref(), !interacting)
+        } else {
+            None
+        };
         self.deep_active[pane] = deep.is_some();
 
         let (precision_text, zoom_colour) = if deep.is_some() {
@@ -1015,6 +1278,7 @@ impl App {
             self.julia_c,
             self.iterations,
             self.bailout,
+            self.family.shader_flag(),
             pane,
             self.palette_phase,
             self.smooth,
@@ -1032,7 +1296,11 @@ impl App {
         ui.painter()
             .add(render::callback(viewport, pane, uniforms, deep));
 
-        if pane == 1 && self.show_orbit_overlay && deep_view.is_none() {
+        if self.family == FractalFamily::Quadratic
+            && pane == 1
+            && self.show_orbit_overlay
+            && deep_view.is_none()
+        {
             let orbit = self.orbit_cache.update(OrbitInput {
                 c: self.julia_c,
                 iterations: self.iterations,
@@ -1062,6 +1330,35 @@ impl App {
         self.progressive_julia_next_stage_at = None;
         self.zoom_focus[1] = None;
         self.orbit_step = 0;
+    }
+
+    fn reset_for_family(&mut self) {
+        self.progressive_julia_zoom_active = false;
+        self.progressive_julia_next_stage_at = None;
+        self.deep_views = [None, None];
+        self.deep_julia_c = None;
+        self.deep_references = [None, None];
+        self.deep_active = [false; 2];
+        self.zoom_focus = [None, None];
+        self.pending_pan_steps = [0.0; 2];
+        self.probes = [ProbeCache::default(); 2];
+        self.ds_validity = [DsValidity::default(); 2];
+        self.precision_modes = [PrecisionMode::F32; 2];
+        self.active_pane = 0;
+        self.orbit_inspector_open = false;
+        match self.family {
+            FractalFamily::Quadratic => {
+                self.parameter.reset_parameter();
+                self.dynamical.reset_dynamical();
+                self.iterations = self.iterations.max(32);
+            }
+            FractalFamily::NewtonCubic => {
+                self.parameter = PlaneView::new([0.0, 0.0], 1.65);
+                self.dynamical = PlaneView::new([0.0, 0.0], 1.65);
+                self.newton_selected_z = [0.5, 0.5];
+                self.iterations = self.iterations.clamp(8, 2_048);
+            }
+        }
     }
 
     fn magnification_log10(&self, pane: usize) -> f64 {
@@ -1101,6 +1398,16 @@ impl App {
     }
 
     fn zoom_pane(&mut self, pane: usize, factor: f64) {
+        if self.family == FractalFamily::NewtonCubic {
+            let view = if pane == 0 {
+                &mut self.parameter
+            } else {
+                &mut self.dynamical
+            };
+            view.zoom_from(self.zoom_focus[pane], factor);
+            self.zoom_focus[pane] = None;
+            return;
+        }
         let handoff_log = ARBITRARY_HANDOFF_ZOOM.log10();
         if let Some(deep) = &mut self.deep_views[pane] {
             let next_log = deep.magnification_log10 - factor.log10();
@@ -1707,6 +2014,15 @@ fn zoom_row(ui: &mut egui::Ui, label: &str, magnification: String) {
                     .monospace()
                     .color(CREAM),
             );
+        });
+    });
+}
+
+fn diagnostic_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).color(MUTED));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.monospace(value);
         });
     });
 }

@@ -6,8 +6,9 @@ use crate::MAX_ITERATIONS;
 use crate::arbitrary::MAX_DECIMAL_ZOOM_EXPONENT;
 
 pub(crate) const FORMAT_ID: &str = "iterascope-experiment";
-pub(crate) const FORMAT_VERSION: u32 = 2;
-pub(crate) const FAMILY_ID: &str = "quadratic";
+pub(crate) const FORMAT_VERSION: u32 = 3;
+pub(crate) const QUADRATIC_FAMILY_ID: &str = "quadratic";
+pub(crate) const NEWTON_FAMILY_ID: &str = "newton-cubic";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +19,8 @@ pub(crate) struct ExperimentDocument {
     pub(crate) parameter_plane: PlaneDocument,
     pub(crate) dynamical_plane: PlaneDocument,
     pub(crate) parameter_c: ComplexDocument,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) newton_initial_z: Option<ComplexDocument>,
     pub(crate) computation: ComputationDocument,
     pub(crate) display: DisplayDocument,
     #[serde(
@@ -109,15 +112,28 @@ impl ExperimentDocument {
                 self.version, FORMAT_VERSION,
             ));
         }
-        if self.family != FAMILY_ID {
+        if self.family != QUADRATIC_FAMILY_ID && self.family != NEWTON_FAMILY_ID {
             return Err(format!("unsupported fractal family {:?}", self.family));
         }
         validate_plane("parameter_plane", self.parameter_plane)?;
         validate_plane("dynamical_plane", self.dynamical_plane)?;
         validate_complex("parameter_c", self.parameter_c)?;
-        if !(32..=MAX_ITERATIONS).contains(&self.computation.iterations) {
+        if let Some(value) = self.newton_initial_z {
+            validate_complex("newton_initial_z", value)?;
+        }
+        let minimum_iterations = if self.family == NEWTON_FAMILY_ID {
+            8
+        } else {
+            32
+        };
+        let maximum_iterations = if self.family == NEWTON_FAMILY_ID {
+            2_048
+        } else {
+            MAX_ITERATIONS
+        };
+        if !(minimum_iterations..=maximum_iterations).contains(&self.computation.iterations) {
             return Err(format!(
-                "iterations must be between 32 and {MAX_ITERATIONS}"
+                "iterations must be between {minimum_iterations} and {maximum_iterations}"
             ));
         }
         if !self.computation.bailout.is_finite()
@@ -134,6 +150,20 @@ impl ExperimentDocument {
             return Err(format!(
                 "progressive_julia_zoom_target_exponent must be between 0 and {MAX_DECIMAL_ZOOM_EXPONENT}"
             ));
+        }
+        if self.family == NEWTON_FAMILY_ID
+            && (self.progressive_julia_zoom_target_exponent != 0
+                || self.deep_parameter_plane.is_some()
+                || self.deep_dynamical_plane.is_some()
+                || self.deep_parameter_c.is_some())
+        {
+            return Err("deep quadratic state is not valid for Newton experiments".to_owned());
+        }
+        if self.family == NEWTON_FAMILY_ID && self.newton_initial_z.is_none() {
+            return Err("Newton experiments require newton_initial_z".to_owned());
+        }
+        if self.family == QUADRATIC_FAMILY_ID && self.newton_initial_z.is_some() {
+            return Err("newton_initial_z is only valid for Newton experiments".to_owned());
         }
         if let Some(plane) = &self.deep_parameter_plane {
             validate_deep_plane("deep_parameter_plane", plane)?;
@@ -156,6 +186,9 @@ impl ExperimentDocument {
                 || self.progressive_julia_zoom_target_exponent != 0)
         {
             return Err("deep arbitrary-precision state requires document version 2".to_owned());
+        }
+        if self.version < 3 && self.newton_initial_z.is_some() {
+            return Err("Newton state requires document version 3".to_owned());
         }
         Ok(())
     }
@@ -197,7 +230,7 @@ mod tests {
         ExperimentDocument {
             format: FORMAT_ID.to_owned(),
             version: FORMAT_VERSION,
-            family: FAMILY_ID.to_owned(),
+            family: QUADRATIC_FAMILY_ID.to_owned(),
             parameter_plane: PlaneDocument {
                 centre: ComplexDocument {
                     re: -0.743_643_887_037_151,
@@ -213,6 +246,7 @@ mod tests {
                 re: -0.743_643_887_037_151,
                 im: 0.131_825_904_205_33,
             },
+            newton_initial_z: None,
             computation: ComputationDocument {
                 iterations: 2048,
                 bailout: 4.0,
@@ -296,5 +330,32 @@ mod tests {
         document.progressive_julia_zoom_target_exponent = MAX_DECIMAL_ZOOM_EXPONENT + 1;
         let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
         assert!(error.contains("5000"));
+    }
+
+    #[test]
+    fn newton_experiment_round_trips_and_rejects_quadratic_deep_state() {
+        let mut document = example();
+        document.family = NEWTON_FAMILY_ID.to_owned();
+        document.computation.iterations = 128;
+        document.newton_initial_z = Some(ComplexDocument { re: 0.5, im: 0.5 });
+        let json = document.to_pretty_json().unwrap();
+        assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
+
+        document.progressive_julia_zoom_target_exponent = 100;
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("not valid for Newton"));
+    }
+
+    #[test]
+    fn newton_iteration_limit_matches_the_shader_limit() {
+        let mut document = example();
+        document.family = NEWTON_FAMILY_ID.to_owned();
+        document.newton_initial_z = Some(ComplexDocument { re: 0.5, im: 0.5 });
+        document.computation.iterations = 2_048;
+        assert!(ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).is_ok());
+
+        document.computation.iterations = 2_049;
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("2048"));
     }
 }

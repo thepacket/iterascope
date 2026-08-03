@@ -17,6 +17,10 @@ runs entirely in WGSL.
 ## What works today
 
 - Linked Mandelbrot parameter plane and Julia dynamical plane
+- Newton basin instrument for `z³ - 1`, with three-root classification and a
+  linked convergence-detail pane
+- Pointwise Newton diagnostics reporting the attracting root, iteration count,
+  polynomial residual, final value, last step and derivative singularities
 - Click-to-centre 2× zoom; parameter-plane clicks also select the Julia parameter
 - Wheel, trackpad pinch and drag navigation in either plane
 - Shift-modified click, wheel or pinch for accelerated logarithmic zoom in
@@ -64,6 +68,33 @@ derivative with respect to `c`. The Julia overlay connects only the selected
 point and its eight immediate predecessors. These straight segments indicate
 iteration order; they are not continuous curves along the Julia set. The
 selected orbit point can also become the centre of the Julia view.
+
+### Newton basins
+
+Choose **Newton** in the Experiment section to study Newton's method applied
+to
+
+\[
+p(z) = z^3 - 1, \qquad
+N(z) = z - \frac{z^3 - 1}{3z^2}.
+\]
+
+The left pane colours each starting value by the root to which it converges.
+Brightness encodes convergence speed. Clicking the overview selects `z₀` and
+opens a linked region in the right pane, where convergence time is emphasized
+to expose sensitive basin boundaries. Image colours use a continuous estimate
+of where the residual crossed the convergence threshold, avoiding false bands
+from whole iteration counts. The CPU `f64` diagnostic independently reports
+the exact integer iteration count alongside the selected orbit's root,
+residual, last Newton step and final complex value; `z₀ = 0` is explicitly
+identified as a derivative singularity.
+
+Newton mode is currently limited to 2,048 iterations and the stable
+`f32`/double-single viewport range. Its double-single path keeps the starting
+coordinate, polynomial, derivative, complex division and Newton update in
+compensated arithmetic so magnified basin boundaries do not collapse onto an
+`f32` coordinate grid. The arbitrary-precision perturbation path remains
+specific to the quadratic family.
 
 ### On-demand rendering and timing
 
@@ -177,8 +208,9 @@ cargo check --target wasm32-unknown-unknown
 ## Experiment documents
 
 Open **Document → Export / Import JSON** to capture the complete reproducible
-experiment state. The versioned document records the quadratic family, both
-plane centres and scales, the selected parameter, computation limits, and
+experiment state. The versioned document records the active family, both
+plane centres and scales, the selected parameter or Newton starting value,
+computation limits, and
 display settings, including critical-orbit overlay visibility. Runtime
 diagnostics, selected inspector step and frame timing are deliberately not
 stored. Copy the JSON to export it; paste another IteraScope document into the
@@ -191,6 +223,8 @@ live state is changed.
 2. Deterministic validation against direct arbitrary-precision sample orbits
 3. Progressive/background reference-orbit generation at very high iteration
    counts
+4. Parameterized Newton polynomials and rational maps with critical-point
+   analysis
 
 ## Project status
 

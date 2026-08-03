@@ -5,7 +5,7 @@ struct Uniforms {
     view_lo: vec4<f32>,
     // Julia c high words, maximum iterations, bailout squared.
     dynamics_hi: vec4<f32>,
-    // Julia c low words; zw reserved.
+    // Julia c low words; z = 0 quadratic / 1 Newton cubic; w reserved.
     dynamics_lo: vec4<f32>,
     // x = 0 parameter plane / 1 dynamical plane, y = palette phase,
     // z = smooth colouring, w = show grid.
@@ -48,6 +48,15 @@ struct EscapeResult {
 struct ScaledComplex {
     mantissa: vec2<f32>,
     exponent: i32,
+};
+
+struct NewtonResult {
+    converged: bool,
+    root: u32,
+    iteration: u32,
+    continuous_iteration: f32,
+    residual: f32,
+    z: vec2<f32>,
 };
 
 @vertex
@@ -97,6 +106,13 @@ fn ds_mul(a: Ds, b: Ds) -> Ds {
     return ds_normalize(product, error);
 }
 
+fn ds_div(a: Ds, b: Ds) -> Ds {
+    let estimate = a.hi / b.hi;
+    let remainder = ds_sub(a, ds_mul(b, Ds(estimate, 0.0)));
+    let correction = (remainder.hi + remainder.lo) / b.hi;
+    return ds_add(Ds(estimate, 0.0), Ds(correction, 0.0));
+}
+
 fn ds_approx(a: Ds) -> f32 {
     return a.hi + a.lo;
 }
@@ -109,6 +125,25 @@ fn ds2_add_f32(a: Ds2, b: vec2<f32>) -> Ds2 {
     return Ds2(
         ds_add(a.x, Ds(b.x, 0.0)),
         ds_add(a.y, Ds(b.y, 0.0)),
+    );
+}
+
+fn ds2_sub(a: Ds2, b: Ds2) -> Ds2 {
+    return Ds2(ds_sub(a.x, b.x), ds_sub(a.y, b.y));
+}
+
+fn ds_complex_mul(a: Ds2, b: Ds2) -> Ds2 {
+    return Ds2(
+        ds_sub(ds_mul(a.x, b.x), ds_mul(a.y, b.y)),
+        ds_add(ds_mul(a.x, b.y), ds_mul(a.y, b.x)),
+    );
+}
+
+fn ds_complex_div(a: Ds2, b: Ds2) -> Ds2 {
+    let denominator = ds_add(ds_mul(b.x, b.x), ds_mul(b.y, b.y));
+    return Ds2(
+        ds_div(ds_add(ds_mul(a.x, b.x), ds_mul(a.y, b.y)), denominator),
+        ds_div(ds_sub(ds_mul(a.y, b.x), ds_mul(a.x, b.y)), denominator),
     );
 }
 
@@ -129,6 +164,157 @@ fn complex_square(z: vec2<f32>) -> vec2<f32> {
 fn complex_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x * b.x - a.y * b.y,
                      a.x * b.y + a.y * b.x);
+}
+
+fn complex_div(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    let denominator = dot(b, b);
+    return vec2<f32>(
+        (a.x * b.x + a.y * b.y) / denominator,
+        (a.y * b.x - a.x * b.y) / denominator,
+    );
+}
+
+fn nearest_newton_root(z: vec2<f32>) -> u32 {
+    let distance_a = distance(z, vec2<f32>(1.0, 0.0));
+    let distance_b = distance(z, vec2<f32>(-0.5, 0.8660254));
+    let distance_c = distance(z, vec2<f32>(-0.5, -0.8660254));
+    if (distance_b < distance_a && distance_b <= distance_c) {
+        return 1u;
+    }
+    if (distance_c < distance_a && distance_c < distance_b) {
+        return 2u;
+    }
+    return 0u;
+}
+
+fn continuous_newton_iteration(
+    iteration: u32,
+    previous_residual: f32,
+    residual: f32,
+) -> f32 {
+    if (iteration == 0u) {
+        return 0.0;
+    }
+    let threshold_log = log(1e-6);
+    let previous_log = log(max(previous_residual, 1e-30));
+    let current_log = log(max(residual, 1e-30));
+    let denominator = max(previous_log - current_log, 1e-20);
+    let fraction = clamp(
+        (previous_log - threshold_log) / denominator,
+        0.0,
+        1.0,
+    );
+    return f32(iteration - 1u) + fraction;
+}
+
+fn iterate_newton(initial: vec2<f32>) -> NewtonResult {
+    var z = initial;
+    var previous_residual = 1e30;
+    let requested = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
+    let max_iterations = min(requested, 2048u);
+    for (var i = 0u; i < 2048u; i = i + 1u) {
+        if (i >= max_iterations) { break; }
+        let z2 = complex_mul(z, z);
+        let z3 = complex_mul(z2, z);
+        let polynomial = z3 - vec2<f32>(1.0, 0.0);
+        let residual = length(polynomial);
+        if (residual <= 1e-6) {
+            return NewtonResult(
+                true,
+                nearest_newton_root(z),
+                i,
+                continuous_newton_iteration(i, previous_residual, residual),
+                residual,
+                z,
+            );
+        }
+        let derivative = 3.0 * z2;
+        if (dot(derivative, derivative) <= 1e-18) {
+            return NewtonResult(false, 0u, i, f32(i), residual, z);
+        }
+        previous_residual = residual;
+        z = z - complex_div(polynomial, derivative);
+        if (any(abs(z) > vec2<f32>(1e18))) {
+            return NewtonResult(false, 0u, i + 1u, f32(i + 1u), 1e18, z);
+        }
+    }
+    let z2 = complex_mul(z, z);
+    let polynomial = complex_mul(z2, z) - vec2<f32>(1.0, 0.0);
+    let residual = length(polynomial);
+    if (residual <= 1e-6) {
+        return NewtonResult(
+            true,
+            nearest_newton_root(z),
+            max_iterations,
+            continuous_newton_iteration(max_iterations, previous_residual, residual),
+            residual,
+            z,
+        );
+    }
+    return NewtonResult(false, 0u, max_iterations, f32(max_iterations), residual, z);
+}
+
+fn iterate_newton_ds(initial: Ds2) -> NewtonResult {
+    var z = initial;
+    var previous_residual = 1e30;
+    let requested = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
+    let max_iterations = min(requested, 2048u);
+    for (var i = 0u; i < 2048u; i = i + 1u) {
+        if (i >= max_iterations) { break; }
+        let z2 = ds_complex_mul(z, z);
+        let z3 = ds_complex_mul(z2, z);
+        let polynomial = Ds2(ds_sub(z3.x, Ds(1.0, 0.0)), z3.y);
+        let polynomial_approx = ds2_approx(polynomial);
+        let residual = length(polynomial_approx);
+        if (residual <= 1e-6) {
+            let approximate = ds2_approx(z);
+            return NewtonResult(
+                true,
+                nearest_newton_root(approximate),
+                i,
+                continuous_newton_iteration(i, previous_residual, residual),
+                residual,
+                approximate,
+            );
+        }
+        let derivative = Ds2(
+            ds_mul(Ds(3.0, 0.0), z2.x),
+            ds_mul(Ds(3.0, 0.0), z2.y),
+        );
+        let derivative_approx = ds2_approx(derivative);
+        if (dot(derivative_approx, derivative_approx) <= 1e-18) {
+            return NewtonResult(false, 0u, i, f32(i), residual, ds2_approx(z));
+        }
+        previous_residual = residual;
+        z = ds2_sub(z, ds_complex_div(polynomial, derivative));
+        let approximate = ds2_approx(z);
+        if (any(abs(approximate) > vec2<f32>(1e18))) {
+            return NewtonResult(false, 0u, i + 1u, f32(i + 1u), 1e18, approximate);
+        }
+    }
+    let z2 = ds_complex_mul(z, z);
+    let z3 = ds_complex_mul(z2, z);
+    let polynomial = Ds2(ds_sub(z3.x, Ds(1.0, 0.0)), z3.y);
+    let residual = length(ds2_approx(polynomial));
+    let approximate = ds2_approx(z);
+    if (residual <= 1e-6) {
+        return NewtonResult(
+            true,
+            nearest_newton_root(approximate),
+            max_iterations,
+            continuous_newton_iteration(max_iterations, previous_residual, residual),
+            residual,
+            approximate,
+        );
+    }
+    return NewtonResult(
+        false,
+        0u,
+        max_iterations,
+        f32(max_iterations),
+        residual,
+        approximate,
+    );
 }
 
 fn scaled_normalize(value: ScaledComplex) -> ScaledComplex {
@@ -342,6 +528,28 @@ fn palette(t: f32) -> vec3<f32> {
     return a + b * cos(6.2831853 * (c * t + d));
 }
 
+fn newton_colour(result: NewtonResult, detail: bool) -> vec3<f32> {
+    if (!result.converged) {
+        let warning = clamp(log2(1.0 + result.residual) * 0.025, 0.0, 0.18);
+        return vec3<f32>(0.025 + warning, 0.031, 0.043);
+    }
+    var root_colour = vec3<f32>(0.20, 0.86, 0.92);
+    if (result.root == 1u) {
+        root_colour = vec3<f32>(0.98, 0.43, 0.30);
+    } else if (result.root == 2u) {
+        root_colour = vec3<f32>(0.96, 0.79, 0.30);
+    }
+    if (u.display.z < 0.5) {
+        return root_colour;
+    }
+    let speed = exp(-0.055 * result.continuous_iteration);
+    if (!detail) {
+        return root_colour * (0.24 + 0.76 * speed);
+    }
+    let convergence = palette(0.043 * result.continuous_iteration + u.display.y);
+    return mix(convergence, root_colour, 0.28) * (0.38 + 0.62 * speed);
+}
+
 fn grid(world: vec2<f32>, scale: f32) -> f32 {
     let decade = pow(10.0, floor(log2(max(scale, 1e-18)) / log2(10.0)));
     let cell = max(decade, 1e-18);
@@ -370,6 +578,24 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let julia = u.display.x > 0.5;
     let double_single = u.view_lo.w > 0.5;
     let perturbation = u.deep.x > 0.5;
+    let newton = u.dynamics_lo.z > 0.5;
+    if (newton) {
+        var result: NewtonResult;
+        if (double_single) {
+            result = iterate_newton_ds(world_ds);
+        } else {
+            result = iterate_newton(world_f32);
+        }
+        var colour = newton_colour(result, u.display.x > 0.5);
+        if (u.display.w > 0.5) {
+            colour = mix(
+                colour,
+                vec3<f32>(0.78, 0.81, 0.87),
+                grid(world_ds_approx, ds_approx(scale_ds)) * 0.12,
+            );
+        }
+        return vec4<f32>(colour, 1.0);
+    }
     var result: EscapeResult;
     var world = world_f32;
     if (perturbation) {

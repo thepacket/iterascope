@@ -32,6 +32,7 @@ impl Uniforms {
         julia_c: [f64; 2],
         iterations: u32,
         bailout: f32,
+        family: u32,
         pane: usize,
         palette_phase: f32,
         smooth: bool,
@@ -47,7 +48,7 @@ impl Uniforms {
             view_hi: [centre_x[0], centre_y[0], scale[0], aspect],
             view_lo: [centre_x[1], centre_y[1], scale[1], precision.shader_flag()],
             dynamics_hi: [julia_x[0], julia_y[0], iterations as f32, bailout * bailout],
-            dynamics_lo: [julia_x[1], julia_y[1], 0.0, 0.0],
+            dynamics_lo: [julia_x[1], julia_y[1], family as f32, 0.0],
             display: [
                 pane as f32,
                 palette_phase,
@@ -354,6 +355,7 @@ mod tests {
             256,
             4.0,
             0,
+            0,
             0.0,
             true,
             false,
@@ -376,6 +378,7 @@ mod tests {
             [0.0; 2],
             256,
             4.0,
+            0,
             1,
             0.0,
             true,
@@ -386,5 +389,25 @@ mod tests {
         assert_ne!(uniforms.deep[1], 0.0);
         assert_eq!(uniforms.deep[2], -3_322.0);
         assert_eq!(uniforms.deep[3], 257.0);
+    }
+
+    #[test]
+    fn newton_family_flag_is_carried_without_changing_uniform_layout() {
+        let uniforms = Uniforms::new(
+            [0.0; 2],
+            1.65,
+            1.0,
+            [0.0; 2],
+            128,
+            4.0,
+            1,
+            0,
+            0.0,
+            true,
+            false,
+            PrecisionMode::F32,
+        );
+        assert_eq!(uniforms.dynamics_lo[2], 1.0);
+        assert_eq!(std::mem::size_of::<Uniforms>(), 96);
     }
 }
