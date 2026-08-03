@@ -65,20 +65,22 @@ point and its eight immediate predecessors. These straight segments indicate
 iteration order; they are not continuous curves along the Julia set. The
 selected orbit point can also become the centre of the Julia view.
 
-### Live rendering and frame timing
+### On-demand rendering and timing
 
-IteraScope currently requests another frame continuously, even when neither
-view has changed. The value beside **LIVE** is a smoothed interval between UI
-frames, not a direct measurement of shader execution time. For example,
-`16.7 ms` is approximately 60 frames per second and `33.3 ms` is approximately
-30 frames per second. The displayed value uses an exponential moving average
-that applies 8% of each newly measured interval.
+IteraScope renders on demand. An unchanged view does not continuously consume
+CPU and GPU resources. A repaint is requested for user input, the settled
+replacement following deep navigation, and each active progressive-zoom
+stage. The previous completed deep image remains visible while its replacement
+reference is prepared. Progressive stages are spaced by 750 ms so WebGPU is
+not continuously fed full-screen deep renders faster than they can be
+presented.
 
-The measurement includes application work and scheduling delays between UI
-frames. WebGPU command completion is asynchronous, so it does not isolate GPU
-render time. A blocked UI thread cannot update the value. Separate CPU
-reference-orbit timings, GPU timestamps where supported, and presented-frame
-timings are planned for meaningful performance diagnostics.
+The top-right **ON DEMAND** indicator reports the smoothed CPU time spent in
+the most recent UI update. It is not a refresh interval, frame rate, or direct
+measurement of shader execution time. WebGPU command completion is
+asynchronous, so separate reference-orbit timings, GPU timestamps where
+supported, and presented-frame timings are still planned for detailed
+performance diagnostics.
 
 ## Numerical model and limits
 

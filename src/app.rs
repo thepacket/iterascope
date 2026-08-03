@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use web_time::Instant;
 
@@ -34,6 +35,9 @@ const MAX_ACCELERATED_DECADES_PER_EVENT: f64 = 20.0;
 /// been submitted for painting. Ten decades per stage reaches extreme targets
 /// quickly while preserving a visible sequence of intermediate renders.
 const PROGRESSIVE_ZOOM_DECADES_PER_STAGE: f64 = 10.0;
+/// Leave the GPU idle between progressive stages instead of continuously
+/// queuing full-screen deep renders faster than WebGPU can present them.
+const PROGRESSIVE_ZOOM_STAGE_INTERVAL: Duration = Duration::from_millis(750);
 /// Orbit disagreement alone enables the more expensive DS path only once a
 /// view is meaningfully zoomed. Classification disagreement and coordinate
 /// collapse always override this floor.
@@ -153,6 +157,7 @@ pub struct App {
     julia_c: [f64; 2],
     progressive_julia_zoom_target_exponent: u32,
     progressive_julia_zoom_active: bool,
+    progressive_julia_next_stage_at: Option<Instant>,
     iterations: u32,
     bailout: f32,
     palette_phase: f32,
@@ -176,8 +181,7 @@ pub struct App {
     deep_julia_c: Option<DeepComplex>,
     deep_references: [Option<DeepReferenceCache>; 2],
     deep_generation: u64,
-    frame_ms: f32,
-    frame_start: Instant,
+    ui_update_ms: f32,
 }
 
 impl App {
@@ -200,6 +204,7 @@ impl App {
             julia_c: [-0.745, 0.113],
             progressive_julia_zoom_target_exponent: 0,
             progressive_julia_zoom_active: false,
+            progressive_julia_next_stage_at: None,
             iterations: 256,
             bailout: 4.0,
             palette_phase: 0.0,
@@ -223,8 +228,7 @@ impl App {
             deep_julia_c: None,
             deep_references: [None, None],
             deep_generation: 0,
-            frame_ms: 0.0,
-            frame_start: Instant::now(),
+            ui_update_ms: 0.0,
         })
     }
 
@@ -287,12 +291,14 @@ impl App {
                         .clicked()
                     {
                         self.progressive_julia_zoom_active = true;
+                        self.progressive_julia_next_stage_at = None;
                     }
                     if ui
                         .add_enabled(self.progressive_julia_zoom_active, egui::Button::new("Stop"))
                         .clicked()
                     {
                         self.progressive_julia_zoom_active = false;
+                        self.progressive_julia_next_stage_at = None;
                     }
                     let current = self.magnification_log10(1);
                     ui.label(
@@ -590,6 +596,7 @@ impl App {
         self.progressive_julia_zoom_target_exponent =
             document.progressive_julia_zoom_target_exponent;
         self.progressive_julia_zoom_active = false;
+        self.progressive_julia_next_stage_at = None;
         self.iterations = document.computation.iterations;
         self.bailout = document.computation.bailout;
         self.smooth = document.display.smooth_escape_time;
@@ -815,6 +822,7 @@ impl App {
             interacting = true;
             if pane == 1 {
                 self.progressive_julia_zoom_active = false;
+                self.progressive_julia_next_stage_at = None;
             }
             if let Some(deep) = &mut self.deep_views[pane] {
                 let aspect = viewport.width() as f64 / viewport.height().max(1.0) as f64;
@@ -830,6 +838,7 @@ impl App {
         if response.dragged() && !pinching {
             if pane == 1 {
                 self.progressive_julia_zoom_active = false;
+                self.progressive_julia_next_stage_at = None;
             }
             let delta = ui.input(|input| input.pointer.delta());
             if let Some(deep) = &mut self.deep_views[pane] {
@@ -858,6 +867,7 @@ impl App {
                 interacting = true;
                 if pane == 1 {
                     self.progressive_julia_zoom_active = false;
+                    self.progressive_julia_next_stage_at = None;
                 }
                 let accelerated = ui.input(|input| input.modifiers.shift);
                 self.zoom_pane(pane, accelerate_zoom_factor(factor, accelerated));
@@ -868,6 +878,7 @@ impl App {
                 interacting = true;
                 if pane == 1 {
                     self.progressive_julia_zoom_active = false;
+                    self.progressive_julia_next_stage_at = None;
                 }
                 if let Some(deep) = &mut self.deep_views[pane] {
                     let local = local_coordinate(viewport, position);
@@ -904,6 +915,12 @@ impl App {
                     }
                 }
             }
+        }
+        if interacting {
+            // Deep navigation deliberately retains the previous completed
+            // image while input is active. Schedule exactly one settled frame
+            // so its replacement reference can be built after input stops.
+            ui.ctx().request_repaint();
         }
 
         let view = if pane == 0 {
@@ -1042,6 +1059,7 @@ impl App {
         self.dynamical.reset_dynamical();
         self.deep_views[1] = None;
         self.progressive_julia_zoom_active = false;
+        self.progressive_julia_next_stage_at = None;
         self.zoom_focus[1] = None;
         self.orbit_step = 0;
     }
@@ -1060,17 +1078,26 @@ impl App {
         )
     }
 
-    fn advance_progressive_julia_zoom(&mut self) {
+    fn advance_progressive_julia_zoom(&mut self) -> Option<Duration> {
         if !self.progressive_julia_zoom_active {
-            return;
+            return None;
+        }
+        let now = Instant::now();
+        if let Some(next_stage) = self.progressive_julia_next_stage_at
+            && next_stage > now
+        {
+            return Some(next_stage - now);
         }
         let current = self.magnification_log10(1);
         let target = self.progressive_julia_zoom_target_exponent as f64;
         let Some(factor) = progressive_zoom_factor(current, target) else {
             self.progressive_julia_zoom_active = false;
-            return;
+            self.progressive_julia_next_stage_at = None;
+            return None;
         };
         self.zoom_pane(1, factor);
+        self.progressive_julia_next_stage_at = Some(now + PROGRESSIVE_ZOOM_STAGE_INTERVAL);
+        Some(PROGRESSIVE_ZOOM_STAGE_INTERVAL)
     }
 
     fn zoom_pane(&mut self, pane: usize, factor: f64) {
@@ -1563,10 +1590,7 @@ fn show_orbit_inspector(
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let now = Instant::now();
-        let elapsed = (now - self.frame_start).as_secs_f32() * 1000.0;
-        self.frame_start = now;
-        self.frame_ms += (elapsed - self.frame_ms) * 0.08;
+        let update_start = Instant::now();
 
         egui::Panel::top("iterascope.topbar")
             .exact_size(34.0)
@@ -1579,11 +1603,11 @@ impl eframe::App for App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new(format!("{:.1} ms", self.frame_ms))
+                            egui::RichText::new(format!("UI {:.1} ms", self.ui_update_ms))
                                 .monospace()
                                 .color(MUTED),
                         );
-                        badge(ui, "LIVE", CORAL);
+                        badge(ui, "ON DEMAND", BLUE);
                     });
                 });
             });
@@ -1604,12 +1628,19 @@ impl eframe::App for App {
         // The current stage has now produced its paint callback. Advance the
         // authoritative view afterwards so every stage is presented for at
         // least one frame before its successor is prepared.
-        self.advance_progressive_julia_zoom();
+        if let Some(delay) = self.advance_progressive_julia_zoom() {
+            ui.ctx().request_repaint_after(delay);
+        }
 
         self.experiment_editor(ui.ctx());
         self.orbit_inspector(ui.ctx());
 
-        ui.ctx().request_repaint();
+        let elapsed = (Instant::now() - update_start).as_secs_f32() * 1000.0;
+        self.ui_update_ms = if self.ui_update_ms == 0.0 {
+            elapsed
+        } else {
+            self.ui_update_ms + (elapsed - self.ui_update_ms) * 0.2
+        };
     }
 
     #[cfg(target_arch = "wasm32")]
