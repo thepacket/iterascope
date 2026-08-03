@@ -1,6 +1,6 @@
 # IteraScope
 
-**An open laboratory for complex dynamics.**
+**An open laboratory for complex dynamics (on pause).**
 
 IteraScope is a GPU-first scientific laboratory for exploring iterated maps.
 It currently provides two linked instruments: a parameter/dynamical-plane
