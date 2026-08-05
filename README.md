@@ -4,7 +4,10 @@
 the left and the linked Julia dynamical plane for the selected c on the
 right](docs/hero.png)
 
-**An open laboratory for complex dynamics (on pause).**
+**An open laboratory for complex dynamics.**
+
+Note: I am considering moving this new born project toward something like Ultra Fractal,
+something artistic, not "scientific".
 
 IteraScope is a GPU-first scientific laboratory for exploring iterated maps.
 It currently provides two linked instruments: a parameter/dynamical-plane
