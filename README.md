@@ -1,5 +1,9 @@
 # IteraScope
 
+![IteraScope: the quadratic instrument, with the Mandelbrot parameter plane on
+the left and the linked Julia dynamical plane for the selected c on the
+right](docs/hero.png)
+
 **An open laboratory for complex dynamics (on pause).**
 
 IteraScope is a GPU-first scientific laboratory for exploring iterated maps.
