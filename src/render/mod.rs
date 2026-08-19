@@ -6,11 +6,141 @@ use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor
 use eframe::wgpu;
 
 use crate::MAX_ITERATIONS;
+use crate::arbitrary::DeepComplex;
+#[cfg(test)]
 use crate::arbitrary::ReferenceOrbit;
 use crate::precision::{PrecisionMode, split_f64};
 
+/// Raw WGSL with the delta-algebra template; see [`shader_source`].
 const SHADER: &str = include_str!("fractal.wgsl");
 const PANE_COUNT: usize = 2;
+
+const TEMPLATE_BEGIN: &str = "// BEGIN DELTA TEMPLATE\n";
+const TEMPLATE_END: &str = "// END DELTA TEMPLATE\n";
+
+/// Expands the delta-algebra template in `fractal.wgsl` into its scaled
+/// (arbitrary-precision depth) and plain-f32 (f64-reference range)
+/// instantiations and returns the compilable shader source.
+pub(crate) fn shader_source() -> String {
+    let begin = SHADER
+        .find(TEMPLATE_BEGIN)
+        .expect("fractal.wgsl has a delta template begin marker");
+    let end = SHADER
+        .find(TEMPLATE_END)
+        .expect("fractal.wgsl has a delta template end marker");
+    let template = &SHADER[begin + TEMPLATE_BEGIN.len()..end];
+    let scaled = instantiate_template(
+        template,
+        "_scaled",
+        "ScaledComplex",
+        "ScaledReal",
+        &[
+            ("dc_mul_plain", "scaled_mul_plain"),
+            ("dc_mul_real", "sc_mul_real"),
+            ("dc_from_reals", "sc_from_reals"),
+            ("dc_from_f32", "sc_from_f32"),
+            ("dc_to_f32", "scaled_to_f32"),
+            ("dc_normalize", "scaled_normalize"),
+            ("dc_pixel_delta", "sc_pixel_delta"),
+            ("dc_zero", "sc_zero"),
+            ("dc_neg", "sc_neg"),
+            ("dc_sub", "sc_sub"),
+            ("dc_add", "scaled_add"),
+            ("dc_mul", "scaled_complex_mul"),
+            ("dc_scale", "sc_scale"),
+            ("dc_x", "sc_x"),
+            ("dc_y", "sc_y"),
+            ("dr_times_complex", "sr_times_complex"),
+            ("dr_from_f32", "sr_from_f32"),
+            ("dr_to_f32", "sr_to_f32"),
+            ("dr_zero", "sr_zero"),
+            ("dr_add", "sr_add"),
+            ("dr_neg", "sr_neg"),
+            ("dr_mul", "sr_mul"),
+            ("dr_scale", "sr_scale"),
+        ],
+    );
+    let plain = instantiate_template(
+        template,
+        "_f32",
+        "vec2<f32>",
+        "f32",
+        &[
+            ("dc_mul_plain", "fc_mul_plain"),
+            ("dc_mul_real", "fc_mul_real"),
+            ("dc_from_reals", "fc_from_reals"),
+            ("dc_from_f32", "fc_from_f32"),
+            ("dc_to_f32", "fc_to_f32"),
+            ("dc_normalize", "fc_normalize"),
+            ("dc_pixel_delta", "fc_pixel_delta"),
+            ("dc_zero", "fc_zero"),
+            ("dc_neg", "fc_neg"),
+            ("dc_sub", "fc_sub"),
+            ("dc_add", "fc_add"),
+            ("dc_mul", "fc_mul"),
+            ("dc_scale", "fc_scale"),
+            ("dc_x", "fc_x"),
+            ("dc_y", "fc_y"),
+            ("dr_times_complex", "fr_times_complex"),
+            ("dr_from_f32", "fr_from_f32"),
+            ("dr_to_f32", "fr_to_f32"),
+            ("dr_zero", "fr_zero"),
+            ("dr_add", "fr_add"),
+            ("dr_neg", "fr_neg"),
+            ("dr_mul", "fr_mul"),
+            ("dr_scale", "fr_scale"),
+        ],
+    );
+    let mut source = String::with_capacity(SHADER.len() + template.len());
+    source.push_str(&SHADER[..begin]);
+    source.push_str("// --- scaled instantiation ---\n");
+    source.push_str(&scaled);
+    source.push_str("// --- f32 instantiation ---\n");
+    source.push_str(&plain);
+    source.push_str(&SHADER[end + TEMPLATE_END.len()..]);
+    source
+}
+
+/// Replaces the template's placeholder identifiers. Replacement is done on
+/// whole identifiers only, longest names first, so `dc_mul_plain` is not
+/// clobbered by `dc_mul`.
+fn instantiate_template(
+    template: &str,
+    suffix: &str,
+    complex_type: &str,
+    real_type: &str,
+    operations: &[(&str, &str)],
+) -> String {
+    let mut rules: Vec<(&str, &str)> = operations.to_vec();
+    rules.push(("DC", complex_type));
+    rules.push(("DR", real_type));
+    rules.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+    let mut output = String::with_capacity(template.len() + 256);
+    let bytes = template.as_bytes();
+    let is_identifier = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut index = 0;
+    while index < template.len() {
+        if !is_identifier(bytes[index]) {
+            output.push(bytes[index] as char);
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < template.len() && is_identifier(bytes[index]) {
+            index += 1;
+        }
+        let word = &template[start..index];
+        if let Some(stripped) = word.strip_suffix("__T") {
+            output.push_str(stripped);
+            output.push_str(suffix);
+        } else if let Some((_, to)) = rules.iter().find(|(from, _)| *from == word) {
+            output.push_str(to);
+        } else {
+            output.push_str(word);
+        }
+    }
+    output
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -24,6 +154,7 @@ pub struct Uniforms {
     family_a: [f32; 4],
     family_b: [f32; 4],
     numerics: [f32; 4],
+    reference: [f32; 4],
 }
 
 impl Uniforms {
@@ -81,15 +212,22 @@ impl Uniforms {
             // Four opaque copies of 1.0 used by the shader to protect
             // compensated arithmetic from fast-math reassociation.
             numerics: [1.0; 4],
+            reference: [0.0; 4],
         }
     }
 
+    /// Enables perturbation rendering around the uploaded reference orbit.
+    /// `reference_offset` is the reference point's position relative to the
+    /// view centre in the shader's local units (x in units of the half-height
+    /// times the aspect ratio, y in half-heights); zero for a centred
+    /// reference.
     pub(crate) fn enable_perturbation(
         mut self,
         scale_mantissa: f32,
         scale_exponent: i32,
         reference_len: usize,
         ds_fallback: bool,
+        reference_offset: [f32; 2],
     ) -> Self {
         self.deep = [
             if ds_fallback { 1.0 } else { 2.0 },
@@ -97,6 +235,7 @@ impl Uniforms {
             scale_exponent as f32,
             reference_len as f32,
         ];
+        self.reference = [reference_offset[0], reference_offset[1], 0.0, 0.0];
         self
     }
 }
@@ -126,6 +265,8 @@ pub(crate) struct DeepRenderData {
     pub(crate) scale_exponent: i32,
     pub(crate) reference: Vec<GpuReferencePoint>,
     pub(crate) ds_fallback: bool,
+    /// Reference point relative to the view centre in shader local units.
+    pub(crate) reference_offset: [f32; 2],
 }
 
 impl DeepRenderData {
@@ -136,6 +277,7 @@ impl DeepRenderData {
         half_height: f64,
         points: &[[f64; 2]],
         ds_fallback: bool,
+        reference_offset: [f32; 2],
     ) -> Self {
         let exponent = half_height.log2().floor() as i32;
         let mantissa = (half_height / 2f64.powi(exponent)) as f32;
@@ -148,9 +290,31 @@ impl DeepRenderData {
                 .map(|point| GpuReferencePoint::new(*point))
                 .collect(),
             ds_fallback,
+            reference_offset,
         }
     }
 
+    pub(crate) fn from_points(
+        generation: u64,
+        scale_mantissa: f32,
+        scale_exponent: i32,
+        points: &[DeepComplex],
+        ds_fallback: bool,
+    ) -> Self {
+        Self {
+            generation,
+            scale_mantissa,
+            scale_exponent,
+            reference: points
+                .iter()
+                .map(|point| GpuReferencePoint::new([point.re.to_f64(), point.im.to_f64()]))
+                .collect(),
+            ds_fallback,
+            reference_offset: [0.0; 2],
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_reference(
         generation: u64,
         scale_mantissa: f32,
@@ -158,17 +322,13 @@ impl DeepRenderData {
         orbit: &ReferenceOrbit,
         ds_fallback: bool,
     ) -> Self {
-        Self {
+        Self::from_points(
             generation,
             scale_mantissa,
             scale_exponent,
-            reference: orbit
-                .points
-                .iter()
-                .map(|point| GpuReferencePoint::new([point.re.to_f64(), point.im.to_f64()]))
-                .collect(),
+            &orbit.points,
             ds_fallback,
-        }
+        )
     }
 }
 
@@ -188,7 +348,7 @@ impl FractalPipeline {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("iterascope.fractal.shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source().into()),
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("iterascope.fractal.bind-group-layout"),
@@ -371,7 +531,17 @@ mod tests {
 
     #[test]
     fn shader_validates_with_wgpus_naga_version() {
-        let module = naga::front::wgsl::parse_str(SHADER).expect("fractal.wgsl must parse");
+        let source = shader_source();
+        assert!(source.contains("fn perturb_step_scaled("));
+        assert!(source.contains("fn perturb_step_f32("));
+        assert!(!source.contains("__T"), "template suffix left unexpanded");
+        assert!(!source.contains(" DC("), "template type left unexpanded");
+        let module = naga::front::wgsl::parse_str(&source).unwrap_or_else(|error| {
+            panic!(
+                "expanded fractal.wgsl must parse: {}",
+                error.emit_to_string(&source)
+            )
+        });
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -381,8 +551,8 @@ mod tests {
     }
 
     #[test]
-    fn uniform_layout_is_nine_vec4s() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 144);
+    fn uniform_layout_is_ten_vec4s() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 160);
     }
 
     #[test]
@@ -436,7 +606,7 @@ mod tests {
             PrecisionMode::DoubleSingle,
             [0.0; 8],
         )
-        .enable_perturbation(mantissa, exponent, 257, false);
+        .enable_perturbation(mantissa, exponent, 257, false, [0.0; 2]);
         assert_ne!(uniforms.deep[1], 0.0);
         assert_eq!(uniforms.deep[2], -3_322.0);
         assert_eq!(uniforms.deep[3], 257.0);
@@ -461,7 +631,7 @@ mod tests {
             [0.0; 8],
         );
         assert_eq!(uniforms.dynamics_lo[2], 1.0);
-        assert_eq!(std::mem::size_of::<Uniforms>(), 144);
+        assert_eq!(std::mem::size_of::<Uniforms>(), 160);
         assert_eq!(uniforms.numerics[0], 1.0);
     }
 
@@ -935,6 +1105,7 @@ mod tests {
                     exponent,
                     data.reference.len(),
                     true,
+                    [0.0; 2],
                 );
                 let perturbed = gpu.render(pane, perturbed_uniforms, Some(&data.reference));
                 // The same view through the f64 reference used below the handoff.
@@ -950,8 +1121,13 @@ mod tests {
                     iterations,
                     4.0,
                 );
-                let f64_data =
-                    DeepRenderData::from_f64_orbit(2, half_height, &f64_orbit.points, true);
+                let f64_data = DeepRenderData::from_f64_orbit(
+                    2,
+                    half_height,
+                    &f64_orbit.points,
+                    true,
+                    [0.0; 2],
+                );
                 let f64_uniforms = Uniforms::new(
                     point,
                     half_height,
@@ -973,8 +1149,60 @@ mod tests {
                     f64_data.scale_exponent,
                     f64_data.reference.len(),
                     true,
+                    [0.0; 2],
                 );
                 let f64_perturbed = gpu.render(pane, f64_uniforms, Some(&f64_data.reference));
+                // And once more around an off-centre reference point; the
+                // image must not depend on where the reference sits.
+                let offset = [0.31f32, -0.22f32];
+                let offset_point = [
+                    point[0] + offset[0] as f64 * half_height,
+                    point[1] + offset[1] as f64 * half_height,
+                ];
+                let offset_orbit = crate::family::reference_orbit_f64(
+                    family,
+                    &parameters,
+                    crate::family::initial_state_with(
+                        family,
+                        offset_point,
+                        dynamical,
+                        family.default_parameter(),
+                    ),
+                    iterations,
+                    4.0,
+                );
+                let offset_data = DeepRenderData::from_f64_orbit(
+                    3,
+                    half_height,
+                    &offset_orbit.points,
+                    true,
+                    offset,
+                );
+                let offset_uniforms = Uniforms::new(
+                    point,
+                    half_height,
+                    gpu.aspect(),
+                    family.default_parameter(),
+                    iterations,
+                    4.0,
+                    family.shader_flag(),
+                    pane,
+                    0.0,
+                    true,
+                    false,
+                    true,
+                    PrecisionMode::DoubleSingle,
+                    words,
+                )
+                .enable_perturbation(
+                    offset_data.scale_mantissa,
+                    offset_data.scale_exponent,
+                    offset_data.reference.len(),
+                    true,
+                    offset,
+                );
+                let offset_perturbed =
+                    gpu.render(pane, offset_uniforms, Some(&offset_data.reference));
 
                 let pixels = (gpu.width * gpu.height) as usize;
                 let mut differing = 0usize;
@@ -997,6 +1225,16 @@ mod tests {
                     }
                 }
                 let f64_fraction = f64_differing as f64 / pixels as f64;
+                let mut offset_differing = 0usize;
+                for index in 0..pixels {
+                    let a = &offset_perturbed[index * 3..index * 3 + 3];
+                    let b = &f64_perturbed[index * 3..index * 3 + 3];
+                    let delta: i32 = (0..3).map(|k| (a[k] as i32 - b[k] as i32).abs()).sum();
+                    if delta > 60 {
+                        offset_differing += 1;
+                    }
+                }
+                let offset_fraction = offset_differing as f64 / pixels as f64;
                 let distinct_ds: std::collections::HashSet<&[u8]> = ds.chunks(3).collect();
                 let distinct_perturbed: std::collections::HashSet<&[u8]> =
                     perturbed.chunks(3).collect();
@@ -1004,12 +1242,13 @@ mod tests {
                     collapsed.push(format!("{family:?} pane {pane}"));
                 }
                 report.push(format!(
-                    "{:26} pane {pane}: reference {} points (ends {:?}), DS vs AP {:.2}%, f64 vs AP {:.2}% pixels differ",
+                    "{:26} pane {pane}: reference {} points (ends {:?}), DS vs AP {:.2}%, f64 vs AP {:.2}%, off-centre vs centred {:.2}% pixels differ",
                     format!("{family:?}"),
                     orbit.points.len(),
                     orbit.escape_iteration,
                     100.0 * fraction,
-                    100.0 * f64_fraction
+                    100.0 * f64_fraction,
+                    100.0 * offset_fraction
                 ));
                 if let Some(directory) = &directory {
                     let stem = format!(
@@ -1304,7 +1543,13 @@ mod tests {
                 PrecisionMode::DoubleSingle,
                 parameters.uniform_words(dynamical),
             )
-            .enable_perturbation(mantissa, exponent, data.reference.len(), false);
+            .enable_perturbation(
+                mantissa,
+                exponent,
+                data.reference.len(),
+                false,
+                [0.0; 2],
+            );
             let rgb = gpu.render(pane, uniforms, Some(&data.reference));
             let distinct: std::collections::HashSet<&[u8]> = rgb.chunks(3).collect();
             report.push(format!(
@@ -1333,5 +1578,129 @@ mod tests {
             failures.is_empty(),
             "perturbation at 1e{zoom_exponent} rendered a uniform image for {failures:?}"
         );
+    }
+
+    /// Timing probe: wall time of one 1024x1024 render per path.
+    #[test]
+    #[ignore]
+    fn gpu_timing_probe() {
+        use crate::arbitrary::{DeepComplex, DeepReal, DeepState, DeepView, ReferenceOrbit};
+        use crate::family::{FamilyParameters, FractalFamily};
+        let gpu = GpuHarness::new(1024, 1024);
+        let parameters = FamilyParameters::default();
+        let iterations = 512u32;
+        for family in [
+            FractalFamily::Quadratic,
+            FractalFamily::Multibrot,
+            FractalFamily::BurningShip,
+            FractalFamily::MagnetOne,
+            FractalFamily::Mandelbox,
+        ] {
+            let plane = family.default_parameter_view();
+            let centre = plane.centre;
+            for (label, precision, perturb) in [
+                ("f32", PrecisionMode::F32, false),
+                ("ds", PrecisionMode::DoubleSingle, false),
+                ("pert-f64", PrecisionMode::DoubleSingle, true),
+            ] {
+                let mut uniforms = Uniforms::new(
+                    centre,
+                    plane.half_height * 1e-6,
+                    gpu.aspect(),
+                    family.default_parameter(),
+                    iterations,
+                    4.0,
+                    family.shader_flag(),
+                    0,
+                    0.0,
+                    true,
+                    false,
+                    true,
+                    precision,
+                    parameters.uniform_words(false),
+                );
+                let mut reference = None;
+                if perturb {
+                    let orbit = crate::family::reference_orbit_f64(
+                        family,
+                        &parameters,
+                        crate::family::initial_state_with(
+                            family,
+                            centre,
+                            false,
+                            family.default_parameter(),
+                        ),
+                        iterations,
+                        4.0,
+                    );
+                    let data = DeepRenderData::from_f64_orbit(
+                        1,
+                        plane.half_height * 1e-6,
+                        &orbit.points,
+                        true,
+                        [0.0; 2],
+                    );
+                    uniforms = uniforms.enable_perturbation(
+                        data.scale_mantissa,
+                        data.scale_exponent,
+                        data.reference.len(),
+                        true,
+                        [0.0; 2],
+                    );
+                    reference = Some(data);
+                }
+                // Warm up, then time.
+                let _ = gpu.render(
+                    0,
+                    uniforms,
+                    reference.as_ref().map(|d| d.reference.as_slice()),
+                );
+                let start = std::time::Instant::now();
+                let _ = gpu.render(
+                    0,
+                    uniforms,
+                    reference.as_ref().map(|d| d.reference.as_slice()),
+                );
+                let elapsed = start.elapsed();
+                eprintln!("{family:?} {label}: {:.1} ms", elapsed.as_secs_f64() * 1e3);
+            }
+        }
+        // CPU reference orbit costs.
+        for exponent in [20u32, 100, 300, 1000] {
+            let c = DeepComplex::from_f64([-0.745, 0.113], exponent).unwrap();
+            for family in [
+                FractalFamily::Quadratic,
+                FractalFamily::BurningShip,
+                FractalFamily::MagnetOne,
+            ] {
+                let start = std::time::Instant::now();
+                let initial = DeepState::initial(family, &c, false, &c).unwrap();
+                let orbit =
+                    ReferenceOrbit::family(family, &parameters, initial, 2000, 4.0).unwrap();
+                eprintln!(
+                    "AP reference {family:?} 1e{exponent}, {} points: {:.1} ms",
+                    orbit.points.len(),
+                    start.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            let view = DeepView {
+                centre: c.clone(),
+                half_height: DeepReal::parse("1e-20", exponent).unwrap(),
+                zoom_exponent: exponent,
+                magnification_log10: 20.0,
+            };
+            let start = std::time::Instant::now();
+            for _ in 0..10 {
+                let _ = (
+                    view.centre.re.exact_decimal(),
+                    view.centre.im.exact_decimal(),
+                    view.half_height.exact_decimal(),
+                );
+            }
+            eprintln!(
+                "exact_decimal x3 at 1e{exponent}: {:.3} ms each",
+                start.elapsed().as_secs_f64() * 1e3 / 10.0
+            );
+        }
     }
 }

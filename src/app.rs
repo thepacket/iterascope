@@ -5,7 +5,7 @@ use web_time::Instant;
 
 use crate::arbitrary::{
     ARBITRARY_HANDOFF_ZOOM, DeepComplex, DeepState, DeepView, MAX_DECIMAL_ZOOM_EXPONENT,
-    ReferenceOrbit,
+    ReferenceOrbitBuilder,
 };
 use crate::experiment::{
     ComplexDocument, ComputationDocument, DeepComplexDocument, DeepPlaneDocument, DisplayDocument,
@@ -48,6 +48,9 @@ const PROGRESSIVE_ZOOM_STAGE_INTERVAL: Duration = Duration::from_millis(750);
 /// view is meaningfully zoomed. Classification disagreement and coordinate
 /// collapse always override this floor.
 const PROBE_DS_MIN_ZOOM: f64 = 256.0;
+/// Arbitrary-precision reference orbits are extended across frames so a
+/// long, high-precision orbit never freezes the interface.
+const DEEP_REFERENCE_FRAME_BUDGET: Duration = Duration::from_millis(6);
 
 const BG: egui::Color32 = egui::Color32::from_rgb(10, 13, 18);
 const PANEL: egui::Color32 = egui::Color32::from_rgb(22, 24, 29);
@@ -108,6 +111,11 @@ impl DeepReferenceKey {
 struct DeepReferenceCache {
     key: DeepReferenceKey,
     data: Arc<DeepRenderData>,
+    /// Still-extending builder while the orbit is incomplete.
+    builder: Option<ReferenceOrbitBuilder>,
+    scale_mantissa: f32,
+    scale_exponent: i32,
+    ds_fallback: bool,
 }
 
 /// Cache key for the `f64` reference orbit used below the handoff.
@@ -214,6 +222,9 @@ pub struct App {
     deep_julia_c: Option<DeepComplex>,
     deep_references: [Option<DeepReferenceCache>; 2],
     f64_references: [Option<F64ReferenceCache>; 2],
+    /// Set during a frame in which a pane's arbitrary-precision reference is
+    /// still being extended; the pane then requests another repaint.
+    deep_reference_building: [bool; 2],
     /// Whether the pane is currently rendered by perturbation around an
     /// `f64` reference (below the handoff) rather than arbitrary precision.
     f64_reference_active: [bool; 2],
@@ -270,6 +281,7 @@ impl App {
             deep_julia_c: None,
             deep_references: [None, None],
             f64_references: [None, None],
+            deep_reference_building: [false; 2],
             f64_reference_active: [false; 2],
             deep_generation: 0,
             ui_update_ms: 0.0,
@@ -1435,12 +1447,16 @@ impl App {
             // Below the handoff the generic families render by perturbation
             // around an f64 reference orbit: exact reference fates, no GPU
             // compensated arithmetic on the critical path.
-            self.f64_reference(pane, &view)
+            self.f64_reference(pane, &view, aspect)
         } else {
             None
         };
         self.f64_reference_active[pane] = deep.is_some() && deep_view.is_none();
         self.deep_active[pane] = deep.is_some();
+        if self.deep_reference_building[pane] {
+            self.deep_reference_building[pane] = false;
+            ui.ctx().request_repaint();
+        }
 
         let (precision_text, zoom_colour) = if deep.is_some() && deep_view.is_some() {
             ("AP PERT", BLUE)
@@ -1504,6 +1520,7 @@ impl App {
                 data.scale_exponent,
                 data.reference.len(),
                 data.ds_fallback,
+                data.reference_offset,
             );
         }
         ui.painter()
@@ -1669,7 +1686,20 @@ impl App {
 
     /// Builds (or reuses) the `f64` reference orbit of the pane's view centre
     /// for perturbation rendering below the arbitrary-precision handoff.
-    fn f64_reference(&mut self, pane: usize, view: &PlaneView) -> Option<Arc<DeepRenderData>> {
+    /// Builds (or reuses) the `f64` reference orbit used for perturbation
+    /// rendering below the arbitrary-precision handoff. If the view centre's
+    /// orbit ends early, a coarse grid of candidates across the view is tried
+    /// and the longest-lived one becomes the reference, so as few pixels as
+    /// possible outlive it.
+    fn f64_reference(
+        &mut self,
+        pane: usize,
+        view: &PlaneView,
+        aspect: f32,
+    ) -> Option<Arc<DeepRenderData>> {
+        if !view.half_height.is_finite() || view.half_height <= 0.0 {
+            return None;
+        }
         let key = F64ReferenceKey {
             family: self.family,
             parameters: self.family_parameters.clone(),
@@ -1686,15 +1716,59 @@ impl App {
             return Some(Arc::clone(&cached.data));
         }
         let dynamical = self.pane_is_dynamical(pane);
-        let orbit = reference_orbit_f64(
-            self.family,
-            &self.family_parameters,
-            initial_state_with(self.family, view.centre, dynamical, self.julia_c),
-            self.iterations,
-            self.bailout as f64,
-        );
-        if !view.half_height.is_finite() || view.half_height <= 0.0 {
-            return None;
+        let orbit_at = |offset: [f32; 2]| {
+            let world = [
+                view.centre[0] + offset[0] as f64 * view.half_height,
+                view.centre[1] + offset[1] as f64 * view.half_height,
+            ];
+            reference_orbit_f64(
+                self.family,
+                &self.family_parameters,
+                initial_state_with(self.family, world, dynamical, self.julia_c),
+                self.iterations,
+                self.bailout as f64,
+            )
+        };
+        let mut offset = [0.0f32; 2];
+        let mut orbit = orbit_at(offset);
+        // Candidate grid size: the search costs up to grid² orbits, so it is
+        // reduced at high iteration counts and skipped at extreme ones
+        // (pixels outliving the reference still continue correctly in f32).
+        let grid: i32 = if self.iterations <= 2_048 {
+            5
+        } else if self.iterations <= 8_192 {
+            3
+        } else {
+            1
+        };
+        if orbit.escape_iteration.is_some() && grid > 1 {
+            // Try a grid across the view (local units: x spans ±aspect).
+            let mut best_length = orbit.points.len();
+            let half = grid / 2;
+            let spacing = 0.8 / half as f32;
+            for row in 0..grid {
+                for column in 0..grid {
+                    if row == half && column == half {
+                        continue;
+                    }
+                    let candidate = [
+                        (column - half) as f32 * spacing * aspect,
+                        (row - half) as f32 * spacing,
+                    ];
+                    let candidate_orbit = orbit_at(candidate);
+                    if candidate_orbit.points.len() > best_length {
+                        best_length = candidate_orbit.points.len();
+                        offset = candidate;
+                        orbit = candidate_orbit;
+                        if orbit.escape_iteration.is_none() {
+                            break;
+                        }
+                    }
+                }
+                if orbit.escape_iteration.is_none() {
+                    break;
+                }
+            }
         }
         self.deep_generation = self.deep_generation.wrapping_add(1).max(1);
         let data = Arc::new(DeepRenderData::from_f64_orbit(
@@ -1702,6 +1776,7 @@ impl App {
             view.half_height,
             &orbit.points,
             true,
+            offset,
         ));
         self.f64_references[pane] = Some(F64ReferenceCache {
             key,
@@ -1710,6 +1785,10 @@ impl App {
         Some(data)
     }
 
+    /// Arbitrary-precision reference orbit for a deep view. Orbits are built
+    /// incrementally under a per-frame time budget; while incomplete the GPU
+    /// renders with the points available so far (pixels beyond the available
+    /// length continue in f32) and the pane requests another repaint.
     fn deep_reference(
         &mut self,
         pane: usize,
@@ -1729,48 +1808,76 @@ impl App {
             self.iterations,
             self.bailout,
         );
-        if let Some(cached) = &self.deep_references[pane]
-            && cached.key == key
-        {
-            return Some(Arc::clone(&cached.data));
-        }
-        if !may_build {
-            // Keep the last completed deep frame on screen while navigation
-            // changes and a replacement reference orbit is not ready yet.
-            // Returning `None` here exposes the frozen DS handoff snapshot,
-            // which appears as a distracting 1.14e14× flash.
-            if let Some(cached) = &self.deep_references[pane] {
-                return Some(Arc::clone(&cached.data));
+        let matches = self.deep_references[pane]
+            .as_ref()
+            .is_some_and(|cached| cached.key == key);
+        if !matches {
+            if !may_build {
+                // Keep the last completed deep frame on screen while navigation
+                // changes and a replacement reference orbit is not ready yet.
+                // Returning `None` here exposes the frozen DS handoff snapshot,
+                // which appears as a distracting 1.14e14× flash.
+                if let Some(cached) = &self.deep_references[pane] {
+                    return Some(Arc::clone(&cached.data));
+                }
+                // On the first transition there is no deep frame to retain.
+                // Start building so the previously presented shallow frame
+                // stays visible until the first AP frame can replace it.
             }
-            // On the first transition there is no deep frame to retain. Build
-            // synchronously so the previously presented shallow frame stays
-            // visible until the first AP frame can replace it atomically.
+            let dynamical = self.pane_is_dynamical(pane);
+            let initial =
+                DeepState::initial(self.family, &view.centre, dynamical, &julia_c).ok()?;
+            let builder = ReferenceOrbitBuilder::new(
+                self.family,
+                &self.family_parameters,
+                initial,
+                self.iterations,
+                self.bailout as f64,
+            )
+            .ok()?;
+            let (scale_mantissa, scale_exponent) = view.half_height.scaled_f32();
+            let ds_fallback =
+                view.magnification_log10 <= ARBITRARY_HANDOFF_ZOOM.log10() + f64::EPSILON * 8.0;
+            self.deep_generation = self.deep_generation.wrapping_add(1).max(1);
+            let data = Arc::new(DeepRenderData::from_points(
+                self.deep_generation,
+                scale_mantissa,
+                scale_exponent,
+                &builder.points,
+                ds_fallback,
+            ));
+            self.deep_references[pane] = Some(DeepReferenceCache {
+                key,
+                data,
+                builder: Some(builder),
+                scale_mantissa,
+                scale_exponent,
+                ds_fallback,
+            });
         }
-
-        let dynamical = self.pane_is_dynamical(pane);
-        let initial = DeepState::initial(self.family, &view.centre, dynamical, &julia_c).ok()?;
-        let orbit = ReferenceOrbit::family(
-            self.family,
-            &self.family_parameters,
-            initial,
-            self.iterations,
-            self.bailout as f64,
-        )
-        .ok()?;
-        let (scale_mantissa, scale_exponent) = view.half_height.scaled_f32();
-        self.deep_generation = self.deep_generation.wrapping_add(1).max(1);
-        let data = Arc::new(DeepRenderData::from_reference(
-            self.deep_generation,
-            scale_mantissa,
-            scale_exponent,
-            &orbit,
-            view.magnification_log10 <= ARBITRARY_HANDOFF_ZOOM.log10() + f64::EPSILON * 8.0,
-        ));
-        self.deep_references[pane] = Some(DeepReferenceCache {
-            key,
-            data: Arc::clone(&data),
-        });
-        Some(data)
+        let cached = self.deep_references[pane].as_mut()?;
+        if let Some(builder) = cached.builder.as_mut() {
+            // Extend the orbit for at most a few milliseconds per frame.
+            let start = Instant::now();
+            let mut complete = builder.is_complete();
+            while !complete && start.elapsed() < DEEP_REFERENCE_FRAME_BUDGET {
+                complete = builder.advance(64);
+            }
+            self.deep_generation = self.deep_generation.wrapping_add(1).max(1);
+            cached.data = Arc::new(DeepRenderData::from_points(
+                self.deep_generation,
+                cached.scale_mantissa,
+                cached.scale_exponent,
+                &builder.points,
+                cached.ds_fallback,
+            ));
+            if complete {
+                cached.builder = None;
+            } else {
+                self.deep_reference_building[pane] = true;
+            }
+        }
+        Some(Arc::clone(&cached.data))
     }
 
     fn draw_focus_marker(

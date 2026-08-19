@@ -251,11 +251,23 @@ per-pixel deltas with rebasing — rather than a plain per-pixel DS orbit.
 
 IteraScope renders on demand. An unchanged view does not continuously consume
 CPU and GPU resources. A repaint is requested for user input, the settled
-replacement following deep navigation, and each active progressive-zoom
-stage. The previous completed deep image remains visible while its replacement
-reference is prepared. Progressive stages are spaced by 750 ms so WebGPU is
-not continuously fed full-screen deep renders faster than they can be
-presented.
+replacement following deep navigation, each active progressive-zoom stage,
+and each slice of an arbitrary-precision reference orbit that is still being
+extended. The previous completed deep image remains visible while its
+replacement reference is prepared. Progressive stages are spaced by 750 ms so
+WebGPU is not continuously fed full-screen deep renders faster than they can
+be presented.
+
+Reference orbits are built so that navigation stays responsive. Below the
+handoff the `f64` reference is chosen as the longest-lived orbit among the
+view centre and a coarse grid of candidates, so few pixels outlive it (those
+that do continue in plain `f32` from their already-separated state).
+Arbitrary-precision references are extended across frames under a 6 ms
+budget: the GPU renders with the points available so far and refines as the
+orbit grows, instead of freezing the interface for a long high-precision
+orbit. The delta recurrence itself runs in plain `f32` below the handoff and
+in scaled mantissa/exponent arithmetic only at arbitrary-precision depth;
+the two are instantiated from one template at shader-load time.
 
 The top-right **ON DEMAND** indicator reports the smoothed CPU time spent in
 the most recent UI update. It is not a refresh interval, frame rate, or direct

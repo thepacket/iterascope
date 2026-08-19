@@ -27,6 +27,10 @@ struct Uniforms {
     // factor extraction that otherwise collapse double-single arithmetic back
     // to f32 (Metal compiles with fast math enabled).
     numerics: vec4<f32>,
+    // xy = reference point relative to the view centre, in the same local
+    // units as the fragment coordinate (x spans ±aspect, y spans ±1) — the
+    // reference orbit may be chosen away from the centre so it lives longer.
+    reference: vec4<f32>,
 };
 
 // Family codes. They must match `FractalFamily::shader_flag` in family.rs.
@@ -352,52 +356,65 @@ fn iterate_newton(initial: vec2<f32>) -> NewtonResult {
     return NewtonResult(false, 0u, max_iterations, f32(max_iterations), residual, z);
 }
 
+// Power-of-two scaling through the float exponent field; no transcendental
+// functions. `exp2i` is exact for -126 <= n <= 127 and returns 0 below.
+fn exp2i(n: i32) -> f32 {
+    if (n < -126) { return 0.0; }
+    return bitcast<f32>(u32(min(n, 127) + 127) << 23u);
+}
+
+// Exponent of the largest power of two not exceeding `size` (size > 0).
+fn floor_log2(size: f32) -> i32 {
+    return i32((bitcast<u32>(size) >> 23u) & 255u) - 127;
+}
+
 fn scaled_normalize(value: ScaledComplex) -> ScaledComplex {
     let size = max(abs(value.mantissa.x), abs(value.mantissa.y));
     if (size == 0.0) {
         return ScaledComplex(vec2<f32>(0.0), 0);
     }
-    let shift = i32(floor(log2(size)));
+    let shift = floor_log2(size);
     return ScaledComplex(
-        value.mantissa * exp2(-f32(shift)),
+        value.mantissa * exp2i(-shift),
         value.exponent + shift,
     );
 }
 
-fn scaled_add(a: ScaledComplex, b: ScaledComplex) -> ScaledComplex {
+fn scaled_add(raw_a: ScaledComplex, raw_b: ScaledComplex) -> ScaledComplex {
+    let a = scaled_normalize(raw_a);
+    let b = scaled_normalize(raw_b);
     if (all(a.mantissa == vec2<f32>(0.0))) { return b; }
     if (all(b.mantissa == vec2<f32>(0.0))) { return a; }
     if (a.exponent >= b.exponent) {
-        let difference = min(a.exponent - b.exponent, 150);
         return scaled_normalize(ScaledComplex(
-            a.mantissa + b.mantissa * exp2(-f32(difference)),
+            a.mantissa + b.mantissa * exp2i(b.exponent - a.exponent),
             a.exponent,
         ));
     }
-    let difference = min(b.exponent - a.exponent, 150);
     return scaled_normalize(ScaledComplex(
-        a.mantissa * exp2(-f32(difference)) + b.mantissa,
+        a.mantissa * exp2i(a.exponent - b.exponent) + b.mantissa,
         b.exponent,
     ));
 }
 
+// Products and scalings leave their result unnormalized: mantissas of
+// normalized operands stay within a few binades, f32 has range to spare, and
+// every consumer that needs a canonical form (additions, conversions and the
+// end of each perturbation step) normalizes itself.
 fn scaled_complex_mul(a: ScaledComplex, b: ScaledComplex) -> ScaledComplex {
-    return scaled_normalize(ScaledComplex(
-        complex_mul(a.mantissa, b.mantissa),
-        a.exponent + b.exponent,
-    ));
+    return ScaledComplex(complex_mul(a.mantissa, b.mantissa), a.exponent + b.exponent);
 }
 
 fn scaled_mul_plain(a: ScaledComplex, b: vec2<f32>) -> ScaledComplex {
-    return scaled_normalize(ScaledComplex(complex_mul(a.mantissa, b), a.exponent));
+    return ScaledComplex(complex_mul(a.mantissa, b), a.exponent);
 }
 
-fn scaled_to_f32(a: ScaledComplex) -> vec2<f32> {
-    if (a.exponent < -126) { return vec2<f32>(0.0); }
+fn scaled_to_f32(value: ScaledComplex) -> vec2<f32> {
+    let a = scaled_normalize(value);
     if (a.exponent > 120) {
         return a.mantissa * 1e20;
     }
-    return a.mantissa * exp2(f32(a.exponent));
+    return a.mantissa * exp2i(a.exponent);
 }
 
 fn reference_value(index: u32) -> vec2<f32> {
@@ -518,6 +535,7 @@ fn iterate_perturbation(
     centre: Ds2,
     local: vec2<f32>,
     local_offset: vec2<f32>,
+    reference_c: vec2<f32>,
     julia: bool,
 ) -> EscapeResult {
     let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
@@ -561,7 +579,7 @@ fn iterate_perturbation(
         // DS. Continue from the already-separated perturbed state instead of
         // restarting from a collapsed coordinate. Automatic reference
         // rebasing will ultimately replace this conservative visual tail.
-        let c = select(u.view_hi.xy, u.dynamics_hi.xy, julia);
+        let c = select(reference_c, u.dynamics_hi.xy, julia);
         var tail = continue_f32(approximate, c, available_iterations, max_iterations);
         tail.trap = min(tail.trap, trap);
         return tail;
@@ -1085,26 +1103,26 @@ fn iterate_family_ds(
     let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
     let radius_squared = family_escape_radius_squared(family);
     let threshold = family_convergence_threshold(family);
-    let pixel_delta = sc_from_f32(local_offset);
+    let pixel_delta = local_offset;
 
-    var deltas: PerturbState;
+    var deltas: PerturbState_f32;
     if (dynamical) {
-        var dz_prev = sc_zero();
+        var dz_prev = vec2<f32>(0.0);
         if (family == FAMILY_MANOWAR) { dz_prev = pixel_delta; }
-        deltas = PerturbState(pixel_delta, dz_prev, sc_zero(), ds2_approx(reference.c));
+        deltas = PerturbState_f32(pixel_delta, dz_prev, vec2<f32>(0.0), ds2_approx(reference.c));
     } else {
-        var dz = sc_zero();
-        var dz_prev = sc_zero();
+        var dz = vec2<f32>(0.0);
+        var dz_prev = vec2<f32>(0.0);
         if (family == FAMILY_MANOWAR || family == FAMILY_BARNSLEY_ONE || family == FAMILY_BARNSLEY_TWO) {
             dz = pixel_delta;
         }
         if (family == FAMILY_MANOWAR) { dz_prev = pixel_delta; }
-        deltas = PerturbState(dz, dz_prev, pixel_delta, ds2_approx(reference.c));
+        deltas = PerturbState_f32(dz, dz_prev, pixel_delta, ds2_approx(reference.c));
     }
 
     var previous_residual = 1e30;
     var trap = 1e30;
-    var approximate = ds2_approx(reference.z) + scaled_to_f32(deltas.dz);
+    var approximate = ds2_approx(reference.z) + deltas.dz;
     for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
         let previous = approximate;
@@ -1112,11 +1130,11 @@ fn iterate_family_ds(
         let z_prev = ds2_approx(reference.z_prev);
         reference = family_step_ds(family, reference);
         let z_next = ds2_approx(reference.z);
-        deltas = perturb_step(family, deltas, z, z_prev, z_next);
+        deltas = perturb_step_f32(family, deltas, z, z_prev, z_next);
         // The reference parameter follows the double-single reference (only
         // the Spider map moves it).
         deltas.c_ref = ds2_approx(reference.c);
-        var dz_f32 = scaled_to_f32(deltas.dz);
+        var dz_f32 = deltas.dz;
         approximate = z_next + dz_f32;
 
         // Promote the pixel to its own reference before the delta grows large
@@ -1129,9 +1147,9 @@ fn iterate_family_ds(
             && length(approximate) < 0.01 * cancellation_scale;
         if (delta_is_large || cancellation) {
             reference.z = ds2_add_f32(reference.z, dz_f32);
-            reference.z_prev = ds2_add_f32(reference.z_prev, scaled_to_f32(deltas.dz_prev));
-            reference.c = ds2_add_f32(reference.c, scaled_to_f32(deltas.dc));
-            deltas = PerturbState(sc_zero(), sc_zero(), sc_zero(), ds2_approx(reference.c));
+            reference.z_prev = ds2_add_f32(reference.z_prev, deltas.dz_prev);
+            reference.c = ds2_add_f32(reference.c, deltas.dc);
+            deltas = PerturbState_f32(vec2<f32>(0.0), vec2<f32>(0.0), vec2<f32>(0.0), ds2_approx(reference.c));
             approximate = ds2_approx(reference.z);
         }
 
@@ -1261,44 +1279,33 @@ struct ScaledReal {
     exponent: i32,
 };
 
-struct PerturbState {
-    dz: ScaledComplex,
-    dz_prev: ScaledComplex,
-    dc: ScaledComplex,
-    // Reference parameter (drifts for the Spider map).
-    c_ref: vec2<f32>,
-};
-
-fn sr_zero() -> ScaledReal {
-    return ScaledReal(0.0, 0);
-}
 
 fn sr_normalize(value: ScaledReal) -> ScaledReal {
     let size = abs(value.mantissa);
     if (size == 0.0) { return ScaledReal(0.0, 0); }
-    let shift = i32(floor(log2(size)));
-    return ScaledReal(value.mantissa * exp2(-f32(shift)), value.exponent + shift);
+    let shift = floor_log2(size);
+    return ScaledReal(value.mantissa * exp2i(-shift), value.exponent + shift);
 }
 
 fn sr_from_f32(value: f32) -> ScaledReal {
     return sr_normalize(ScaledReal(value, 0));
 }
 
-fn sr_to_f32(value: ScaledReal) -> f32 {
-    if (value.exponent < -126) { return 0.0; }
+fn sr_to_f32(raw: ScaledReal) -> f32 {
+    let value = sr_normalize(raw);
     if (value.exponent > 120) { return value.mantissa * 1e20; }
-    return value.mantissa * exp2(f32(value.exponent));
+    return value.mantissa * exp2i(value.exponent);
 }
 
-fn sr_add(a: ScaledReal, b: ScaledReal) -> ScaledReal {
+fn sr_add(raw_a: ScaledReal, raw_b: ScaledReal) -> ScaledReal {
+    let a = sr_normalize(raw_a);
+    let b = sr_normalize(raw_b);
     if (a.mantissa == 0.0) { return b; }
     if (b.mantissa == 0.0) { return a; }
     if (a.exponent >= b.exponent) {
-        let difference = min(a.exponent - b.exponent, 150);
-        return sr_normalize(ScaledReal(a.mantissa + b.mantissa * exp2(-f32(difference)), a.exponent));
+        return sr_normalize(ScaledReal(a.mantissa + b.mantissa * exp2i(b.exponent - a.exponent), a.exponent));
     }
-    let difference = min(b.exponent - a.exponent, 150);
-    return sr_normalize(ScaledReal(a.mantissa * exp2(-f32(difference)) + b.mantissa, b.exponent));
+    return sr_normalize(ScaledReal(a.mantissa * exp2i(a.exponent - b.exponent) + b.mantissa, b.exponent));
 }
 
 fn sr_neg(a: ScaledReal) -> ScaledReal {
@@ -1306,34 +1313,34 @@ fn sr_neg(a: ScaledReal) -> ScaledReal {
 }
 
 fn sr_mul(a: ScaledReal, b: ScaledReal) -> ScaledReal {
-    return sr_normalize(ScaledReal(a.mantissa * b.mantissa, a.exponent + b.exponent));
+    return ScaledReal(a.mantissa * b.mantissa, a.exponent + b.exponent);
 }
 
 fn sr_scale(a: ScaledReal, s: f32) -> ScaledReal {
-    return sr_normalize(ScaledReal(a.mantissa * s, a.exponent));
+    return ScaledReal(a.mantissa * s, a.exponent);
 }
 
 fn sc_x(a: ScaledComplex) -> ScaledReal {
-    return sr_normalize(ScaledReal(a.mantissa.x, a.exponent));
+    return ScaledReal(a.mantissa.x, a.exponent);
 }
 
 fn sc_y(a: ScaledComplex) -> ScaledReal {
-    return sr_normalize(ScaledReal(a.mantissa.y, a.exponent));
+    return ScaledReal(a.mantissa.y, a.exponent);
 }
 
-fn sc_from_reals(x: ScaledReal, y: ScaledReal) -> ScaledComplex {
+fn sc_from_reals(raw_x: ScaledReal, raw_y: ScaledReal) -> ScaledComplex {
+    let x = sr_normalize(raw_x);
+    let y = sr_normalize(raw_y);
     if (x.mantissa == 0.0) { return scaled_normalize(ScaledComplex(vec2<f32>(0.0, y.mantissa), y.exponent)); }
     if (y.mantissa == 0.0) { return scaled_normalize(ScaledComplex(vec2<f32>(x.mantissa, 0.0), x.exponent)); }
     if (x.exponent >= y.exponent) {
-        let difference = min(x.exponent - y.exponent, 150);
         return scaled_normalize(ScaledComplex(
-            vec2<f32>(x.mantissa, y.mantissa * exp2(-f32(difference))),
+            vec2<f32>(x.mantissa, y.mantissa * exp2i(y.exponent - x.exponent)),
             x.exponent,
         ));
     }
-    let difference = min(y.exponent - x.exponent, 150);
     return scaled_normalize(ScaledComplex(
-        vec2<f32>(x.mantissa * exp2(-f32(difference)), y.mantissa),
+        vec2<f32>(x.mantissa * exp2i(x.exponent - y.exponent), y.mantissa),
         y.exponent,
     ));
 }
@@ -1351,17 +1358,17 @@ fn sc_neg(a: ScaledComplex) -> ScaledComplex {
 }
 
 fn sc_scale(a: ScaledComplex, s: f32) -> ScaledComplex {
-    return scaled_normalize(ScaledComplex(a.mantissa * s, a.exponent));
+    return ScaledComplex(a.mantissa * s, a.exponent);
 }
 
 // Scaled real times an f32 complex value.
 fn sr_times_complex(r: ScaledReal, z: vec2<f32>) -> ScaledComplex {
-    return scaled_normalize(ScaledComplex(z * r.mantissa, r.exponent));
+    return ScaledComplex(z * r.mantissa, r.exponent);
 }
 
 // Scaled real times a scaled complex value.
 fn sc_mul_real(a: ScaledComplex, r: ScaledReal) -> ScaledComplex {
-    return scaled_normalize(ScaledComplex(a.mantissa * r.mantissa, a.exponent + r.exponent));
+    return ScaledComplex(a.mantissa * r.mantissa, a.exponent + r.exponent);
 }
 
 fn sc_sub(a: ScaledComplex, b: ScaledComplex) -> ScaledComplex {
@@ -1376,39 +1383,8 @@ fn complex_inverse(z: vec2<f32>) -> vec2<f32> {
 // |a + d| − |a| evaluated without cancellation. When |d| is far below |a|
 // the result is exactly ±d and stays scaled; only when the pixel crosses the
 // fold does the O(1) difference appear.
-fn diffabs(reference: f32, delta: ScaledReal) -> ScaledReal {
-    let delta_f32 = sr_to_f32(delta);
-    if (reference >= 0.0) {
-        if (reference + delta_f32 >= 0.0) { return delta; }
-        return sr_add(sr_from_f32(-2.0 * reference), sr_neg(delta));
-    }
-    if (reference + delta_f32 < 0.0) { return sr_neg(delta); }
-    return sr_add(sr_from_f32(2.0 * reference), delta);
-}
 
-// 2 Z δ + δ².
-fn quadratic_delta(z: vec2<f32>, delta: ScaledComplex) -> ScaledComplex {
-    return scaled_add(scaled_mul_plain(delta, 2.0 * z), scaled_complex_mul(delta, delta));
-}
 
-// Σ_{k=1}^{d} C(d, k) Z^{d−k} δ^k  =  (Z + δ)^d − Z^d.
-fn binomial_delta(z: vec2<f32>, delta: ScaledComplex, degree: u32) -> ScaledComplex {
-    var powers: array<vec2<f32>, 9>;
-    powers[0] = vec2<f32>(1.0, 0.0);
-    for (var j = 1u; j < 9u; j = j + 1u) {
-        powers[j] = complex_mul(powers[j - 1u], z);
-    }
-    var sum = sc_zero();
-    var delta_power = delta;
-    var coefficient = f32(degree);
-    for (var k = 1u; k <= 8u; k = k + 1u) {
-        if (k > degree) { break; }
-        sum = scaled_add(sum, scaled_mul_plain(delta_power, coefficient * powers[degree - k]));
-        delta_power = scaled_complex_mul(delta_power, delta);
-        coefficient = coefficient * f32(degree - k) / f32(k + 1u);
-    }
-    return sum;
-}
 
 fn box_branch(value: f32) -> i32 {
     if (value > 1.0) { return 1; }
@@ -1416,253 +1392,7 @@ fn box_branch(value: f32) -> i32 {
     return 0;
 }
 
-// Component-wise box-fold difference box(X + dx) − box(X).
-fn box_fold_delta(reference: f32, delta: ScaledReal) -> ScaledReal {
-    let pixel = reference + sr_to_f32(delta);
-    let reference_branch = box_branch(reference);
-    if (box_branch(pixel) == reference_branch) {
-        if (reference_branch == 0) { return delta; }
-        return sr_neg(delta);
-    }
-    return sr_from_f32(box_fold(pixel) - box_fold(reference));
-}
 
-fn perturb_step(
-    family: u32,
-    state: PerturbState,
-    z: vec2<f32>,
-    z_prev: vec2<f32>,
-    z_next: vec2<f32>,
-) -> PerturbState {
-    let delta = state.dz;
-    let dc = state.dc;
-    let c = state.c_ref;
-    let x = z.x;
-    let y = z.y;
-    let dx = sc_x(delta);
-    let dy = sc_y(delta);
-    var next = sc_zero();
-    var next_prev = state.dz_prev;
-    var next_dc = dc;
-    var next_c = c;
-    switch family {
-        case FAMILY_MULTIBROT: {
-            next = scaled_add(binomial_delta(z, delta, family_degree()), dc);
-        }
-        case FAMILY_TRICORN, FAMILY_PERPENDICULAR_MANDELBROT, FAMILY_BURNING_SHIP,
-            FAMILY_PERPENDICULAR_BURNING_SHIP, FAMILY_CELTIC, FAMILY_PERPENDICULAR_CELTIC,
-            FAMILY_BUFFALO, FAMILY_PERPENDICULAR_BUFFALO: {
-            // Δ(x² − y²) and Δ(xy) without cancellation.
-            let real_delta = sr_add(
-                sr_add(sr_scale(dx, 2.0 * x), sr_mul(dx, dx)),
-                sr_neg(sr_add(sr_scale(dy, 2.0 * y), sr_mul(dy, dy))),
-            );
-            let product_delta = sr_add(sr_add(sr_scale(dy, x), sr_scale(dx, y)), sr_mul(dx, dy));
-            var real_part = real_delta;
-            if (family == FAMILY_CELTIC || family == FAMILY_PERPENDICULAR_CELTIC
-                || family == FAMILY_BUFFALO || family == FAMILY_PERPENDICULAR_BUFFALO) {
-                real_part = diffabs(x * x - y * y, real_delta);
-            }
-            var imaginary_part = sr_zero();
-            if (family == FAMILY_TRICORN) {
-                imaginary_part = sr_scale(product_delta, -2.0);
-            } else if (family == FAMILY_CELTIC) {
-                imaginary_part = sr_scale(product_delta, 2.0);
-            } else if (family == FAMILY_BURNING_SHIP || family == FAMILY_BUFFALO) {
-                imaginary_part = sr_scale(diffabs(x * y, product_delta), 2.0);
-            } else if (family == FAMILY_PERPENDICULAR_MANDELBROT || family == FAMILY_PERPENDICULAR_CELTIC) {
-                // Δ(|x| y) = diffabs(X, dx) (Y + dy) + |X| dy
-                let abs_x_delta = diffabs(x, dx);
-                imaginary_part = sr_scale(
-                    sr_add(sr_add(sr_scale(abs_x_delta, y), sr_mul(abs_x_delta, dy)), sr_scale(dy, abs(x))),
-                    -2.0,
-                );
-            } else {
-                // Perpendicular Burning Ship / Buffalo: Δ(x |y|) = X dY + dx |Y| + dx dY
-                let abs_y_delta = diffabs(y, dy);
-                imaginary_part = sr_scale(
-                    sr_add(sr_add(sr_scale(abs_y_delta, x), sr_scale(dx, abs(y))), sr_mul(dx, abs_y_delta)),
-                    -2.0,
-                );
-            }
-            next = scaled_add(sc_from_reals(real_part, imaginary_part), dc);
-        }
-        case FAMILY_LAMBDA: {
-            // f = λ (z − z²):  Δ = Λ w + δλ ((Z − Z²) + w),  w = δ(1 − 2Z) − δ².
-            let w = sc_sub(scaled_mul_plain(delta, vec2<f32>(1.0, 0.0) - 2.0 * z), scaled_complex_mul(delta, delta));
-            let base = z - complex_square(z);
-            next = scaled_add(
-                scaled_add(scaled_mul_plain(w, c), scaled_mul_plain(dc, base)),
-                scaled_complex_mul(dc, w),
-            );
-        }
-        case FAMILY_PHOENIX: {
-            let dp = ScaledComplex(vec2<f32>(dc.mantissa.x, 0.0), dc.exponent);
-            let dq = sc_y(dc);
-            next = scaled_add(quadratic_delta(z, delta), dp);
-            next = scaled_add(next, sc_scale(state.dz_prev, c.y));
-            next = scaled_add(next, sr_times_complex(dq, z_prev));
-            next = scaled_add(next, sc_mul_real(state.dz_prev, dq));
-            next_prev = delta;
-        }
-        case FAMILY_MANOWAR: {
-            next = scaled_add(scaled_add(quadratic_delta(z, delta), state.dz_prev), dc);
-            next_prev = delta;
-        }
-        case FAMILY_SPIDER: {
-            next = scaled_add(quadratic_delta(z, delta), dc);
-            next_dc = scaled_add(sc_scale(dc, 0.5), next);
-            next_c = 0.5 * c + z_next;
-        }
-        case FAMILY_MAGNET_ONE: {
-            let one = vec2<f32>(1.0, 0.0);
-            let numerator = complex_square(z) + c - one;
-            let denominator = 2.0 * z + c - vec2<f32>(2.0, 0.0);
-            let numerator_delta = scaled_add(quadratic_delta(z, delta), dc);
-            let denominator_delta = scaled_add(sc_scale(delta, 2.0), dc);
-            let pixel_denominator = denominator + scaled_to_f32(denominator_delta);
-            let g = complex_div(numerator, denominator);
-            let quotient_delta = sc_sub(
-                scaled_mul_plain(numerator_delta, denominator),
-                scaled_mul_plain(denominator_delta, numerator),
-            );
-            let dg = scaled_mul_plain(
-                quotient_delta,
-                complex_inverse(complex_mul(denominator, pixel_denominator)),
-            );
-            next = quadratic_delta(g, dg);
-        }
-        case FAMILY_MAGNET_TWO: {
-            let one = vec2<f32>(1.0, 0.0);
-            let c1 = c - one;
-            let c2 = c - vec2<f32>(2.0, 0.0);
-            let c12 = complex_mul(c1, c2);
-            let z2 = complex_square(z);
-            let numerator = complex_mul(z2, z) + 3.0 * complex_mul(c1, z) + c12;
-            let denominator = 3.0 * z2 + 3.0 * complex_mul(c2, z) + c12 + one;
-            let delta2 = scaled_complex_mul(delta, delta);
-            let delta3 = scaled_complex_mul(delta2, delta);
-            // Terms shared by numerator and denominator: δc (3Z + 2C − 3) + 3 δc δ + δc².
-            let shared_terms = scaled_add(
-                scaled_add(
-                    scaled_mul_plain(dc, 3.0 * z + 2.0 * c - vec2<f32>(3.0, 0.0)),
-                    sc_scale(scaled_complex_mul(dc, delta), 3.0),
-                ),
-                scaled_complex_mul(dc, dc),
-            );
-            let numerator_delta = scaled_add(
-                scaled_add(
-                    scaled_add(scaled_mul_plain(delta, 3.0 * z2 + 3.0 * c1), sc_scale(scaled_mul_plain(delta2, z), 3.0)),
-                    delta3,
-                ),
-                shared_terms,
-            );
-            let denominator_delta = scaled_add(
-                scaled_add(scaled_mul_plain(delta, 6.0 * z + 3.0 * c2), sc_scale(delta2, 3.0)),
-                shared_terms,
-            );
-            let pixel_denominator = denominator + scaled_to_f32(denominator_delta);
-            let g = complex_div(numerator, denominator);
-            let quotient_delta = sc_sub(
-                scaled_mul_plain(numerator_delta, denominator),
-                scaled_mul_plain(denominator_delta, numerator),
-            );
-            let dg = scaled_mul_plain(
-                quotient_delta,
-                complex_inverse(complex_mul(denominator, pixel_denominator)),
-            );
-            next = quadratic_delta(g, dg);
-        }
-        case FAMILY_NOVA, FAMILY_NEWTON: {
-            var p = family_degree();
-            var relaxation = u.family_a.y;
-            if (family == FAMILY_NEWTON) {
-                p = 3u;
-                relaxation = 1.0;
-            }
-            // (Z+δ)^(1−p) − Z^(1−p) = −B / (Z^(p−1) (Z+δ)^(p−1)).
-            let b = binomial_delta(z, delta, p - 1u);
-            let z_power = complex_pow(z, p - 1u);
-            let pixel_power = complex_pow(z + scaled_to_f32(delta), p - 1u);
-            let inverse_delta = sc_neg(scaled_mul_plain(
-                b,
-                complex_inverse(complex_mul(z_power, pixel_power)),
-            ));
-            next = scaled_add(
-                sc_scale(delta, 1.0 - relaxation / f32(p)),
-                sc_scale(inverse_delta, relaxation / f32(p)),
-            );
-            if (family == FAMILY_NOVA) {
-                next = scaled_add(next, dc);
-            }
-        }
-        case FAMILY_BARNSLEY_ONE, FAMILY_BARNSLEY_TWO: {
-            let one = vec2<f32>(1.0, 0.0);
-            let pixel_z = z + scaled_to_f32(delta);
-            let pixel_c = c + scaled_to_f32(dc);
-            var reference_branch = x >= 0.0;
-            var pixel_branch = pixel_z.x >= 0.0;
-            if (family == FAMILY_BARNSLEY_TWO) {
-                reference_branch = x * c.y + c.x * y >= 0.0;
-                pixel_branch = pixel_z.x * pixel_c.y + pixel_c.x * pixel_z.y >= 0.0;
-            }
-            let reference_base = select(z + one, z - one, reference_branch);
-            let pixel_base = select(z + one, z - one, pixel_branch);
-            // (base + δ)(C + δc) − reference_base C
-            next = scaled_add(
-                scaled_add(
-                    sc_from_f32(complex_mul(pixel_base - reference_base, c)),
-                    scaled_mul_plain(delta, c),
-                ),
-                scaled_add(scaled_mul_plain(dc, pixel_base), scaled_complex_mul(dc, delta)),
-            );
-        }
-        case FAMILY_MANDELBOX: {
-            let folded = vec2<f32>(box_fold(x), box_fold(y));
-            let fold_delta = sc_from_reals(box_fold_delta(x, dx), box_fold_delta(y, dy));
-            let radius_squared = dot(folded, folded);
-            // Δ(r²) = 2 F·ΔF + |ΔF|²
-            let radius_delta = sr_add(
-                sr_add(sr_scale(sc_x(fold_delta), 2.0 * folded.x), sr_scale(sc_y(fold_delta), 2.0 * folded.y)),
-                sr_add(sr_mul(sc_x(fold_delta), sc_x(fold_delta)), sr_mul(sc_y(fold_delta), sc_y(fold_delta))),
-            );
-            let pixel_radius_squared = radius_squared + sr_to_f32(radius_delta);
-            let min_squared = u.family_a.w * u.family_a.w;
-            let fixed_squared = u.family_b.x * u.family_b.x;
-            var reference_branch = 2;
-            if (radius_squared < min_squared) { reference_branch = 0; }
-            else if (radius_squared < fixed_squared) { reference_branch = 1; }
-            var pixel_branch = 2;
-            if (pixel_radius_squared < min_squared) { pixel_branch = 0; }
-            else if (pixel_radius_squared < fixed_squared) { pixel_branch = 1; }
-            var ball_delta = fold_delta;
-            if (reference_branch != pixel_branch) {
-                let pixel_folded = folded + scaled_to_f32(fold_delta);
-                var pixel_ball = pixel_folded;
-                if (pixel_branch == 0) { pixel_ball = pixel_folded * (fixed_squared / min_squared); }
-                else if (pixel_branch == 1) { pixel_ball = pixel_folded * (fixed_squared / pixel_radius_squared); }
-                var reference_ball = folded;
-                if (reference_branch == 0) { reference_ball = folded * (fixed_squared / min_squared); }
-                else if (reference_branch == 1) { reference_ball = folded * (fixed_squared / radius_squared); }
-                ball_delta = sc_from_f32(pixel_ball - reference_ball);
-            } else if (reference_branch == 0) {
-                ball_delta = sc_scale(fold_delta, fixed_squared / min_squared);
-            } else if (reference_branch == 1) {
-                // fixed² [ΔF r² − F Δ(r²)] / (r² r²_pixel)
-                let numerator = sc_sub(
-                    sc_scale(fold_delta, radius_squared),
-                    sr_times_complex(radius_delta, folded),
-                );
-                ball_delta = sc_scale(numerator, fixed_squared / max(radius_squared * pixel_radius_squared, 1e-38));
-            }
-            next = scaled_add(sc_scale(ball_delta, u.family_a.z), dc);
-        }
-        default: {
-            next = scaled_add(quadratic_delta(z, delta), dc);
-        }
-    }
-    return PerturbState(next, next_prev, next_dc, next_c);
-}
 
 // Continues a generic orbit in plain f32 from a known state; used after the
 // reference orbit ends beyond the double-single handoff.
@@ -1699,50 +1429,397 @@ fn continue_family_f32(
     return GenericResult(RESULT_BOUNDED, max_iterations, state.z, f32(max_iterations), trap);
 }
 
-fn iterate_family_perturbation(
+// Plain-f32 delta helpers for the `_f32` instantiation.
+fn fc_zero() -> vec2<f32> { return vec2<f32>(0.0); }
+fn fc_from_f32(value: vec2<f32>) -> vec2<f32> { return value; }
+fn fc_neg(a: vec2<f32>) -> vec2<f32> { return -a; }
+fn fc_sub(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return a - b; }
+fn fc_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return a + b; }
+fn fc_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return complex_mul(a, b); }
+fn fc_mul_plain(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return complex_mul(a, b); }
+fn fc_scale(a: vec2<f32>, s: f32) -> vec2<f32> { return a * s; }
+fn fc_to_f32(a: vec2<f32>) -> vec2<f32> { return a; }
+fn fc_x(a: vec2<f32>) -> f32 { return a.x; }
+fn fc_y(a: vec2<f32>) -> f32 { return a.y; }
+fn fc_from_reals(x: f32, y: f32) -> vec2<f32> { return vec2<f32>(x, y); }
+fn fc_mul_real(a: vec2<f32>, r: f32) -> vec2<f32> { return a * r; }
+fn fr_times_complex(r: f32, z: vec2<f32>) -> vec2<f32> { return z * r; }
+fn fc_normalize(a: vec2<f32>) -> vec2<f32> { return a; }
+fn fc_pixel_delta(local: vec2<f32>) -> vec2<f32> { return local * u.deep.y * exp2i(i32(u.deep.z)); }
+fn fr_zero() -> f32 { return 0.0; }
+fn fr_from_f32(value: f32) -> f32 { return value; }
+fn fr_to_f32(value: f32) -> f32 { return value; }
+fn fr_add(a: f32, b: f32) -> f32 { return a + b; }
+fn fr_neg(a: f32) -> f32 { return -a; }
+fn fr_mul(a: f32, b: f32) -> f32 { return a * b; }
+fn fr_scale(a: f32, s: f32) -> f32 { return a * s; }
+
+fn sr_zero() -> ScaledReal {
+    return ScaledReal(0.0, 0);
+}
+
+fn sc_pixel_delta(local: vec2<f32>) -> ScaledComplex {
+    return scaled_normalize(ScaledComplex(local * u.deep.y, i32(u.deep.z)));
+}
+
+// ---------------------------------------------------------------------------
+// Delta algebra template.
+//
+// Everything between the BEGIN/END markers is instantiated twice by
+// `render::shader_source()` at shader-load time: once with scaled
+// (mantissa, exponent) deltas for arbitrary-precision depth (suffix
+// `_scaled`, types ScaledComplex/ScaledReal, `sc_*`/`sr_*` helpers) and once
+// with plain f32 deltas for the f64-reference range below the handoff
+// (suffix `_f32`, types vec2<f32>/f32, `fc_*`/`fr_*` helpers), where deltas
+// never leave f32 range and the plain version runs several times faster.
+// `DC`/`DR` are the complex/real delta types, `dc_*`/`dr_*` the operations
+// and the double-underscore-T suffix marks names to be instantiated. The raw file does not compile as-is.
+// ---------------------------------------------------------------------------
+// BEGIN DELTA TEMPLATE
+struct PerturbState__T {
+    dz: DC,
+    dz_prev: DC,
+    dc: DC,
+    // Reference parameter (drifts for the Spider map).
+    c_ref: vec2<f32>,
+};
+
+fn diffabs__T(reference: f32, delta: DR) -> DR {
+    let delta_f32 = dr_to_f32(delta);
+    if (reference >= 0.0) {
+        if (reference + delta_f32 >= 0.0) { return delta; }
+        return dr_add(dr_from_f32(-2.0 * reference), dr_neg(delta));
+    }
+    if (reference + delta_f32 < 0.0) { return dr_neg(delta); }
+    return dr_add(dr_from_f32(2.0 * reference), delta);
+}
+
+// 2 Z δ + δ².
+fn quadratic_delta__T(z: vec2<f32>, delta: DC) -> DC {
+    return dc_add(dc_mul_plain(delta, 2.0 * z), dc_mul(delta, delta));
+}
+
+// Σ_{k=1}^{d} C(d, k) Z^{d−k} δ^k  =  (Z + δ)^d − Z^d.
+fn binomial_delta__T(z: vec2<f32>, delta: DC, degree: u32) -> DC {
+    // Horner form in δ: Σ C(d,k) Z^(d−k) δ^k = δ (c₁Z^(d−1) + δ (c₂Z^(d−2) + ... )).
+    // Evaluated from the highest power down so only one running power of Z
+    // and one multiplication by δ per term are needed.
+    var accumulator = dc_zero();
+    var coefficient = 1.0;
+    // C(d, d) = 1 for the δ^d term; build coefficients downward.
+    var z_power = vec2<f32>(1.0, 0.0);
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        if (k >= degree) { break; }
+        // term index t = degree - k (from δ^d down to δ^1), coefficient C(d, t)
+        let t = degree - k;
+        accumulator = dc_add(
+            dc_mul(accumulator, delta),
+            dc_mul_plain(dc_from_f32(z_power), vec2<f32>(coefficient, 0.0)),
+        );
+        // Next (lower) term: multiply Z power, update C(d, t-1) = C(d, t) * t / (d - t + 1)
+        z_power = complex_mul(z_power, z);
+        coefficient = coefficient * f32(t) / f32(degree - t + 1u);
+    }
+    return dc_mul(accumulator, delta);
+}
+
+// Component-wise box-fold difference box(X + dx) − box(X).
+fn box_fold_delta__T(reference: f32, delta: DR) -> DR {
+    let pixel = reference + dr_to_f32(delta);
+    let reference_branch = box_branch(reference);
+    if (box_branch(pixel) == reference_branch) {
+        if (reference_branch == 0) { return delta; }
+        return dr_neg(delta);
+    }
+    return dr_from_f32(box_fold(pixel) - box_fold(reference));
+}
+
+fn perturb_step__T(
     family: u32,
-    centre: Ds2,
+    state: PerturbState__T,
+    z: vec2<f32>,
+    z_prev: vec2<f32>,
+    z_next: vec2<f32>,
+) -> PerturbState__T {
+    let delta = state.dz;
+    let dc = state.dc;
+    let c = state.c_ref;
+    let x = z.x;
+    let y = z.y;
+    let dx = dc_x(delta);
+    let dy = dc_y(delta);
+    var next = dc_zero();
+    var next_prev = state.dz_prev;
+    var next_dc = dc;
+    var next_c = c;
+    switch family {
+        case FAMILY_MULTIBROT: {
+            next = dc_add(binomial_delta__T(z, delta, family_degree()), dc);
+        }
+        case FAMILY_TRICORN, FAMILY_PERPENDICULAR_MANDELBROT, FAMILY_BURNING_SHIP,
+            FAMILY_PERPENDICULAR_BURNING_SHIP, FAMILY_CELTIC, FAMILY_PERPENDICULAR_CELTIC,
+            FAMILY_BUFFALO, FAMILY_PERPENDICULAR_BUFFALO: {
+            // Δ(x² − y²) and Δ(xy) without cancellation.
+            let real_delta = dr_add(
+                dr_add(dr_scale(dx, 2.0 * x), dr_mul(dx, dx)),
+                dr_neg(dr_add(dr_scale(dy, 2.0 * y), dr_mul(dy, dy))),
+            );
+            let product_delta = dr_add(dr_add(dr_scale(dy, x), dr_scale(dx, y)), dr_mul(dx, dy));
+            var real_part = real_delta;
+            if (family == FAMILY_CELTIC || family == FAMILY_PERPENDICULAR_CELTIC
+                || family == FAMILY_BUFFALO || family == FAMILY_PERPENDICULAR_BUFFALO) {
+                real_part = diffabs__T(x * x - y * y, real_delta);
+            }
+            var imaginary_part = dr_zero();
+            if (family == FAMILY_TRICORN) {
+                imaginary_part = dr_scale(product_delta, -2.0);
+            } else if (family == FAMILY_CELTIC) {
+                imaginary_part = dr_scale(product_delta, 2.0);
+            } else if (family == FAMILY_BURNING_SHIP || family == FAMILY_BUFFALO) {
+                imaginary_part = dr_scale(diffabs__T(x * y, product_delta), 2.0);
+            } else if (family == FAMILY_PERPENDICULAR_MANDELBROT || family == FAMILY_PERPENDICULAR_CELTIC) {
+                // Δ(|x| y) = diffabs__T(X, dx) (Y + dy) + |X| dy
+                let abs_x_delta = diffabs__T(x, dx);
+                imaginary_part = dr_scale(
+                    dr_add(dr_add(dr_scale(abs_x_delta, y), dr_mul(abs_x_delta, dy)), dr_scale(dy, abs(x))),
+                    -2.0,
+                );
+            } else {
+                // Perpendicular Burning Ship / Buffalo: Δ(x |y|) = X dY + dx |Y| + dx dY
+                let abs_y_delta = diffabs__T(y, dy);
+                imaginary_part = dr_scale(
+                    dr_add(dr_add(dr_scale(abs_y_delta, x), dr_scale(dx, abs(y))), dr_mul(dx, abs_y_delta)),
+                    -2.0,
+                );
+            }
+            next = dc_add(dc_from_reals(real_part, imaginary_part), dc);
+        }
+        case FAMILY_LAMBDA: {
+            // f = λ (z − z²):  Δ = Λ w + δλ ((Z − Z²) + w),  w = δ(1 − 2Z) − δ².
+            let w = dc_sub(dc_mul_plain(delta, vec2<f32>(1.0, 0.0) - 2.0 * z), dc_mul(delta, delta));
+            let base = z - complex_square(z);
+            next = dc_add(
+                dc_add(dc_mul_plain(w, c), dc_mul_plain(dc, base)),
+                dc_mul(dc, w),
+            );
+        }
+        case FAMILY_PHOENIX: {
+            let dp = dc_from_reals(dc_x(dc), dr_zero());
+            let dq = dc_y(dc);
+            next = dc_add(quadratic_delta__T(z, delta), dp);
+            next = dc_add(next, dc_scale(state.dz_prev, c.y));
+            next = dc_add(next, dr_times_complex(dq, z_prev));
+            next = dc_add(next, dc_mul_real(state.dz_prev, dq));
+            next_prev = delta;
+        }
+        case FAMILY_MANOWAR: {
+            next = dc_add(dc_add(quadratic_delta__T(z, delta), state.dz_prev), dc);
+            next_prev = delta;
+        }
+        case FAMILY_SPIDER: {
+            next = dc_add(quadratic_delta__T(z, delta), dc);
+            next_dc = dc_add(dc_scale(dc, 0.5), next);
+            next_c = 0.5 * c + z_next;
+        }
+        case FAMILY_MAGNET_ONE: {
+            let one = vec2<f32>(1.0, 0.0);
+            let numerator = complex_square(z) + c - one;
+            let denominator = 2.0 * z + c - vec2<f32>(2.0, 0.0);
+            let numerator_delta = dc_add(quadratic_delta__T(z, delta), dc);
+            let denominator_delta = dc_add(dc_scale(delta, 2.0), dc);
+            let pixel_denominator = denominator + dc_to_f32(denominator_delta);
+            let g = complex_div(numerator, denominator);
+            let quotient_delta = dc_sub(
+                dc_mul_plain(numerator_delta, denominator),
+                dc_mul_plain(denominator_delta, numerator),
+            );
+            let dg = dc_mul_plain(
+                quotient_delta,
+                complex_inverse(complex_mul(denominator, pixel_denominator)),
+            );
+            next = quadratic_delta__T(g, dg);
+        }
+        case FAMILY_MAGNET_TWO: {
+            let one = vec2<f32>(1.0, 0.0);
+            let c1 = c - one;
+            let c2 = c - vec2<f32>(2.0, 0.0);
+            let c12 = complex_mul(c1, c2);
+            let z2 = complex_square(z);
+            let numerator = complex_mul(z2, z) + 3.0 * complex_mul(c1, z) + c12;
+            let denominator = 3.0 * z2 + 3.0 * complex_mul(c2, z) + c12 + one;
+            let delta2 = dc_mul(delta, delta);
+            let delta3 = dc_mul(delta2, delta);
+            // Terms shared by numerator and denominator: δc (3Z + 2C − 3) + 3 δc δ + δc².
+            let shared_terms = dc_add(
+                dc_add(
+                    dc_mul_plain(dc, 3.0 * z + 2.0 * c - vec2<f32>(3.0, 0.0)),
+                    dc_scale(dc_mul(dc, delta), 3.0),
+                ),
+                dc_mul(dc, dc),
+            );
+            let numerator_delta = dc_add(
+                dc_add(
+                    dc_add(dc_mul_plain(delta, 3.0 * z2 + 3.0 * c1), dc_scale(dc_mul_plain(delta2, z), 3.0)),
+                    delta3,
+                ),
+                shared_terms,
+            );
+            let denominator_delta = dc_add(
+                dc_add(dc_mul_plain(delta, 6.0 * z + 3.0 * c2), dc_scale(delta2, 3.0)),
+                shared_terms,
+            );
+            let pixel_denominator = denominator + dc_to_f32(denominator_delta);
+            let g = complex_div(numerator, denominator);
+            let quotient_delta = dc_sub(
+                dc_mul_plain(numerator_delta, denominator),
+                dc_mul_plain(denominator_delta, numerator),
+            );
+            let dg = dc_mul_plain(
+                quotient_delta,
+                complex_inverse(complex_mul(denominator, pixel_denominator)),
+            );
+            next = quadratic_delta__T(g, dg);
+        }
+        case FAMILY_NOVA, FAMILY_NEWTON: {
+            var p = family_degree();
+            var relaxation = u.family_a.y;
+            if (family == FAMILY_NEWTON) {
+                p = 3u;
+                relaxation = 1.0;
+            }
+            // (Z+δ)^(1−p) − Z^(1−p) = −B / (Z^(p−1) (Z+δ)^(p−1)).
+            let b = binomial_delta__T(z, delta, p - 1u);
+            let z_power = complex_pow(z, p - 1u);
+            let pixel_power = complex_pow(z + dc_to_f32(delta), p - 1u);
+            let inverse_delta = dc_neg(dc_mul_plain(
+                b,
+                complex_inverse(complex_mul(z_power, pixel_power)),
+            ));
+            next = dc_add(
+                dc_scale(delta, 1.0 - relaxation / f32(p)),
+                dc_scale(inverse_delta, relaxation / f32(p)),
+            );
+            if (family == FAMILY_NOVA) {
+                next = dc_add(next, dc);
+            }
+        }
+        case FAMILY_BARNSLEY_ONE, FAMILY_BARNSLEY_TWO: {
+            let one = vec2<f32>(1.0, 0.0);
+            let pixel_z = z + dc_to_f32(delta);
+            let pixel_c = c + dc_to_f32(dc);
+            var reference_branch = x >= 0.0;
+            var pixel_branch = pixel_z.x >= 0.0;
+            if (family == FAMILY_BARNSLEY_TWO) {
+                reference_branch = x * c.y + c.x * y >= 0.0;
+                pixel_branch = pixel_z.x * pixel_c.y + pixel_c.x * pixel_z.y >= 0.0;
+            }
+            let reference_base = select(z + one, z - one, reference_branch);
+            let pixel_base = select(z + one, z - one, pixel_branch);
+            // (base + δ)(C + δc) − reference_base C
+            next = dc_add(
+                dc_add(
+                    dc_from_f32(complex_mul(pixel_base - reference_base, c)),
+                    dc_mul_plain(delta, c),
+                ),
+                dc_add(dc_mul_plain(dc, pixel_base), dc_mul(dc, delta)),
+            );
+        }
+        case FAMILY_MANDELBOX: {
+            let folded = vec2<f32>(box_fold(x), box_fold(y));
+            let fold_delta = dc_from_reals(box_fold_delta__T(x, dx), box_fold_delta__T(y, dy));
+            let radius_squared = dot(folded, folded);
+            // Δ(r²) = 2 F·ΔF + |ΔF|²
+            let radius_delta = dr_add(
+                dr_add(dr_scale(dc_x(fold_delta), 2.0 * folded.x), dr_scale(dc_y(fold_delta), 2.0 * folded.y)),
+                dr_add(dr_mul(dc_x(fold_delta), dc_x(fold_delta)), dr_mul(dc_y(fold_delta), dc_y(fold_delta))),
+            );
+            let pixel_radius_squared = radius_squared + dr_to_f32(radius_delta);
+            let min_squared = u.family_a.w * u.family_a.w;
+            let fixed_squared = u.family_b.x * u.family_b.x;
+            var reference_branch = 2;
+            if (radius_squared < min_squared) { reference_branch = 0; }
+            else if (radius_squared < fixed_squared) { reference_branch = 1; }
+            var pixel_branch = 2;
+            if (pixel_radius_squared < min_squared) { pixel_branch = 0; }
+            else if (pixel_radius_squared < fixed_squared) { pixel_branch = 1; }
+            var ball_delta = fold_delta;
+            if (reference_branch != pixel_branch) {
+                let pixel_folded = folded + dc_to_f32(fold_delta);
+                var pixel_ball = pixel_folded;
+                if (pixel_branch == 0) { pixel_ball = pixel_folded * (fixed_squared / min_squared); }
+                else if (pixel_branch == 1) { pixel_ball = pixel_folded * (fixed_squared / pixel_radius_squared); }
+                var reference_ball = folded;
+                if (reference_branch == 0) { reference_ball = folded * (fixed_squared / min_squared); }
+                else if (reference_branch == 1) { reference_ball = folded * (fixed_squared / radius_squared); }
+                ball_delta = dc_from_f32(pixel_ball - reference_ball);
+            } else if (reference_branch == 0) {
+                ball_delta = dc_scale(fold_delta, fixed_squared / min_squared);
+            } else if (reference_branch == 1) {
+                // fixed² [ΔF r² − F Δ(r²)] / (r² r²_pixel)
+                let numerator = dc_sub(
+                    dc_scale(fold_delta, radius_squared),
+                    dr_times_complex(radius_delta, folded),
+                );
+                ball_delta = dc_scale(numerator, fixed_squared / max(radius_squared * pixel_radius_squared, 1e-38));
+            }
+            next = dc_add(dc_scale(ball_delta, u.family_a.z), dc);
+        }
+        default: {
+            next = dc_add(quadratic_delta__T(z, delta), dc);
+        }
+    }
+    return PerturbState__T(
+        dc_normalize(next),
+        dc_normalize(next_prev),
+        dc_normalize(next_dc),
+        next_c,
+    );
+}
+
+fn iterate_family_perturbation__T(
+    family: u32,
+    reference_c: vec2<f32>,
     local: vec2<f32>,
-    local_offset: vec2<f32>,
     dynamical: bool,
 ) -> GenericResult {
     let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
     let reference_len = u32(max(u.deep.w, 1.0));
     let available_iterations = min(max_iterations, reference_len - 1u);
-    let pixel_delta = scaled_normalize(ScaledComplex(local * u.deep.y, i32(u.deep.z)));
+    let pixel_delta = dc_pixel_delta(local);
     let radius_squared = family_escape_radius_squared(family);
     let threshold = family_convergence_threshold(family);
 
-    var state: PerturbState;
+    var state: PerturbState__T;
     let z0 = reference_value(0u);
     if (dynamical) {
-        var dz_prev = sc_zero();
+        var dz_prev = dc_zero();
         if (family == FAMILY_MANOWAR) { dz_prev = pixel_delta; }
-        state = PerturbState(pixel_delta, dz_prev, sc_zero(), u.dynamics_hi.xy);
+        state = PerturbState__T(pixel_delta, dz_prev, dc_zero(), u.dynamics_hi.xy);
     } else {
-        var dz = sc_zero();
-        var dz_prev = sc_zero();
+        var dz = dc_zero();
+        var dz_prev = dc_zero();
         if (family == FAMILY_MANOWAR || family == FAMILY_BARNSLEY_ONE || family == FAMILY_BARNSLEY_TWO) {
             dz = pixel_delta;
         }
         if (family == FAMILY_MANOWAR) { dz_prev = pixel_delta; }
-        state = PerturbState(dz, dz_prev, pixel_delta, ds2_approx(centre));
+        state = PerturbState__T(dz, dz_prev, pixel_delta, reference_c);
     }
     var initial_prev = vec2<f32>(0.0);
     if (family == FAMILY_MANOWAR) { initial_prev = z0; }
 
-    var approximate = z0 + scaled_to_f32(state.dz);
+    var approximate = z0 + dc_to_f32(state.dz);
     var previous_residual = 1e30;
     var trap = 1e30;
     var z_prev = initial_prev;
+    var z = z0;
     for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= available_iterations) { break; }
-        let z = reference_value(i);
         let z_next = reference_value(i + 1u);
         let previous = approximate;
-        state = perturb_step(family, state, z, z_prev, z_next);
+        state = perturb_step__T(family, state, z, z_prev, z_next);
         z_prev = z;
-        approximate = z_next + scaled_to_f32(state.dz);
+        z = z_next;
+        approximate = z_next + dc_to_f32(state.dz);
         let iteration = i + 1u;
         trap = min(trap, dot(approximate, approximate));
         if (family_escaped(family, approximate, radius_squared)) {
@@ -1757,23 +1834,21 @@ fn iterate_family_perturbation(
         previous_residual = residual;
     }
 
-    if (available_iterations < max_iterations && u.deep.x < 1.5) {
-        // The reference escaped or converged before this pixel did. At the
-        // handoff the double-single path is still a safe per-pixel fallback.
-        return iterate_family_ds(family, centre, local_offset, dynamical);
-    }
     if (available_iterations < max_iterations) {
-        // Beyond the handoff continue from the separated perturbed state in
-        // plain f32; automatic rebasing will ultimately replace this tail.
+        // The reference escaped or converged before this pixel did. Continue
+        // from the separated perturbed state in plain f32: by now the pixel's
+        // orbit differs from the reference by far more than f32 resolution.
+        // Automatic reference rebasing will ultimately replace this tail.
         let tail = GenericState(
             approximate,
-            z_prev + scaled_to_f32(state.dz_prev),
-            state.c_ref + scaled_to_f32(state.dc),
+            z_prev + dc_to_f32(state.dz_prev),
+            state.c_ref + dc_to_f32(state.dc),
         );
         return continue_family_f32(family, tail, available_iterations, max_iterations, trap, previous_residual);
     }
     return GenericResult(RESULT_BOUNDED, max_iterations, approximate, f32(max_iterations), trap);
 }
+// END DELTA TEMPLATE
 
 fn newton_from_generic(result: GenericResult) -> NewtonResult {
     let z2 = complex_mul(result.z, result.z);
@@ -1846,6 +1921,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let julia = u.display.x > 0.5;
     let double_single = u.view_lo.w > 0.5;
     let perturbation = u.deep.x > 0.5;
+    // Pixel position relative to the (possibly off-centre) reference point,
+    // and the reference's own parameter for parameter-plane families.
+    let reference_local = local - u.reference.xy;
+    let reference_c = ds2_approx(centre_ds) + u.reference.xy * ds_approx(scale_ds);
     let family = u32(u.dynamics_lo.z + 0.5);
     let newton = family == FAMILY_NEWTON;
     let dynamical = u.family_b.w > 0.5;
@@ -1894,8 +1973,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     if (family != FAMILY_QUADRATIC && !newton) {
         var result: GenericResult;
         var world = world_f32;
-        if (perturbation) {
-            result = iterate_family_perturbation(family, centre_ds, local, local_offset, dynamical);
+        if (perturbation && u.deep.x < 1.5) {
+            result = iterate_family_perturbation_f32(family, reference_c, reference_local, dynamical);
+            world = world_ds_approx;
+        } else if (perturbation) {
+            result = iterate_family_perturbation_scaled(family, reference_c, reference_local, dynamical);
             world = world_ds_approx;
         } else if (double_single) {
             result = iterate_family_ds(family, centre_ds, local_offset, dynamical);
@@ -1915,9 +1997,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     }
     if (newton) {
         var result: NewtonResult;
-        if (perturbation) {
+        if (perturbation && u.deep.x < 1.5) {
             result = newton_from_generic(
-                iterate_family_perturbation(FAMILY_NEWTON, centre_ds, local, local_offset, true),
+                iterate_family_perturbation_f32(FAMILY_NEWTON, reference_c, reference_local, true),
+            );
+        } else if (perturbation) {
+            result = newton_from_generic(
+                iterate_family_perturbation_scaled(FAMILY_NEWTON, reference_c, reference_local, true),
             );
         } else if (double_single) {
             result = newton_from_generic(
@@ -1939,7 +2025,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     var result: EscapeResult;
     var world = world_f32;
     if (perturbation) {
-        result = iterate_perturbation(centre_ds, local, local_offset, julia);
+        result = iterate_perturbation(centre_ds, reference_local, local_offset, reference_c, julia);
         world = world_ds_approx;
     } else if (double_single) {
         result = iterate_ds(centre_ds, local_offset, julia);

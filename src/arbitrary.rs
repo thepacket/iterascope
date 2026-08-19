@@ -299,10 +299,6 @@ impl DeepComplex {
             im: DeepReal::parse("0", exponent)?,
         })
     }
-
-    fn magnitude_squared_f64(&self) -> f64 {
-        self.re.mul(&self.re).add(&self.im.mul(&self.im)).to_f64()
-    }
 }
 
 /// Arbitrary-precision orbit state: the same triple the shader and the CPU
@@ -523,27 +519,21 @@ pub(crate) fn deep_step(
     }
 }
 
-impl ReferenceOrbit {
-    pub fn quadratic_parameter(
-        c: &DeepComplex,
-        iterations: u32,
-        bailout: f64,
-    ) -> Result<Self, String> {
-        Self::quadratic(DeepComplex::zero_like(c)?, c, iterations, bailout)
-    }
+/// Incrementally built reference orbit, so an expensive arbitrary-precision
+/// orbit can be extended across frames under a time budget instead of
+/// freezing the interface.
+pub struct ReferenceOrbitBuilder {
+    family: FractalFamily,
+    parameters: FamilyParameters,
+    state: DeepState,
+    iterations: u32,
+    escape_squared: f64,
+    pub points: Vec<DeepComplex>,
+    pub escape_iteration: Option<u32>,
+}
 
-    pub fn quadratic_julia(
-        initial: DeepComplex,
-        c: &DeepComplex,
-        iterations: u32,
-        bailout: f64,
-    ) -> Result<Self, String> {
-        Self::quadratic(initial, c, iterations, bailout)
-    }
-
-    /// Reference orbit of any perturbation-capable family, terminating on the
-    /// same escape or convergence tests as the shader and `family::diagnose`.
-    pub(crate) fn family(
+impl ReferenceOrbitBuilder {
+    pub(crate) fn new(
         family: FractalFamily,
         parameters: &FamilyParameters,
         initial: DeepState,
@@ -559,9 +549,6 @@ impl ReferenceOrbit {
                 family.name()
             ));
         }
-        if family == FractalFamily::Quadratic {
-            return Self::quadratic(initial.z, &initial.c, iterations, bailout);
-        }
         let escape_squared = match family {
             FractalFamily::Mandelbox => {
                 let radius = bailout * MANDELBOX_BAILOUT_FACTOR;
@@ -571,16 +558,40 @@ impl ReferenceOrbit {
             FractalFamily::NewtonCubic => 1e36,
             _ => bailout * bailout,
         };
-        let mut state = initial;
         let mut points = Vec::with_capacity(iterations as usize + 1);
-        points.push(state.z.clone());
-        for iteration in 1..=iterations {
-            let previous = state.z.to_f64_pair();
-            state = deep_step(family, parameters, &state);
-            points.push(state.z.clone());
-            let z = state.z.to_f64_pair();
+        points.push(initial.z.clone());
+        Ok(Self {
+            family,
+            parameters: parameters.clone(),
+            state: initial,
+            iterations,
+            escape_squared,
+            points,
+            escape_iteration: None,
+        })
+    }
+
+    /// Number of iterations computed so far.
+    pub fn computed(&self) -> u32 {
+        self.points.len() as u32 - 1
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.escape_iteration.is_some() || self.computed() >= self.iterations
+    }
+
+    /// Advances by at most `max_steps` iterations; returns whether the orbit
+    /// is complete afterwards.
+    pub fn advance(&mut self, max_steps: u32) -> bool {
+        let mut steps = 0;
+        while !self.is_complete() && steps < max_steps {
+            let iteration = self.computed() + 1;
+            let previous = self.state.z.to_f64_pair();
+            self.state = deep_step(self.family, &self.parameters, &self.state);
+            self.points.push(self.state.z.clone());
+            let z = self.state.z.to_f64_pair();
             let magnitude_squared = z[0] * z[0] + z[1] * z[1];
-            let converged = match family {
+            let converged = match self.family {
                 FractalFamily::MagnetOne | FractalFamily::MagnetTwo => {
                     (z[0] - 1.0).hypot(z[1]) < MAGNET_CONVERGENCE
                 }
@@ -594,46 +605,68 @@ impl ReferenceOrbit {
                 }
                 _ => false,
             };
-            if !magnitude_squared.is_finite() || magnitude_squared > escape_squared || converged {
-                return Ok(Self {
-                    points,
-                    escape_iteration: Some(iteration),
-                });
+            if !magnitude_squared.is_finite()
+                || magnitude_squared > self.escape_squared
+                || converged
+            {
+                self.escape_iteration = Some(iteration);
             }
+            steps += 1;
         }
-        Ok(Self {
-            points,
-            escape_iteration: None,
-        })
+        self.is_complete()
     }
 
-    fn quadratic(
-        mut z: DeepComplex,
+    pub fn finish(mut self) -> ReferenceOrbit {
+        self.advance(u32::MAX);
+        ReferenceOrbit {
+            points: self.points,
+            escape_iteration: self.escape_iteration,
+        }
+    }
+}
+
+impl ReferenceOrbit {
+    pub fn quadratic_parameter(
         c: &DeepComplex,
         iterations: u32,
         bailout: f64,
     ) -> Result<Self, String> {
-        if !bailout.is_finite() || bailout <= 0.0 {
-            return Err("reference-orbit bailout must be positive and finite".to_owned());
-        }
+        let initial = DeepState::initial(FractalFamily::Quadratic, c, false, c)?;
+        Self::family(
+            FractalFamily::Quadratic,
+            &FamilyParameters::default(),
+            initial,
+            iterations,
+            bailout,
+        )
+    }
 
-        let mut points = Vec::with_capacity(iterations as usize + 1);
-        points.push(z.clone());
-        let bailout_squared = bailout * bailout;
-        for iteration in 1..=iterations {
-            z = z.square_add(c);
-            points.push(z.clone());
-            if z.magnitude_squared_f64() > bailout_squared {
-                return Ok(Self {
-                    points,
-                    escape_iteration: Some(iteration),
-                });
-            }
-        }
-        Ok(Self {
-            points,
-            escape_iteration: None,
-        })
+    pub fn quadratic_julia(
+        initial: DeepComplex,
+        c: &DeepComplex,
+        iterations: u32,
+        bailout: f64,
+    ) -> Result<Self, String> {
+        let initial = DeepState::initial(FractalFamily::Quadratic, &initial, true, c)?;
+        Self::family(
+            FractalFamily::Quadratic,
+            &FamilyParameters::default(),
+            initial,
+            iterations,
+            bailout,
+        )
+    }
+
+    /// Reference orbit of any perturbation-capable family, terminating on the
+    /// same escape or convergence tests as the shader and `family::diagnose`.
+    pub(crate) fn family(
+        family: FractalFamily,
+        parameters: &FamilyParameters,
+        initial: DeepState,
+        iterations: u32,
+        bailout: f64,
+    ) -> Result<Self, String> {
+        Ok(ReferenceOrbitBuilder::new(family, parameters, initial, iterations, bailout)?.finish())
     }
 }
 
