@@ -156,9 +156,10 @@ from it.
   linear light; sizes whose supersampled frame exceeds the 8192-pixel
   texture limit render as tiles around the same reference orbit, seamless
   at any magnification
-- Two independently collapsible control panes: the left **Instrument** pane
-  (family, document, parameters, computation, navigation, diagnostics) and
-  the right **Studio** pane (layers, colouring, still and animation export)
+- Two independently collapsible, drag-resizable control panes: the left
+  **Instrument** pane (family, document, parameters, computation,
+  navigation, diagnostics) and the right **Studio** pane (layers, colouring,
+  still and animation export)
 - Optional scale-aware coordinate grid
 - Zoom-path animation: a dive to the current centre between two magnification
   exponents at constant or eased logarithmic speed, with an optional gradient
@@ -214,7 +215,8 @@ The controls are split across two independently collapsible panes: the left
 **Instrument** pane holds the scientific state (family, document, parameters,
 computation, navigation and diagnostics), the right **Studio** pane the
 artistic state (layers, colouring, still and animation export). The chevron
-in each pane's header collapses it to a slim strip.
+in each pane's header collapses it to a slim strip, and each pane can be
+widened by dragging its inner edge.
 
 The **Animation** section renders the classic deep-zoom video: a dive to the
 active pane's centre, from a start to an end magnification exponent (defaults:

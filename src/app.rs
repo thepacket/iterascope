@@ -1746,26 +1746,56 @@ impl App {
             let active = index == self.layers.active;
             let bottom = index == 0;
             ui.horizontal(|ui| {
-                let layer = &mut self.layers.layers[index];
-                let eye = if layer.visible { "👁" } else { "—" };
-                if ui
-                    .add(egui::Button::new(eye).min_size(egui::vec2(24.0, 0.0)))
-                    .on_hover_text("Show or hide this layer")
-                    .clicked()
                 {
-                    layer.visible = !layer.visible;
+                    let layer = &mut self.layers.layers[index];
+                    let eye = if layer.visible { "👁" } else { "—" };
+                    if ui
+                        .add(egui::Button::new(eye).min_size(egui::vec2(24.0, 0.0)))
+                        .on_hover_text("Show or hide this layer")
+                        .clicked()
+                    {
+                        layer.visible = !layer.visible;
+                    }
                 }
-                if ui
-                    .selectable_label(active, &layer.name)
-                    .on_hover_text("Select this layer for editing")
-                    .clicked()
-                {
-                    self.layers.active = index;
-                    self.gradient_selected_stop = 0;
-                }
+                // Reorder and delete sit right-aligned on the name row so
+                // the blend row below keeps its full width for the slider.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(count > 1, egui::Button::new("✕").small())
+                        .on_hover_text("Delete this layer")
+                        .clicked()
+                    {
+                        remove = Some(index);
+                    }
+                    if ui
+                        .add_enabled(index > 0, egui::Button::new("▼").small())
+                        .on_hover_text("Move down")
+                        .clicked()
+                    {
+                        swap = Some((index, index - 1));
+                    }
+                    if ui
+                        .add_enabled(index + 1 < count, egui::Button::new("▲").small())
+                        .on_hover_text("Move up")
+                        .clicked()
+                    {
+                        swap = Some((index, index + 1));
+                    }
+                    let layer = &self.layers.layers[index];
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        if ui
+                            .selectable_label(active, &layer.name)
+                            .on_hover_text("Select this layer for editing")
+                            .clicked()
+                        {
+                            self.layers.active = index;
+                            self.gradient_selected_stop = 0;
+                        }
+                    });
+                });
             });
             ui.horizontal(|ui| {
-                ui.add_space(28.0);
+                ui.add_space(26.0);
                 let layer = &mut self.layers.layers[index];
                 if bottom {
                     ui.label(egui::RichText::new("base").small().color(MUTED))
@@ -1775,37 +1805,21 @@ impl App {
                 } else {
                     egui::ComboBox::from_id_salt(("iterascope.layer.mode", index))
                         .selected_text(layer.merge_mode.name())
-                        .width(92.0)
+                        .width(88.0)
                         .show_ui(ui, |ui| {
                             for mode in MergeMode::ALL {
                                 ui.selectable_value(&mut layer.merge_mode, mode, mode.name());
                             }
                         });
                 }
+                // The opacity slider takes whatever width remains.
+                ui.spacing_mut().slider_width = (ui.available_width() - 16.0).max(40.0);
                 ui.add(
                     egui::Slider::new(&mut layer.opacity, 0.0..=1.0)
                         .show_value(false)
-                        .text("op"),
-                );
-                if ui
-                    .add_enabled(index + 1 < count, egui::Button::new("▲").small())
-                    .clicked()
-                {
-                    swap = Some((index, index + 1));
-                }
-                if ui
-                    .add_enabled(index > 0, egui::Button::new("▼").small())
-                    .clicked()
-                {
-                    swap = Some((index, index - 1));
-                }
-                if ui
-                    .add_enabled(count > 1, egui::Button::new("✕").small())
-                    .on_hover_text("Delete this layer")
-                    .clicked()
-                {
-                    remove = Some(index);
-                }
+                        .text(""),
+                )
+                .on_hover_text(format!("Opacity {:.0}%", layer.opacity * 100.0));
             });
         }
         if let Some((a, b)) = swap {
@@ -2286,7 +2300,7 @@ impl App {
             );
         });
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("magnification 10^").color(MUTED));
+            ui.label(egui::RichText::new("zoom 10^").color(MUTED));
             ui.add(
                 egui::DragValue::new(&mut self.animation.start_magnification_log10)
                     .range(-3.0..=MAX_DECIMAL_ZOOM_EXPONENT as f64)
@@ -2301,7 +2315,7 @@ impl App {
                     .fixed_decimals(2),
             );
             if ui
-                .button("End = view")
+                .button("= view")
                 .on_hover_text("Set the end magnification to the active pane's current zoom")
                 .clicked()
             {
@@ -3808,31 +3822,40 @@ impl eframe::App for App {
                 });
             });
 
+        // Both control panes share the same default width and can be
+        // resized by dragging their inner edge; collapsed they become an
+        // exact slim strip.
         let left_open = self.left_panel_open;
-        egui::Panel::left("iterascope.controls")
-            .exact_size(if left_open {
-                PANEL_WIDTH
-            } else {
-                COLLAPSED_PANEL_WIDTH
-            })
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(if left_open {
-                egui::Margin::symmetric(12, 10)
-            } else {
-                egui::Margin::symmetric(2, 10)
-            }))
-            .show(ui, |ui| {
-                if panel_header(ui, "INSTRUMENT", true, &mut self.left_panel_open) {
-                    self.instrument_controls(ui);
-                }
-            });
+        let mut left = egui::Panel::left("iterascope.controls");
+        left = if left_open {
+            left.resizable(true)
+                .default_size(PANEL_WIDTH)
+                .size_range(PANEL_WIDTH..=520.0)
+        } else {
+            left.exact_size(COLLAPSED_PANEL_WIDTH)
+        };
+        left.frame(egui::Frame::new().fill(PANEL).inner_margin(if left_open {
+            egui::Margin::symmetric(12, 10)
+        } else {
+            egui::Margin::symmetric(2, 10)
+        }))
+        .show(ui, |ui| {
+            if panel_header(ui, "INSTRUMENT", true, &mut self.left_panel_open) {
+                self.instrument_controls(ui);
+            }
+        });
 
         let right_open = self.right_panel_open;
-        egui::Panel::right("iterascope.studio")
-            .exact_size(if right_open {
-                PANEL_WIDTH
-            } else {
-                COLLAPSED_PANEL_WIDTH
-            })
+        let mut right = egui::Panel::right("iterascope.studio");
+        right = if right_open {
+            right
+                .resizable(true)
+                .default_size(PANEL_WIDTH)
+                .size_range(PANEL_WIDTH..=520.0)
+        } else {
+            right.exact_size(COLLAPSED_PANEL_WIDTH)
+        };
+        right
             .frame(egui::Frame::new().fill(PANEL).inner_margin(if right_open {
                 egui::Margin::symmetric(12, 10)
             } else {
