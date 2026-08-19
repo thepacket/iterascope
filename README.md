@@ -142,11 +142,18 @@ from it.
 - Layers: up to eight complete colour stages composited over one iteration
   pass — each layer has its own gradient, algorithms, opacity and merge mode
   (Normal, Add, Multiply, Screen, Overlay, Darken, Lighten, Difference) —
-  with an optional single-image workspace that gives the composited image
-  the full window. Layers share the image's location and family, so one
-  reference orbit serves the whole stack and the deep-zoom engine is
-  untouched; a single-layer stack renders byte-identically to, and as fast
-  as, the pre-layer renderer
+  with a single-image workspace (the default layout) that gives the
+  composited image the full window. Layers share the image's location and
+  family, so one reference orbit serves the whole stack and the deep-zoom
+  engine is untouched; a single-layer stack renders byte-identically to, and
+  as fast as, the pre-layer renderer
+- An Ultra Fractal-style switch picker: while the single image shows the
+  dynamical plane, **Pick c…** opens a parameter-plane window with
+  crosshair, scroll zoom and a live Julia thumbnail of the hovered
+  parameter; clicking sets `c` and the composited image follows immediately
+- Still-image export (native app): the current view rendered to PNG at up
+  to 8192×8192 with 2×2 or 3×3 supersampled anti-aliasing, box-filtered in
+  linear light
 - Optional scale-aware coordinate grid
 - Zoom-path animation: a dive to the current centre between two magnification
   exponents at constant or eased logarithmic speed, with an optional gradient
@@ -185,6 +192,13 @@ moves one hundredth.
 
 ### Animation
 
+The **Still image** section renders the active pane's current view to a PNG
+at a chosen resolution with supersampled anti-aliasing: the frame is rendered
+at two or three times the requested size and box-filtered down in linear
+light, so gradient edges keep their brightness. It uses the same frozen-scene
+machinery as the animation exporter — one reference orbit at the current
+centre, valid at the full depth of the view.
+
 The **Animation** section renders the classic deep-zoom video: a dive to the
 active pane's centre, from a start to an end magnification exponent (defaults:
 `10^0` to the current view via **End = view**) at constant logarithmic speed,
@@ -212,9 +226,13 @@ edits the active layer. Layers currently share the image's location, family
 and iteration settings (per-layer formulas and locations are future work),
 which is what keeps the whole stack exact at any magnification: one
 reference orbit drives every layer. The **Image** toggle in the top bar
-swaps the two linked panes for the composited image alone, full-window;
-**Panes** brings the linked layout back — that is also where the parameter
-plane remains available for picking a new `c`.
+swaps the two linked panes for the composited image alone, full-window — the
+default layout; **Panes** brings the linked scientific layout back. While the
+image shows the dynamical plane, **Pick c…** in the top bar opens the switch
+picker: the parameter plane with a crosshair, scroll zoom, a marker on the
+current `c` and a live Julia thumbnail of the hovered parameter — click to
+choose and the composited image follows immediately. From a parameter-plane
+image, **Open Julia** jumps to the dynamical plane of the selected `c`.
 
 ### Colouring
 
@@ -523,12 +541,11 @@ live state is changed.
    arbitrary-precision exponential/trigonometric reference orbits so the
    transcendental families can join the deep-zoom path
 6. Towards generative fractal art: per-layer formulas, locations and masks
-   (layers with merge modes over one composited image landed, sharing the
-   image's location); a UF-style switch picker with a cursor-following Julia
-   preview to replace the permanent parameter pane; keyframed centre drift
-   and per-parameter animation curves; orbit-trap options that skip the
-   shared leading iterations of deep orbits; derivatives for the remaining
-   families' distance estimates
+   (layers, the switch picker, anti-aliased stills and the single-image
+   default landed); keyframed centre drift and per-parameter animation
+   curves; tiled rendering past the 8192-pixel texture limit; orbit-trap
+   options that skip the shared leading iterations of deep orbits;
+   derivatives for the remaining families' distance estimates
 
 ## Project status
 

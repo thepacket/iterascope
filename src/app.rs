@@ -248,6 +248,9 @@ pub struct App {
     layers: LayerStack,
     /// Single composited image instead of the two linked panes.
     single_image: bool,
+    /// The Ultra Fractal-style switch picker: a parameter-plane window with
+    /// a live Julia preview for choosing `c` while composing a single image.
+    switch_picker_open: bool,
     /// Rasterised gradients shared with the render callbacks; rebuilt when
     /// the visible layers' gradients differ from `gradient_table_source`.
     gradient_table: Arc<GradientTable>,
@@ -259,6 +262,9 @@ pub struct App {
     gradient_random_seed: u64,
     render_state: eframe::egui_wgpu::RenderState,
     animation: ZoomAnimation,
+    still_width: u32,
+    still_height: u32,
+    still_supersample: u32,
     export_directory: String,
     #[cfg(not(target_arch = "wasm32"))]
     export: Option<ExportJob>,
@@ -323,7 +329,8 @@ impl App {
             bailout: 4.0,
             grid: false,
             layers: LayerStack::default(),
-            single_image: false,
+            single_image: true,
+            switch_picker_open: false,
             gradient_table: Arc::new(GradientTable::new(0, &LayerStack::default())),
             gradient_table_source: vec![Gradient::default()],
             gradient_editor_open: false,
@@ -333,6 +340,9 @@ impl App {
             gradient_random_seed: 1,
             render_state: render_state.clone(),
             animation: ZoomAnimation::default(),
+            still_width: 3840,
+            still_height: 2160,
+            still_supersample: 2,
             export_directory: default_export_directory(),
             #[cfg(not(target_arch = "wasm32"))]
             export: None,
@@ -876,6 +886,9 @@ impl App {
             section(ui, "Layers", |ui| self.layer_list(ui));
 
             section(ui, "Colouring", |ui| self.colouring_controls(ui));
+
+            #[cfg(not(target_arch = "wasm32"))]
+            section(ui, "Still image", |ui| self.still_controls(ui));
 
             section(ui, "Animation", |ui| self.animation_controls(ui));
 
@@ -2292,6 +2305,48 @@ impl App {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn still_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "Render the active pane's current view as a PNG with supersampled anti-aliasing.",
+            )
+            .small()
+            .color(MUTED),
+        );
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut self.still_width)
+                    .range(16..=animation::MAX_DIMENSION)
+                    .speed(16),
+            );
+            ui.label("×");
+            ui.add(
+                egui::DragValue::new(&mut self.still_height)
+                    .range(16..=animation::MAX_DIMENSION)
+                    .speed(16),
+            );
+            egui::ComboBox::from_id_salt("iterascope.still.supersample")
+                .selected_text(format!("{0}×{0} AA", self.still_supersample.clamp(1, 3)))
+                .width(84.0)
+                .show_ui(ui, |ui| {
+                    for factor in [1u32, 2, 3] {
+                        ui.selectable_value(
+                            &mut self.still_supersample,
+                            factor,
+                            format!("{factor}×{factor} AA"),
+                        );
+                    }
+                });
+            if ui
+                .add_enabled(self.export.is_none(), egui::Button::new("Render still"))
+                .clicked()
+            {
+                self.render_still();
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn animation_export_controls(&mut self, ui: &mut egui::Ui) {
         ui.checkbox(
             &mut self.animation.encode_video,
@@ -2363,7 +2418,6 @@ impl App {
             return;
         }
         let pane = self.active_pane;
-        let dynamical = self.pane_is_dynamical(pane);
         let current = self.magnification_log10(pane);
         let mut clamped = false;
         for target in [
@@ -2376,6 +2430,47 @@ impl App {
             }
         }
 
+        let scene = match self.freeze_scene(pane) {
+            Ok(scene) => scene,
+            Err(error) => {
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let directory = std::path::PathBuf::from(self.export_directory.trim())
+            .join(format!("zoom-{}-{stamp}", self.family.document_id()));
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            self.export_message = Some((format!("cannot create {directory:?}: {error}"), true));
+            return;
+        }
+
+        self.export = Some(ExportJob {
+            animation,
+            scene,
+            directory,
+            next_frame: 0,
+            started: Instant::now(),
+        });
+        if clamped {
+            self.export_message = Some((
+                "Magnification clamped to the current view (zoom further first to go deeper)"
+                    .to_owned(),
+                false,
+            ));
+        }
+    }
+
+    /// Freezes the pane's dynamics, layer stack and reference orbit for
+    /// offline rendering. The centre never moves, so one orbit — the
+    /// arbitrary-precision orbit of a deep centre, or an `f64` orbit
+    /// otherwise — serves any magnification up to the current view's.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn freeze_scene(&mut self, pane: usize) -> Result<FrozenScene, String> {
+        let dynamical = self.pane_is_dynamical(pane);
         self.export_generation += 1;
         let base = self.export_generation * 4;
         let mut ap_reference = None;
@@ -2386,26 +2481,14 @@ impl App {
                 DeepComplex::from_f64(self.julia_c, view.zoom_exponent)
                     .expect("finite Julia parameter")
             });
-            let initial = match DeepState::initial(self.family, &view.centre, dynamical, &julia_c) {
-                Ok(initial) => initial,
-                Err(error) => {
-                    self.export_message = Some((error, true));
-                    return;
-                }
-            };
-            let orbit = match ReferenceOrbit::family(
+            let initial = DeepState::initial(self.family, &view.centre, dynamical, &julia_c)?;
+            let orbit = ReferenceOrbit::family(
                 self.family,
                 &self.family_parameters,
                 initial,
                 self.iterations,
                 self.bailout as f64,
-            ) {
-                Ok(orbit) => orbit,
-                Err(error) => {
-                    self.export_message = Some((error, true));
-                    return;
-                }
-            };
+            )?;
             centre = view.centre_preview();
             f64_points = orbit
                 .points
@@ -2446,22 +2529,7 @@ impl App {
                 ),
             )
         });
-
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or(0);
-        let directory = std::path::PathBuf::from(self.export_directory.trim())
-            .join(format!("zoom-{}-{stamp}", self.family.document_id()));
-        if let Err(error) = std::fs::create_dir_all(&directory) {
-            self.export_message = Some((format!("cannot create {directory:?}: {error}"), true));
-            return;
-        }
-
-        self.export = Some(ExportJob {
-            gradient: Arc::new(GradientTable::new(base + 3, &self.layers)),
-            layers: self.layers.clone(),
-            animation,
+        Ok(FrozenScene {
             family: self.family,
             dynamical,
             family_words: self.family_parameters.uniform_words(dynamical),
@@ -2469,19 +2537,73 @@ impl App {
             bailout: self.bailout,
             julia_c: self.julia_c,
             centre,
+            layers: self.layers.clone(),
+            gradient: Arc::new(GradientTable::new(base + 3, &self.layers)),
             ap_reference,
             f64_reference,
-            directory,
-            next_frame: 0,
-            started: Instant::now(),
-        });
-        if clamped {
-            self.export_message = Some((
-                "Magnification clamped to the current view (zoom further first to go deeper)"
-                    .to_owned(),
-                false,
-            ));
+        })
+    }
+
+    /// Renders the current view as a still PNG with supersampled
+    /// anti-aliasing: the frame renders at `supersample`× the requested
+    /// size and is box-filtered down in linear light.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn render_still(&mut self) {
+        self.export_message = None;
+        let width = (self.still_width & !1).clamp(16, animation::MAX_DIMENSION);
+        let height = (self.still_height & !1).clamp(16, animation::MAX_DIMENSION);
+        let mut supersample = self.still_supersample.clamp(1, 3);
+        while supersample > 1
+            && (width * supersample > animation::MAX_DIMENSION
+                || height * supersample > animation::MAX_DIMENSION)
+        {
+            supersample -= 1;
         }
+        let pane = self.active_pane;
+        let magnification = self.magnification_log10(pane);
+        let scene = match self.freeze_scene(pane) {
+            Ok(scene) => scene,
+            Err(error) => {
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
+        let started = Instant::now();
+        let rendered = match scene.render_frame(
+            &self.render_state,
+            magnification,
+            (width * supersample, height * supersample),
+            0.0,
+        ) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
+        let rgba = downsample_srgb(&rendered, width * supersample, supersample);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let directory = std::path::PathBuf::from(self.export_directory.trim());
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            self.export_message = Some((format!("cannot create {directory:?}: {error}"), true));
+            return;
+        }
+        let path = directory.join(format!("still-{}-{stamp}.png", self.family.document_id()));
+        if let Err(error) = write_png(&path, width, height, &rgba) {
+            self.export_message = Some((format!("cannot write {path:?}: {error}"), true));
+            return;
+        }
+        self.export_message = Some((
+            format!(
+                "Wrote {} ({width}×{height}, {supersample}×{supersample} anti-aliasing) in {:.1} s",
+                path.display(),
+                started.elapsed().as_secs_f64()
+            ),
+            false,
+        ));
     }
 
     /// Renders one export frame per UI update so the interface stays
@@ -2489,90 +2611,25 @@ impl App {
     /// interactive panes'.
     #[cfg(not(target_arch = "wasm32"))]
     fn advance_export(&mut self, ctx: &egui::Context) {
-        let device = self.render_state.device.clone();
-        let queue = self.render_state.queue.clone();
-        let renderer = Arc::clone(&self.render_state.renderer);
+        let render_state = self.render_state.clone();
         let Some(job) = &mut self.export else {
             return;
         };
         let frame = job.next_frame;
         let total = job.animation.frame_count();
         let magnification = job.animation.magnification_log10_at(frame);
-        let handoff_log = ARBITRARY_HANDOFF_ZOOM.log10();
-        let (scale_mantissa, scale_exponent) = animation::frame_scale(magnification);
-        let aspect = job.animation.width as f32 / job.animation.height as f32;
-
-        // Reference selection mirrors the interactive renderer: plain f32
-        // for families without perturbation, an f64 reference below the
-        // handoff, the arbitrary-precision reference beyond it.
-        let reference = if magnification > handoff_log {
-            job.ap_reference
-                .as_ref()
-                .map(|r| (r.0, r.1.as_slice(), false))
-        } else {
-            job.f64_reference
-                .as_ref()
-                .map(|r| (r.0, r.1.as_slice(), true))
-                .or_else(|| {
-                    job.ap_reference
-                        .as_ref()
-                        .map(|r| (r.0, r.1.as_slice(), false))
-                })
-        };
-        let mut uniforms = Uniforms::new(
-            job.centre,
-            animation::frame_half_height_f64(magnification),
-            aspect,
-            job.julia_c,
-            job.iterations,
-            job.bailout,
-            job.family.shader_flag(),
-            usize::from(job.dynamical),
-            job.layers.layers[0].colouring.outside.smooth,
-            false,
-            if reference.is_some() {
-                PrecisionMode::DoubleSingle
-            } else {
-                PrecisionMode::F32
-            },
-            job.family_words,
-        );
-        if let Some((_, points, ds_fallback)) = reference {
-            uniforms = uniforms.enable_perturbation(
-                scale_mantissa,
-                scale_exponent,
-                points.len(),
-                ds_fallback,
-                [0.0; 2],
-            );
-        }
-        let mut layers = job.layers.clone();
-        let sweep = job.animation.gradient_offset_at(frame);
-        for layer in &mut layers.layers {
-            layer.colouring.outside.offset += sweep;
-            layer.colouring.inside.offset += sweep;
-        }
-        let colouring_uniforms = ColouringUniforms::new(
-            &layers,
-            animation::frame_pixel_log(magnification, job.animation.height),
-        );
-
-        let rgba = {
-            let renderer = renderer.read();
-            let Some(pipeline) = renderer.callback_resources.get::<FractalPipeline>() else {
+        let rgba = match job.scene.render_frame(
+            &render_state,
+            magnification,
+            (job.animation.width, job.animation.height),
+            job.animation.gradient_offset_at(frame),
+        ) {
+            Ok(rgba) => rgba,
+            Err(error) => {
                 self.export = None;
-                self.export_message = Some(("renderer not initialised".to_owned(), true));
+                self.export_message = Some((error, true));
                 return;
-            };
-            pipeline.render_export(
-                &device,
-                &queue,
-                &uniforms,
-                &colouring_uniforms,
-                &job.gradient,
-                reference.map(|(generation, points, _)| (generation, points)),
-                (job.animation.width, job.animation.height),
-            )
+            }
         };
 
         let path = job.directory.join(format!("frame-{frame:05}.png"));
@@ -2602,6 +2659,178 @@ impl App {
             self.export_message = Some((message, false));
         }
         ctx.request_repaint();
+    }
+
+    /// The Ultra Fractal-style switch picker: a parameter-plane window with
+    /// crosshair, scroll zoom and a live Julia thumbnail. Clicking chooses
+    /// `c`; the composited image behind the window follows immediately.
+    /// Only offered while the single image shows the dynamical plane — the
+    /// picker renders through the parameter pane's GPU resources, which are
+    /// otherwise idle in that layout.
+    fn switch_picker(&mut self, ctx: &egui::Context) {
+        if !self.single_image
+            || self.active_pane != 1
+            || self.family.linkage() != Linkage::ParameterDynamical
+        {
+            self.switch_picker_open = false;
+            return;
+        }
+        if !self.switch_picker_open {
+            return;
+        }
+        let mut open = self.switch_picker_open;
+        egui::Window::new("Choose c")
+            .open(&mut open)
+            .default_width(460.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Click to set the Julia parameter; scroll to zoom the plane.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+                let width = 440.0f32;
+                let height = width / 1.45;
+                let (rect, response) = ui
+                    .allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+                let aspect = (rect.width() / rect.height().max(1.0)).max(0.1);
+                let view = self.parameter;
+                let pixel_log = (2.0 * view.half_height
+                    / (rect.height().max(1.0) as f64 * ctx.pixels_per_point() as f64))
+                    .ln() as f32;
+                let uniforms = Uniforms::new(
+                    view.centre,
+                    view.half_height,
+                    aspect,
+                    self.julia_c,
+                    self.iterations.min(2_048),
+                    self.bailout,
+                    self.family.shader_flag(),
+                    0,
+                    self.layers.layers[0].colouring.outside.smooth,
+                    false,
+                    PrecisionMode::F32,
+                    self.family_parameters.uniform_words(false),
+                );
+                let colouring_uniforms = ColouringUniforms::new(&self.layers, pixel_log);
+                let gradient = self.gradient_table();
+                ui.painter().add(render::callback(
+                    rect,
+                    0,
+                    uniforms,
+                    colouring_uniforms,
+                    Arc::clone(&gradient),
+                    None,
+                    1,
+                    ctx.pixels_per_point(),
+                ));
+                ui.painter().rect_stroke(
+                    rect,
+                    2.0,
+                    egui::Stroke::new(1.0, BORDER),
+                    egui::StrokeKind::Inside,
+                );
+
+                let hover = response
+                    .hover_pos()
+                    .map(|position| (position, self.parameter.point_at(rect, position)));
+                if let Some((position, point)) = hover {
+                    // Crosshair at the cursor.
+                    ui.painter().vline(
+                        position.x,
+                        rect.y_range(),
+                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(60)),
+                    );
+                    ui.painter().hline(
+                        rect.x_range(),
+                        position.y,
+                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(60)),
+                    );
+                    // Scroll zooms about the cursor.
+                    let scroll = ui.input(|input| input.smooth_scroll_delta.y) as f64;
+                    if scroll != 0.0 {
+                        let factor = 0.997f64.powf(scroll).clamp(0.2, 5.0);
+                        let view = &mut self.parameter;
+                        view.centre[0] = point[0] + (view.centre[0] - point[0]) * factor;
+                        view.centre[1] = point[1] + (view.centre[1] - point[1]) * factor;
+                        view.zoom(factor);
+                    }
+                    if response.clicked() {
+                        self.julia_c = point;
+                        self.deep_julia_c = None;
+                        self.reframe_dynamical_plane();
+                    }
+                }
+                // Marker at the currently selected c.
+                if let Some(position) = complex_to_screen(&self.parameter, rect, self.julia_c)
+                    && rect.contains(position)
+                {
+                    ui.painter()
+                        .circle_stroke(position, 5.0, egui::Stroke::new(1.5, CREAM));
+                }
+
+                ui.horizontal(|ui| {
+                    let c = hover.map_or(self.julia_c, |(_, point)| point);
+                    ui.label(
+                        egui::RichText::new(format!("c = {:+.6} {:+.6}i", c[0], c[1]))
+                            .monospace()
+                            .color(TEXT),
+                    );
+                    if ui.button("Reset view").clicked() {
+                        self.parameter =
+                            PlaneView::from_default(self.family.default_parameter_view());
+                    }
+                });
+
+                // Live Julia preview of the hovered (else selected) c.
+                let preview_c = hover.map_or(self.julia_c, |(_, point)| point);
+                let preview_height = 120.0f32;
+                let preview_width = preview_height * 1.45;
+                let (preview_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(preview_width, preview_height),
+                    egui::Sense::hover(),
+                );
+                let preview_view = self.family.default_dynamical_view();
+                let preview_uniforms = Uniforms::new(
+                    preview_view.centre,
+                    preview_view.half_height,
+                    preview_width / preview_height,
+                    preview_c,
+                    self.iterations.min(512),
+                    self.bailout,
+                    self.family.shader_flag(),
+                    1,
+                    self.layers.layers[0].colouring.outside.smooth,
+                    false,
+                    PrecisionMode::F32,
+                    self.family_parameters.uniform_words(true),
+                );
+                let preview_pixel_log = (2.0 * preview_view.half_height
+                    / (preview_rect.height().max(1.0) as f64 * ctx.pixels_per_point() as f64))
+                    .ln() as f32;
+                ui.painter().add(render::callback(
+                    preview_rect,
+                    render::EXPORT_PANE,
+                    preview_uniforms,
+                    ColouringUniforms::new(&self.layers, preview_pixel_log),
+                    gradient,
+                    None,
+                    1,
+                    ctx.pixels_per_point(),
+                ));
+                ui.painter().rect_stroke(
+                    preview_rect,
+                    2.0,
+                    egui::Stroke::new(1.0, BORDER),
+                    egui::StrokeKind::Inside,
+                );
+                if hover.is_some() {
+                    ctx.request_repaint();
+                }
+            });
+        self.switch_picker_open = open;
     }
 
     fn reframe_dynamical_plane(&mut self) {
@@ -3469,6 +3698,25 @@ impl eframe::App for App {
                         if ui.selectable_label(self.active_pane == 1, right).clicked() {
                             self.active_pane = 1;
                         }
+                        if self.family.linkage() == Linkage::ParameterDynamical {
+                            if self.active_pane == 1 {
+                                if ui
+                                    .selectable_label(self.switch_picker_open, "Pick c…")
+                                    .on_hover_text(
+                                        "Choose the Julia parameter from the parameter plane, with a live preview",
+                                    )
+                                    .clicked()
+                                {
+                                    self.switch_picker_open = !self.switch_picker_open;
+                                }
+                            } else if ui
+                                .button("Open Julia")
+                                .on_hover_text("Show the dynamical plane of the selected c")
+                                .clicked()
+                            {
+                                self.active_pane = 1;
+                            }
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
@@ -3505,6 +3753,7 @@ impl eframe::App for App {
         self.experiment_editor(ui.ctx());
         self.orbit_inspector(ui.ctx());
         self.gradient_editor(ui.ctx());
+        self.switch_picker(ui.ctx());
         #[cfg(not(target_arch = "wasm32"))]
         self.advance_export(ui.ctx());
 
@@ -3525,6 +3774,18 @@ impl eframe::App for App {
 #[cfg(not(target_arch = "wasm32"))]
 struct ExportJob {
     animation: ZoomAnimation,
+    scene: FrozenScene,
+    directory: std::path::PathBuf,
+    next_frame: usize,
+    started: Instant,
+}
+
+/// Everything an offline render needs, frozen at the moment the user asked
+/// for it: the dynamics, the layer stack, and the reference orbit of the
+/// fixed centre — re-described in scale for any magnification a frame asks
+/// for.
+#[cfg(not(target_arch = "wasm32"))]
+struct FrozenScene {
     family: FractalFamily,
     dynamical: bool,
     family_words: [f32; 8],
@@ -3540,9 +3801,89 @@ struct ExportJob {
     ap_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
     /// The same orbit projected to `f64` for frames below the handoff.
     f64_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
-    directory: std::path::PathBuf,
-    next_frame: usize,
-    started: Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FrozenScene {
+    /// Renders one frame of this scene at `magnification` through the
+    /// export pipeline. Reference selection mirrors the interactive
+    /// renderer: plain f32 for families without perturbation, the f64
+    /// reference below the handoff, the arbitrary-precision reference
+    /// beyond it. `sweep` is added to every layer's gradient offsets.
+    fn render_frame(
+        &self,
+        render_state: &eframe::egui_wgpu::RenderState,
+        magnification: f64,
+        size: (u32, u32),
+        sweep: f32,
+    ) -> Result<Vec<u8>, String> {
+        let handoff_log = ARBITRARY_HANDOFF_ZOOM.log10();
+        let (scale_mantissa, scale_exponent) = animation::frame_scale(magnification);
+        let reference = if magnification > handoff_log {
+            self.ap_reference
+                .as_ref()
+                .map(|r| (r.0, r.1.as_slice(), false))
+        } else {
+            self.f64_reference
+                .as_ref()
+                .map(|r| (r.0, r.1.as_slice(), true))
+                .or_else(|| {
+                    self.ap_reference
+                        .as_ref()
+                        .map(|r| (r.0, r.1.as_slice(), false))
+                })
+        };
+        let mut uniforms = Uniforms::new(
+            self.centre,
+            animation::frame_half_height_f64(magnification),
+            size.0 as f32 / size.1 as f32,
+            self.julia_c,
+            self.iterations,
+            self.bailout,
+            self.family.shader_flag(),
+            usize::from(self.dynamical),
+            self.layers.layers[0].colouring.outside.smooth,
+            false,
+            if reference.is_some() {
+                PrecisionMode::DoubleSingle
+            } else {
+                PrecisionMode::F32
+            },
+            self.family_words,
+        );
+        if let Some((_, points, ds_fallback)) = reference {
+            uniforms = uniforms.enable_perturbation(
+                scale_mantissa,
+                scale_exponent,
+                points.len(),
+                ds_fallback,
+                [0.0; 2],
+            );
+        }
+        let mut layers = self.layers.clone();
+        if sweep != 0.0 {
+            for layer in &mut layers.layers {
+                layer.colouring.outside.offset += sweep;
+                layer.colouring.inside.offset += sweep;
+            }
+        }
+        let colouring_uniforms =
+            ColouringUniforms::new(&layers, animation::frame_pixel_log(magnification, size.1));
+        let renderer = render_state.renderer.read();
+        let pipeline = renderer
+            .callback_resources
+            .get::<FractalPipeline>()
+            .ok_or_else(|| "renderer not initialised".to_owned())?;
+        Ok(pipeline.render_export(
+            &render_state.device,
+            &render_state.queue,
+            &uniforms,
+            &colouring_uniforms,
+            &self.gradient,
+            reference.map(|(generation, points, _)| (generation, points)),
+            size,
+        ))
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -3555,6 +3896,61 @@ fn default_export_directory() -> String {
 #[cfg(target_arch = "wasm32")]
 fn default_export_directory() -> String {
     String::new()
+}
+
+/// Box-filters `factor`×`factor` blocks of RGBA sRGB pixels down to one, in
+/// linear light so anti-aliased edges keep their brightness. `width` is the
+/// supersampled row width; the output is `width/factor` wide.
+#[cfg(not(target_arch = "wasm32"))]
+fn downsample_srgb(rgba: &[u8], width: u32, factor: u32) -> Vec<u8> {
+    if factor <= 1 {
+        return rgba.to_vec();
+    }
+    // sRGB → linear lookup for every byte value.
+    let to_linear: Vec<f32> = (0..256)
+        .map(|value| {
+            let v = value as f32 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        })
+        .collect();
+    let from_linear = |linear: f32| -> u8 {
+        let v = if linear <= 0.003_130_8 {
+            12.92 * linear
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        };
+        (v.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    let width = width as usize;
+    let factor = factor as usize;
+    let out_width = width / factor;
+    let height = rgba.len() / (width * 4);
+    let out_height = height / factor;
+    let samples = (factor * factor) as f32;
+    let mut out = Vec::with_capacity(out_width * out_height * 4);
+    for row in 0..out_height {
+        for column in 0..out_width {
+            let mut sum = [0.0f32; 3];
+            for dy in 0..factor {
+                let base = ((row * factor + dy) * width + column * factor) * 4;
+                for dx in 0..factor {
+                    let pixel = &rgba[base + dx * 4..base + dx * 4 + 3];
+                    sum[0] += to_linear[pixel[0] as usize];
+                    sum[1] += to_linear[pixel[1] as usize];
+                    sum[2] += to_linear[pixel[2] as usize];
+                }
+            }
+            out.push(from_linear(sum[0] / samples));
+            out.push(from_linear(sum[1] / samples));
+            out.push(from_linear(sum[2] / samples));
+            out.push(255);
+        }
+    }
+    out
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -4135,6 +4531,36 @@ fn badge(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn downsampling_averages_in_linear_light_and_keeps_flat_colours() {
+        // A flat colour must survive exactly.
+        let flat: Vec<u8> = std::iter::repeat_n([10u8, 128, 240, 255], 16)
+            .flatten()
+            .collect();
+        let out = downsample_srgb(&flat, 4, 2);
+        assert_eq!(out.len(), 2 * 2 * 4);
+        assert!(out.chunks(4).all(|pixel| pixel == [10, 128, 240, 255]));
+        // A black/white checkerboard averages to sRGB mid-grey (~188), not
+        // the naive byte average 128 — the linear-light hallmark.
+        let mut board = Vec::new();
+        for row in 0..2 {
+            for column in 0..2 {
+                let value = if (row + column) % 2 == 0 { 255u8 } else { 0 };
+                board.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        let out = downsample_srgb(&board, 2, 2);
+        assert_eq!(out.len(), 4);
+        assert!(
+            (out[0] as i32 - 188).abs() <= 1,
+            "linear-light average was {}",
+            out[0]
+        );
+        // Factor 1 is the identity.
+        assert_eq!(downsample_srgb(&flat, 4, 1), flat);
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
