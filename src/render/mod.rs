@@ -9,7 +9,7 @@ use crate::MAX_ITERATIONS;
 use crate::arbitrary::DeepComplex;
 #[cfg(test)]
 use crate::arbitrary::ReferenceOrbit;
-use crate::colouring::{self, Colouring};
+use crate::colouring::{self, LayerStack};
 use crate::precision::{PrecisionMode, split_f64};
 
 /// Raw WGSL with the delta-algebra template; see [`shader_source`].
@@ -284,9 +284,9 @@ pub(crate) struct ColouringUniforms {
 impl ColouringUniforms {
     /// `pixel_log` is the natural logarithm of one pixel's height in world
     /// units; distance estimates are expressed in pixels.
-    pub(crate) fn new(colouring: &Colouring, pixel_log: f32) -> Self {
+    pub(crate) fn new(layers: &LayerStack, pixel_log: f32) -> Self {
         Self {
-            words: colouring.gpu_words(pixel_log),
+            words: layers.gpu_words(pixel_log),
         }
     }
 
@@ -301,12 +301,13 @@ impl ColouringUniforms {
 
 impl Default for ColouringUniforms {
     fn default() -> Self {
-        Self::new(&Colouring::default(), 0.0)
+        Self::new(&LayerStack::default(), 0.0)
     }
 }
 
-/// A rasterised gradient ready for upload. The generation lets the renderer
-/// skip re-uploading a table it already holds.
+/// The rasterised gradients of a layer stack's visible layers, concatenated
+/// bottom first, ready for upload. The generation lets the renderer skip
+/// re-uploading a table it already holds.
 #[derive(Debug)]
 pub(crate) struct GradientTable {
     pub(crate) generation: u64,
@@ -314,10 +315,10 @@ pub(crate) struct GradientTable {
 }
 
 impl GradientTable {
-    pub(crate) fn new(generation: u64, gradient: &colouring::Gradient) -> Self {
+    pub(crate) fn new(generation: u64, layers: &LayerStack) -> Self {
         Self {
             generation,
-            entries: gradient.lookup_table(),
+            entries: layers.lookup_tables(),
         }
     }
 }
@@ -715,16 +716,18 @@ impl FractalPipeline {
             colouring_buffer.unmap();
             let gradient_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("iterascope.gradient"),
-                size: (colouring::LOOKUP_TABLE_LEN * std::mem::size_of::<[f32; 4]>()) as u64,
+                size: (colouring::MAX_LAYERS
+                    * colouring::LOOKUP_TABLE_LEN
+                    * std::mem::size_of::<[f32; 4]>()) as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: true,
             });
-            gradient_buffer
-                .slice(..)
-                .get_mapped_range_mut()
-                .copy_from_slice(bytemuck::cast_slice(
-                    &colouring::Gradient::default().lookup_table(),
-                ));
+            {
+                let default_table = LayerStack::default().lookup_tables();
+                let bytes: &[u8] = bytemuck::cast_slice(&default_table);
+                let mut mapped = gradient_buffer.slice(..).get_mapped_range_mut();
+                mapped.slice(..bytes.len()).copy_from_slice(bytes);
+            }
             gradient_buffer.unmap();
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("iterascope.fractal.bind-group"),
@@ -780,6 +783,7 @@ impl FractalPipeline {
     /// this between UI frames, one frame per update. `reference` carries a
     /// generation so an orbit shared by many frames uploads once.
     #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_export(
         &self,
         device: &wgpu::Device,
@@ -802,7 +806,7 @@ impl FractalPipeline {
         }
 
         let mut slot = self.export_target.lock().unwrap();
-        if !slot.as_ref().is_some_and(|target| target.size == size) {
+        if slot.as_ref().is_none_or(|target| target.size != size) {
             let padded_bytes_per_row = (size.0 * 4).div_ceil(256) * 256;
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("iterascope.export"),
@@ -927,8 +931,8 @@ impl FractalPipeline {
         if let Some(gradient) = gradient {
             let mut uploaded = resources.gradient_generation.lock().unwrap();
             if *uploaded != Some(gradient.generation) {
-                let entries =
-                    &gradient.entries[..gradient.entries.len().min(colouring::LOOKUP_TABLE_LEN)];
+                let limit = colouring::MAX_LAYERS * colouring::LOOKUP_TABLE_LEN;
+                let entries = &gradient.entries[..gradient.entries.len().min(limit)];
                 queue.write_buffer(&resources.gradient_buffer, 0, bytemuck::cast_slice(entries));
                 *uploaded = Some(gradient.generation);
             }
@@ -1550,19 +1554,28 @@ mod tests {
 
         /// Uploads a colour stage for a pane; later renders of that pane use
         /// it until replaced.
-        fn set_colouring(&self, pane: usize, colouring: &Colouring, pixel_log: f32) {
+        fn set_colouring(
+            &self,
+            pane: usize,
+            colouring: &crate::colouring::Colouring,
+            pixel_log: f32,
+        ) {
+            self.set_layers(pane, &LayerStack::single(colouring.clone()), pixel_log);
+        }
+
+        fn set_layers(&self, pane: usize, layers: &LayerStack, pixel_log: f32) {
             let table = GradientTable::new(
                 self.pipeline.panes[pane]
                     .gradient_generation
                     .lock()
                     .unwrap()
                     .map_or(1, |generation| generation + 1),
-                &colouring.gradient,
+                layers,
             );
             self.pipeline.upload_colouring(
                 &self.queue,
                 pane,
-                &ColouringUniforms::new(colouring, pixel_log),
+                &ColouringUniforms::new(layers, pixel_log),
                 Some(&table),
             );
         }
@@ -1709,7 +1722,7 @@ mod tests {
         let deep =
             DeepRenderData::from_f64_orbit(1, deep_half_height, &orbit.points, true, [0.0; 2]);
 
-        let render = |colouring: &Colouring, deep_zoom: bool| -> Vec<u8> {
+        let render = |colouring: &crate::colouring::Colouring, deep_zoom: bool| -> Vec<u8> {
             let (centre, half_height) = if deep_zoom {
                 (deep_point, deep_half_height)
             } else {
@@ -1755,9 +1768,9 @@ mod tests {
 
         for algorithm in ColouringAlgorithm::ALL {
             for deep_zoom in [false, true] {
-                let mut colouring = Colouring {
+                let mut colouring = crate::colouring::Colouring {
                     gradient: Gradient::random(5),
-                    ..Colouring::default()
+                    ..crate::colouring::Colouring::default()
                 };
                 colouring.outside.set_algorithm(algorithm);
                 colouring
@@ -1926,7 +1939,7 @@ mod tests {
             ("stripes", ColouringAlgorithm::Stripes, 60.0),
             ("triangle", ColouringAlgorithm::TriangleInequality, 60.0),
         ] {
-            let mut colouring = Colouring::default();
+            let mut colouring = crate::colouring::Colouring::default();
             colouring.outside.set_algorithm(algorithm);
             colouring.outside.density = density;
             gpu.set_colouring(1, &colouring, pixel_log);
@@ -2026,8 +2039,8 @@ mod tests {
         };
         assert_eq!(animation.frame_count(), 5);
         let handoff_log = crate::arbitrary::ARBITRARY_HANDOFF_ZOOM.log10();
-        let colouring_base = Colouring::default();
-        let gradient = GradientTable::new(13, &colouring_base.gradient);
+        let layers_base = LayerStack::default();
+        let gradient = GradientTable::new(13, &layers_base);
 
         let mut previous: Option<Vec<u8>> = None;
         for frame in 0..animation.frame_count() {
@@ -2061,16 +2074,13 @@ mod tests {
                     [0.0; 2],
                 );
             }
-            let mut colouring = colouring_base.clone();
-            colouring.outside.offset += animation.gradient_offset_at(frame);
+            let mut layers = layers_base.clone();
+            layers.layers[0].colouring.outside.offset += animation.gradient_offset_at(frame);
             let rgba = gpu.pipeline.render_export(
                 &gpu.device,
                 &gpu.queue,
                 &uniforms,
-                &ColouringUniforms::new(
-                    &colouring,
-                    animation::frame_pixel_log(magnification, size.1),
-                ),
+                &ColouringUniforms::new(&layers, animation::frame_pixel_log(magnification, size.1)),
                 &gradient,
                 reference.map(|(generation, points, _)| (generation, points)),
                 size,
@@ -2103,6 +2113,117 @@ mod tests {
                 std::fs::write(format!("{directory}/export-frame-{frame}.ppm"), ppm).unwrap();
             }
             previous = Some(rgba);
+        }
+    }
+
+    /// Layer compositing: a single-layer stack must reproduce the
+    /// pre-layer renderer byte for byte; adding layers must change the
+    /// image; a fully transparent top layer must not; merge modes must
+    /// differ from one another. Run with
+    /// `ITERASCOPE_RENDER_DIR=out cargo test --release gpu_layer_composite -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gpu_layer_composite() {
+        use crate::colouring::{ColouringAlgorithm, Gradient, Layer, MergeMode, TrapShape};
+        use crate::family::{FamilyParameters, FractalFamily};
+
+        let directory = std::env::var("ITERASCOPE_RENDER_DIR").ok();
+        let gpu = GpuHarness::new(512, 352);
+        let parameters = FamilyParameters::default();
+        let family = FractalFamily::Quadratic;
+        let plane = family.default_parameter_view();
+        let uniforms = Uniforms::new(
+            plane.centre,
+            plane.half_height,
+            gpu.aspect(),
+            family.default_parameter(),
+            512,
+            4.0,
+            family.shader_flag(),
+            0,
+            true,
+            false,
+            PrecisionMode::F32,
+            parameters.uniform_words(false),
+        );
+        let pixel_log = (2.0 * plane.half_height / gpu.height as f64).ln() as f32;
+        let render = |layers: &LayerStack| -> Vec<u8> {
+            gpu.set_layers(0, layers, pixel_log);
+            gpu.render(0, uniforms, None)
+        };
+
+        // 1. One layer == the plain colouring path.
+        let base = crate::colouring::Colouring::default();
+        let single = render(&LayerStack::single(base.clone()));
+        gpu.set_colouring(0, &base, pixel_log);
+        let plain = gpu.render(0, uniforms, None);
+        assert_eq!(single, plain, "a single-layer stack changed the image");
+
+        // 2. A stripes layer on top changes the image; at opacity 0 it
+        // does not; hidden it does not.
+        let mut stripes = Layer {
+            merge_mode: MergeMode::Multiply,
+            ..Layer::default()
+        };
+        stripes.colouring.gradient = Gradient::random(9);
+        stripes
+            .colouring
+            .outside
+            .set_algorithm(ColouringAlgorithm::Stripes);
+        stripes
+            .colouring
+            .inside
+            .set_algorithm(ColouringAlgorithm::OrbitTrap);
+        stripes.colouring.inside.trap_shape = TrapShape::Cross;
+        let mut stack = LayerStack::single(base.clone());
+        stack.layers.push(stripes);
+        let composed = render(&stack);
+        assert_ne!(composed, single, "the second layer had no effect");
+        let distinct: std::collections::HashSet<&[u8]> = composed.chunks(3).collect();
+        eprintln!("two-layer composite: {} distinct colours", distinct.len());
+        assert!(distinct.len() > 200);
+        if let Some(directory) = &directory {
+            std::fs::create_dir_all(directory).unwrap();
+            gpu.write_ppm(&format!("{directory}/layers-single.ppm"), &single);
+            gpu.write_ppm(&format!("{directory}/layers-composite.ppm"), &composed);
+        }
+        stack.layers[1].opacity = 0.0;
+        assert_eq!(render(&stack), single, "opacity 0 still changed the image");
+        stack.layers[1].opacity = 1.0;
+        stack.layers[1].visible = false;
+        assert_eq!(
+            render(&stack),
+            single,
+            "a hidden layer still changed the image"
+        );
+        stack.layers[1].visible = true;
+
+        // 3. Merge modes are distinct.
+        let mut by_mode: Vec<Vec<u8>> = Vec::new();
+        for mode in MergeMode::ALL {
+            stack.layers[1].merge_mode = mode;
+            let image = render(&stack);
+            for (previous_mode, previous) in MergeMode::ALL.iter().zip(&by_mode) {
+                assert_ne!(
+                    &image, previous,
+                    "{mode:?} renders identically to {previous_mode:?}"
+                );
+            }
+            by_mode.push(image);
+        }
+
+        // 4. The stack survives the maximum depth: all eight layers.
+        while stack.layers.len() < crate::colouring::MAX_LAYERS {
+            let mut layer = stack.layers[1].clone();
+            layer.opacity = 0.35;
+            stack.layers.push(layer);
+        }
+        let full = render(&stack);
+        let distinct: std::collections::HashSet<&[u8]> = full.chunks(3).collect();
+        eprintln!("eight-layer composite: {} distinct colours", distinct.len());
+        assert!(distinct.len() > 200);
+        if let Some(directory) = &directory {
+            gpu.write_ppm(&format!("{directory}/layers-eight.ppm"), &full);
         }
     }
 
@@ -2842,14 +2963,14 @@ mod tests {
                 // The same render through the orbit-statistics variant with
                 // every accumulator live, to record what the trap, average
                 // and distance-estimate colourings cost on top.
-                let mut heavy = Colouring::default();
+                let mut heavy = crate::colouring::Colouring::default();
                 heavy
                     .outside
                     .set_algorithm(crate::colouring::ColouringAlgorithm::TriangleInequality);
                 heavy
                     .inside
                     .set_algorithm(crate::colouring::ColouringAlgorithm::OrbitTrap);
-                let mut extra = Colouring::default();
+                let mut extra = crate::colouring::Colouring::default();
                 extra
                     .outside
                     .set_algorithm(crate::colouring::ColouringAlgorithm::Stripes);
@@ -2893,7 +3014,7 @@ mod tests {
                     "{family:?} {label} + orbit stats (TIA/DE): {:.1} ms",
                     start.elapsed().as_secs_f64() * 1e3
                 );
-                gpu.set_colouring(0, &Colouring::default(), -10.0);
+                gpu.set_colouring(0, &crate::colouring::Colouring::default(), -10.0);
             }
         }
         // CPU reference orbit costs.

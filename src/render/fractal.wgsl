@@ -88,7 +88,12 @@ struct ReferencePoint {
 @group(0) @binding(1) var<storage, read> reference_orbit: array<ReferencePoint>;
 
 // Colour stage settings; see `Colouring::gpu_words` in colouring.rs.
-struct ColouringUniforms {
+// Most layers one image may composite; must match `colouring::MAX_LAYERS`.
+const MAX_LAYERS: u32 = 8u;
+
+// One layer's colour stage. See `Layer` / `ColouringSide::gpu_words` in
+// colouring.rs.
+struct LayerColouring {
     // Outside (escaped or converged) algorithm:
     // a = [algorithm, transfer, density, offset],
     // b = [smooth, decomposition sectors, stripe frequency, trap shape],
@@ -103,15 +108,29 @@ struct ColouringUniforms {
     inside_b: vec4<f32>,
     inside_c: vec4<f32>,
     inside_d: vec4<f32>,
-    // Which per-iteration accumulators are needed: x = orbit trap,
+    // x = merge mode, y = opacity, z = layer needs orbit traps,
+    // w = layer needs the stripe accumulator.
+    blend: vec4<f32>,
+};
+
+struct ColouringUniforms {
+    // x = visible layer count, y = ln(pixel height in world units),
+    // z = gradient table entries per layer.
+    header: vec4<f32>,
+    // Union over layers of the accumulators needed: x = orbit trap,
     // y = triangle inequality, z = stripes, w = derivative.
     needs: vec4<f32>,
-    // x = gradient table length, y = ln(pixel height in world units).
-    table: vec4<f32>,
+    // Visible layers, bottom first.
+    layers: array<LayerColouring, 8>,
 };
 @group(0) @binding(2) var<uniform> colouring: ColouringUniforms;
-// Rasterised cyclic gradient, RGBA.
+// Rasterised cyclic gradients, RGBA; one table of header.z entries per
+// visible layer, bottom first.
 @group(0) @binding(3) var<storage, read> gradient_table: array<vec4<f32>>;
+
+fn layer_count() -> u32 {
+    return clamp(u32(colouring.header.x + 0.5), 1u, MAX_LAYERS);
+}
 
 // Whether the iteration loops gather orbit statistics (orbit traps,
 // triangle-inequality and stripe averages, the derivative). The renderer
@@ -152,21 +171,22 @@ struct ScaledComplex {
 // loop feeds its f32 orbit values through `observe`; which accumulators are
 // live is decided per frame by `colouring.needs`.
 struct OrbitStats {
-    // Best (smallest) trap metric for the outside and inside trap shapes.
-    trap_outside: f32,
-    trap_inside: f32,
+    // Best (smallest) trap metric per layer, for the layer's outside and
+    // inside trap shapes.
+    trap_outside: array<f32, 8>,
+    trap_inside: array<f32, 8>,
     // Triangle-inequality terms: running sum, the most recent term and the
     // number of terms, so the last term can be blended by the fractional
-    // iteration count.
+    // iteration count. Shared across layers (depends only on the family).
     tia_sum: f32,
     tia_last: f32,
     tia_count: f32,
-    // Stripe-average terms, same scheme.
-    stripe_sum: f32,
-    stripe_last: f32,
+    // Stripe-average terms per layer (the frequency is a layer setting).
+    stripe_sum: array<f32, 8>,
+    stripe_last: array<f32, 8>,
     stripe_count: f32,
     // Derivative of z_n with respect to the pixel coordinate, for distance
-    // estimation; scaled so it survives deep zooms.
+    // estimation; scaled so it survives deep zooms. Shared across layers.
     derivative: ScaledComplex,
 };
 
@@ -1194,10 +1214,11 @@ fn lyapunov_colour(exponent: f32) -> vec3<f32> {
     }
     if (exponent < 0.0) {
         let strength = clamp(-exponent / 1.5, 0.0, 1.0);
-        let position = transfer(u32(colouring.outside_a.y + 0.5), -exponent)
-            * colouring.outside_a.z / 0.035 * 0.18 + colouring.outside_a.w;
+        let outside_a = colouring.layers[0].outside_a;
+        let position = transfer(u32(outside_a.y + 0.5), -exponent)
+            * outside_a.z / 0.035 * 0.18 + outside_a.w;
         let base = vec3<f32>(0.06, 0.05, 0.04);
-        return mix(base, gradient_colour(position), pow(strength, 0.65));
+        return mix(base, gradient_colour(position, 0u), pow(strength, 0.65));
     }
     let strength = clamp(exponent / 1.2, 0.0, 1.0);
     let near_zero = vec3<f32>(0.30, 0.36, 0.52);
@@ -1805,8 +1826,19 @@ fn stats_new(dynamical: bool) -> OrbitStats {
     // In the dynamical plane the pixel is z0, so dz0/dz0 = 1; in the
     // parameter plane the families with derivative support start from a
     // constant, so dz0/dc = 0 and the first step contributes ∂f/∂c.
-    let derivative = ScaledComplex(vec2<f32>(select(0.0, 1.0, dynamical), 0.0), 0);
-    return OrbitStats(1e30, 1e30, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, derivative);
+    var stats: OrbitStats;
+    for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
+        stats.trap_outside[layer] = 1e30;
+        stats.trap_inside[layer] = 1e30;
+        stats.stripe_sum[layer] = 0.0;
+        stats.stripe_last[layer] = 0.0;
+    }
+    stats.tia_sum = 0.0;
+    stats.tia_last = 0.0;
+    stats.tia_count = 0.0;
+    stats.stripe_count = 0.0;
+    stats.derivative = ScaledComplex(vec2<f32>(select(0.0, 1.0, dynamical), 0.0), 0);
+    return stats;
 }
 
 // Metric of z against a trap shape. Point traps accumulate the squared
@@ -1875,11 +1907,17 @@ fn observe(
     dynamical: bool,
 ) {
     if (!ORBIT_STATS) { return; }
+    let count = layer_count();
     if (colouring.needs.x > 0.5) {
-        (*stats).trap_outside = min((*stats).trap_outside, trap_metric(
-            u32(colouring.outside_b.w + 0.5), colouring.outside_c.xy, colouring.outside_c.z, z));
-        (*stats).trap_inside = min((*stats).trap_inside, trap_metric(
-            u32(colouring.inside_b.w + 0.5), colouring.inside_c.xy, colouring.inside_c.z, z));
+        for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
+            if (layer >= count) { break; }
+            let l = colouring.layers[layer];
+            if (l.blend.z < 0.5) { continue; }
+            (*stats).trap_outside[layer] = min((*stats).trap_outside[layer], trap_metric(
+                u32(l.outside_b.w + 0.5), l.outside_c.xy, l.outside_c.z, z));
+            (*stats).trap_inside[layer] = min((*stats).trap_inside[layer], trap_metric(
+                u32(l.inside_b.w + 0.5), l.inside_c.xy, l.inside_c.z, z));
+        }
     }
     if (colouring.needs.y > 0.5 && iteration > 1u) {
         // |z_{n+1}| lies between ||z_n|^d − |c|| and |z_n|^d + |c| for
@@ -1902,11 +1940,19 @@ fn observe(
         (*stats).tia_count = (*stats).tia_count + 1.0;
     }
     if (colouring.needs.z > 0.5) {
-        let frequency = select(colouring.inside_b.z, colouring.outside_b.z,
-            u32(colouring.outside_a.x + 0.5) == ALGORITHM_STRIPES);
-        let term = 0.5 + 0.5 * sin(frequency * atan2(z.y, z.x));
-        (*stats).stripe_sum = (*stats).stripe_sum + term;
-        (*stats).stripe_last = term;
+        let angle = atan2(z.y, z.x);
+        for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
+            if (layer >= count) { break; }
+            let l = colouring.layers[layer];
+            if (l.blend.w < 0.5) { continue; }
+            // The layer's outside frequency when its outside uses stripes,
+            // otherwise its inside frequency.
+            let frequency = select(l.inside_b.z, l.outside_b.z,
+                u32(l.outside_a.x + 0.5) == ALGORITHM_STRIPES);
+            let term = 0.5 + 0.5 * sin(frequency * angle);
+            (*stats).stripe_sum[layer] = (*stats).stripe_sum[layer] + term;
+            (*stats).stripe_last[layer] = term;
+        }
         (*stats).stripe_count = (*stats).stripe_count + 1.0;
     }
     if (colouring.needs.w > 0.5 && family_has_derivative(family)) {
@@ -1914,13 +1960,18 @@ fn observe(
     }
 }
 
-fn gradient_colour(position: f32) -> vec3<f32> {
-    let n = max(u32(colouring.table.x + 0.5), 1u);
+fn gradient_colour(position: f32, layer: u32) -> vec3<f32> {
+    let n = max(u32(colouring.header.z + 0.5), 1u);
+    let offset = layer * n;
     let scaled = fract(position) * f32(n);
     let base = floor(scaled);
     let i0 = min(u32(base), n - 1u);
     let i1 = (i0 + 1u) % n;
-    return mix(gradient_table[i0].rgb, gradient_table[i1].rgb, scaled - base);
+    return mix(
+        gradient_table[offset + i0].rgb,
+        gradient_table[offset + i1].rgb,
+        scaled - base,
+    );
 }
 
 fn transfer(code: u32, value: f32) -> f32 {
@@ -1977,6 +2028,7 @@ fn colour_side(
     family: u32,
     result: GenericResult,
     inside: bool,
+    layer: u32,
 ) -> vec3<f32> {
     let algorithm = u32(a.x + 0.5);
     if (algorithm == ALGORITHM_SOLID) {
@@ -2000,7 +2052,8 @@ fn colour_side(
         }
         case ALGORITHM_STRIPES: {
             if (ORBIT_STATS) {
-                value = blended_average(result.stats.stripe_sum, result.stats.stripe_last,
+                value = blended_average(result.stats.stripe_sum[layer],
+                    result.stats.stripe_last[layer],
                     result.stats.stripe_count, final_term_weight(family, result));
             }
         }
@@ -2012,7 +2065,7 @@ fn colour_side(
                 let mantissa = max(length(result.stats.derivative.mantissa), 1e-30);
                 let log_derivative = log(mantissa) + f32(result.stats.derivative.exponent) * 0.69314718;
                 let log_distance = log(magnitude) + log(max(log(magnitude), 1e-6)) - log_derivative;
-                value = exp(clamp(log_distance - colouring.table.y, -40.0, 40.0));
+                value = exp(clamp(log_distance - colouring.header.y, -40.0, 40.0));
             } else if (result.kind != RESULT_ESCAPED) {
                 value = 0.0;
             }
@@ -2020,14 +2073,15 @@ fn colour_side(
         case ALGORITHM_TRAP: {
             if (ORBIT_STATS) {
                 let shape = u32(b.w + 0.5);
-                let metric = select(result.stats.trap_outside, result.stats.trap_inside, inside);
+                let metric = select(result.stats.trap_outside[layer],
+                    result.stats.trap_inside[layer], inside);
                 value = select(trap_distance(shape, metric), 0.0, metric >= 1e29);
             }
         }
         default: {}
     }
     let position = transfer(u32(a.y + 0.5), value) * a.z + a.w;
-    var colour = gradient_colour(position);
+    var colour = gradient_colour(position, layer);
     if (c.w > 0.0) {
         // Darken slowly escaping or converging pixels.
         let speed = exp(-0.05 * result.value);
@@ -2036,13 +2090,57 @@ fn colour_side(
     return colour;
 }
 
-fn colour_stage(family: u32, result: GenericResult) -> vec3<f32> {
+// One layer's colour for this orbit result.
+fn layer_colour(layer: u32, family: u32, result: GenericResult) -> vec3<f32> {
+    let l = colouring.layers[layer];
     if (result.kind == RESULT_BOUNDED) {
-        return colour_side(colouring.inside_a, colouring.inside_b, colouring.inside_c,
-            colouring.inside_d, family, result, true);
+        return colour_side(l.inside_a, l.inside_b, l.inside_c, l.inside_d,
+            family, result, true, layer);
     }
-    return colour_side(colouring.outside_a, colouring.outside_b, colouring.outside_c,
-        colouring.outside_d, family, result, false);
+    return colour_side(l.outside_a, l.outside_b, l.outside_c, l.outside_d,
+        family, result, false, layer);
+}
+
+// Photoshop-style merge of one layer over the accumulated colour.
+fn blend_layer(dst: vec3<f32>, src: vec3<f32>, mode: u32, opacity: f32) -> vec3<f32> {
+    var blended: vec3<f32>;
+    switch mode {
+        case 1u: { blended = min(dst + src, vec3<f32>(1.0)); }
+        case 2u: { blended = dst * src; }
+        case 3u: { blended = vec3<f32>(1.0) - (vec3<f32>(1.0) - dst) * (vec3<f32>(1.0) - src); }
+        case 4u: {
+            blended = select(
+                vec3<f32>(1.0) - 2.0 * (vec3<f32>(1.0) - dst) * (vec3<f32>(1.0) - src),
+                2.0 * dst * src,
+                dst < vec3<f32>(0.5),
+            );
+        }
+        case 5u: { blended = min(dst, src); }
+        case 6u: { blended = max(dst, src); }
+        case 7u: { blended = abs(dst - src); }
+        default: { blended = src; }
+    }
+    return mix(dst, blended, clamp(opacity, 0.0, 1.0));
+}
+
+// The composited colour of the visible layer stack, bottom first. The
+// bottom layer's merge mode is ignored: it composites over black by its
+// opacity alone, so a single-layer stack reproduces the pre-layer renderer
+// exactly at opacity 1.
+fn colour_stage(family: u32, result: GenericResult) -> vec3<f32> {
+    let count = layer_count();
+    var colour = layer_colour(0u, family, result) * clamp(colouring.layers[0].blend.y, 0.0, 1.0);
+    for (var layer = 1u; layer < MAX_LAYERS; layer = layer + 1u) {
+        if (layer >= count) { break; }
+        let l = colouring.layers[layer];
+        colour = blend_layer(
+            colour,
+            layer_colour(layer, family, result),
+            u32(l.blend.x + 0.5),
+            l.blend.y,
+        );
+    }
+    return colour;
 }
 
 fn grid(world: vec2<f32>, scale: f32) -> f32 {

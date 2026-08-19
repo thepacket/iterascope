@@ -11,8 +11,8 @@ use crate::arbitrary::{
     ReferenceOrbitBuilder,
 };
 use crate::colouring::{
-    Colouring, ColouringAlgorithm, ColouringSide, Gradient, Interpolation, Transfer, TrapShape,
-    presets,
+    Colouring, ColouringAlgorithm, ColouringSide, Gradient, Interpolation, Layer, LayerStack,
+    MAX_LAYERS, MergeMode, Transfer, TrapShape, presets,
 };
 use crate::experiment::{
     ComplexDocument, ComputationDocument, DeepComplexDocument, DeepPlaneDocument, DisplayDocument,
@@ -245,11 +245,13 @@ pub struct App {
     iterations: u32,
     bailout: f32,
     grid: bool,
-    colouring: Colouring,
-    /// Rasterised gradient shared with the render callbacks; rebuilt when
-    /// `colouring.gradient` differs from `gradient_table_source`.
+    layers: LayerStack,
+    /// Single composited image instead of the two linked panes.
+    single_image: bool,
+    /// Rasterised gradients shared with the render callbacks; rebuilt when
+    /// the visible layers' gradients differ from `gradient_table_source`.
     gradient_table: Arc<GradientTable>,
-    gradient_table_source: Gradient,
+    gradient_table_source: Vec<Gradient>,
     gradient_editor_open: bool,
     gradient_selected_stop: usize,
     gradient_import_text: String,
@@ -320,9 +322,10 @@ impl App {
             iterations: 256,
             bailout: 4.0,
             grid: false,
-            colouring: Colouring::default(),
-            gradient_table: Arc::new(GradientTable::new(0, &Gradient::default())),
-            gradient_table_source: Gradient::default(),
+            layers: LayerStack::default(),
+            single_image: false,
+            gradient_table: Arc::new(GradientTable::new(0, &LayerStack::default())),
+            gradient_table_source: vec![Gradient::default()],
             gradient_editor_open: false,
             gradient_selected_stop: 0,
             gradient_import_text: String::new(),
@@ -391,11 +394,13 @@ impl App {
                 if self.family != previous_family {
                     self.reset_for_family();
                     if self.family.converges() != previous_family.converges() {
-                        self.colouring.outside = if self.family.converges() {
-                            ColouringSide::default_basins()
-                        } else {
-                            ColouringSide::default()
-                        };
+                        for layer in &mut self.layers.layers {
+                            layer.colouring.outside = if self.family.converges() {
+                                ColouringSide::default_basins()
+                            } else {
+                                ColouringSide::default()
+                            };
+                        }
                     }
                 }
                 ui.label(
@@ -868,6 +873,8 @@ impl App {
                 }
             });
 
+            section(ui, "Layers", |ui| self.layer_list(ui));
+
             section(ui, "Colouring", |ui| self.colouring_controls(ui));
 
             section(ui, "Animation", |ui| self.animation_controls(ui));
@@ -1008,13 +1015,14 @@ impl App {
                 bailout: self.bailout,
             },
             display: DisplayDocument {
-                smooth_escape_time: self.colouring.outside.smooth,
+                smooth_escape_time: self.layers.layers[0].colouring.outside.smooth,
                 coordinate_grid: self.grid,
                 palette_phase: 0.0,
                 critical_orbit_overlay: self.show_orbit_overlay,
                 interior_shading: true,
             },
-            colouring: Some(self.colouring.clone()),
+            colouring: None,
+            layers: Some(self.layers.layers.clone()),
             progressive_julia_zoom_target_exponent: if self.family.supports_deep_zoom() {
                 self.progressive_julia_zoom_target_exponent
             } else {
@@ -1086,18 +1094,22 @@ impl App {
         self.bailout = document.computation.bailout;
         self.grid = document.display.coordinate_grid;
         self.show_orbit_overlay = document.display.critical_orbit_overlay;
-        self.colouring = document.colouring.unwrap_or_else(|| {
-            // Documents from before format version 5: the palette phase was
-            // the gradient offset and the only colouring choice was the
-            // smoothing of the outside iteration count.
-            let mut colouring = Colouring::default();
-            if self.family.converges() {
-                colouring.outside = ColouringSide::default_basins();
-            }
-            colouring.outside.smooth = document.display.smooth_escape_time;
-            colouring.outside.offset = document.display.palette_phase;
-            colouring
-        });
+        self.layers = if let Some(layers) = document.layers {
+            LayerStack::from_layers(layers)
+        } else {
+            LayerStack::single(document.colouring.unwrap_or_else(|| {
+                // Documents from before format version 5: the palette phase
+                // was the gradient offset and the only colouring choice was
+                // the smoothing of the outside iteration count.
+                let mut colouring = Colouring::default();
+                if self.family.converges() {
+                    colouring.outside = ColouringSide::default_basins();
+                }
+                colouring.outside.smooth = document.display.smooth_escape_time;
+                colouring.outside.offset = document.display.palette_phase;
+                colouring
+            }))
+        };
         self.gradient_selected_stop = 0;
 
         self.zoom_focus = [None, None];
@@ -1227,6 +1239,11 @@ impl App {
 
     fn workspace(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap().shrink(6.0);
+        if self.single_image {
+            let pane = self.active_pane.min(1);
+            self.pane(ui, rect, pane);
+            return;
+        }
         if rect.width() > 780.0 {
             let width = (rect.width() - PANE_GAP) * 0.5;
             let left = egui::Rect::from_min_size(rect.min, egui::vec2(width, rect.height()));
@@ -1611,7 +1628,7 @@ impl App {
             self.bailout,
             self.family.shader_flag(),
             pane,
-            self.colouring.outside.smooth,
+            self.layers.layers[0].colouring.outside.smooth,
             self.grid,
             precision,
             self.family_parameters
@@ -1632,7 +1649,7 @@ impl App {
         let pixel_log = std::f64::consts::LN_10
             * (1.45_f64.log10() - self.magnification_log10(pane))
             + (2.0 / (pixel_height_points * ui.ctx().pixels_per_point() as f64)).ln();
-        let colouring_uniforms = ColouringUniforms::new(&self.colouring, pixel_log as f32);
+        let colouring_uniforms = ColouringUniforms::new(&self.layers, pixel_log as f32);
         let gradient = self.gradient_table();
         ui.painter().add(render::callback(
             viewport,
@@ -1669,24 +1686,164 @@ impl App {
         }
     }
 
-    /// The rasterised gradient for the render callbacks, rebuilt only when
-    /// the gradient changed.
+    /// The rasterised gradients for the render callbacks, rebuilt only when
+    /// a visible layer's gradient (or the visible set) changed.
     fn gradient_table(&mut self) -> Arc<GradientTable> {
-        if self.colouring.gradient != self.gradient_table_source {
+        let sources: Vec<Gradient> = self
+            .layers
+            .visible()
+            .map(|layer| layer.colouring.gradient.clone())
+            .collect();
+        if sources != self.gradient_table_source {
             let generation = self.gradient_table.generation + 1;
-            self.gradient_table =
-                Arc::new(GradientTable::new(generation, &self.colouring.gradient));
-            self.gradient_table_source = self.colouring.gradient.clone();
+            self.gradient_table = Arc::new(GradientTable::new(generation, &self.layers));
+            self.gradient_table_source = sources;
         }
         Arc::clone(&self.gradient_table)
     }
 
+    /// The layer list: visibility, blend settings and stacking order, shown
+    /// top layer first as in Ultra Fractal.
+    fn layer_list(&mut self, ui: &mut egui::Ui) {
+        let count = self.layers.layers.len();
+        let mut remove: Option<usize> = None;
+        let mut swap: Option<(usize, usize)> = None;
+        for index in (0..count).rev() {
+            let active = index == self.layers.active;
+            let bottom = index == 0;
+            ui.horizontal(|ui| {
+                let layer = &mut self.layers.layers[index];
+                let eye = if layer.visible { "👁" } else { "—" };
+                if ui
+                    .add(egui::Button::new(eye).min_size(egui::vec2(24.0, 0.0)))
+                    .on_hover_text("Show or hide this layer")
+                    .clicked()
+                {
+                    layer.visible = !layer.visible;
+                }
+                if ui
+                    .selectable_label(active, &layer.name)
+                    .on_hover_text("Select this layer for editing")
+                    .clicked()
+                {
+                    self.layers.active = index;
+                    self.gradient_selected_stop = 0;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(28.0);
+                let layer = &mut self.layers.layers[index];
+                if bottom {
+                    ui.label(egui::RichText::new("base").small().color(MUTED))
+                        .on_hover_text(
+                            "The bottom layer composites over black; its merge mode is ignored",
+                        );
+                } else {
+                    egui::ComboBox::from_id_salt(("iterascope.layer.mode", index))
+                        .selected_text(layer.merge_mode.name())
+                        .width(92.0)
+                        .show_ui(ui, |ui| {
+                            for mode in MergeMode::ALL {
+                                ui.selectable_value(&mut layer.merge_mode, mode, mode.name());
+                            }
+                        });
+                }
+                ui.add(
+                    egui::Slider::new(&mut layer.opacity, 0.0..=1.0)
+                        .show_value(false)
+                        .text("op"),
+                );
+                if ui
+                    .add_enabled(index + 1 < count, egui::Button::new("▲").small())
+                    .clicked()
+                {
+                    swap = Some((index, index + 1));
+                }
+                if ui
+                    .add_enabled(index > 0, egui::Button::new("▼").small())
+                    .clicked()
+                {
+                    swap = Some((index, index - 1));
+                }
+                if ui
+                    .add_enabled(count > 1, egui::Button::new("✕").small())
+                    .on_hover_text("Delete this layer")
+                    .clicked()
+                {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some((a, b)) = swap {
+            self.layers.layers.swap(a, b);
+            if self.layers.active == a {
+                self.layers.active = b;
+            } else if self.layers.active == b {
+                self.layers.active = a;
+            }
+        }
+        if let Some(index) = remove
+            && self.layers.layers.len() > 1
+        {
+            self.layers.layers.remove(index);
+            if self.layers.active >= self.layers.layers.len() {
+                self.layers.active = self.layers.layers.len() - 1;
+            }
+        }
+        ui.horizontal(|ui| {
+            let full = self.layers.layers.len() >= MAX_LAYERS;
+            if ui
+                .add_enabled(!full, egui::Button::new("Duplicate"))
+                .on_hover_text("Copy the active layer above itself")
+                .clicked()
+            {
+                let mut copy = self.layers.active_layer().clone();
+                copy.name = format!("{} copy", copy.name);
+                let at = self.layers.active + 1;
+                self.layers.layers.insert(at, copy);
+                self.layers.active = at;
+            }
+            if ui
+                .add_enabled(!full, egui::Button::new("Add"))
+                .on_hover_text("Add a default layer on top")
+                .clicked()
+            {
+                let mut layer = Layer {
+                    name: format!("Layer {}", self.layers.layers.len() + 1),
+                    ..Layer::default()
+                };
+                if self.family.converges() {
+                    layer.colouring.outside = ColouringSide::default_basins();
+                }
+                self.layers.layers.push(layer);
+                self.layers.active = self.layers.layers.len() - 1;
+            }
+            let name = &mut self.layers.active_layer_mut().name;
+            ui.add(egui::TextEdit::singleline(name).desired_width(110.0));
+        });
+    }
+
     fn colouring_controls(&mut self, ui: &mut egui::Ui) {
         let family = self.family;
+        if self.layers.layers.len() > 1 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Editing layer: {}",
+                    self.layers.active_layer().name
+                ))
+                .small()
+                .color(CREAM),
+            );
+        }
         // Gradient preview; click to open the editor.
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
-        paint_gradient(ui.painter(), rect, &self.colouring.gradient, 96);
+        paint_gradient(
+            ui.painter(),
+            rect,
+            &self.layers.active_colouring().gradient,
+            96,
+        );
         ui.painter().rect_stroke(
             rect,
             2.0,
@@ -1709,7 +1866,7 @@ impl App {
                         if ui.selectable_label(false, name).clicked()
                             && let Some(gradient) = presets::by_name(name)
                         {
-                            self.colouring.gradient = gradient;
+                            self.layers.active_colouring_mut().gradient = gradient;
                             self.gradient_selected_stop = 0;
                         }
                     }
@@ -1728,14 +1885,24 @@ impl App {
             .id_salt("iterascope.colouring.outside")
             .default_open(true)
             .show(ui, |ui| {
-                colouring_side_controls(ui, &mut self.colouring.outside, family, true);
+                colouring_side_controls(
+                    ui,
+                    &mut self.layers.active_colouring_mut().outside,
+                    family,
+                    true,
+                );
             });
         if family != FractalFamily::Lyapunov {
             egui::CollapsingHeader::new("Inside · bounded")
                 .id_salt("iterascope.colouring.inside")
                 .default_open(false)
                 .show(ui, |ui| {
-                    colouring_side_controls(ui, &mut self.colouring.inside, family, false);
+                    colouring_side_controls(
+                        ui,
+                        &mut self.layers.active_colouring_mut().inside,
+                        family,
+                        false,
+                    );
                 });
         }
         ui.add_space(2.0);
@@ -1758,7 +1925,7 @@ impl App {
     }
 
     fn gradient_editor_contents(&mut self, ui: &mut egui::Ui) {
-        let gradient = &mut self.colouring.gradient;
+        let gradient = &mut self.layers.active_colouring_mut().gradient;
         gradient.normalise();
         if self.gradient_selected_stop >= gradient.stops.len() {
             self.gradient_selected_stop = 0;
@@ -2292,8 +2459,8 @@ impl App {
         }
 
         self.export = Some(ExportJob {
-            gradient: Arc::new(GradientTable::new(base + 3, &self.colouring.gradient)),
-            colouring: self.colouring.clone(),
+            gradient: Arc::new(GradientTable::new(base + 3, &self.layers)),
+            layers: self.layers.clone(),
             animation,
             family: self.family,
             dynamical,
@@ -2361,7 +2528,7 @@ impl App {
             job.bailout,
             job.family.shader_flag(),
             usize::from(job.dynamical),
-            job.colouring.outside.smooth,
+            job.layers.layers[0].colouring.outside.smooth,
             false,
             if reference.is_some() {
                 PrecisionMode::DoubleSingle
@@ -2379,12 +2546,14 @@ impl App {
                 [0.0; 2],
             );
         }
-        let mut colouring = job.colouring.clone();
+        let mut layers = job.layers.clone();
         let sweep = job.animation.gradient_offset_at(frame);
-        colouring.outside.offset += sweep;
-        colouring.inside.offset += sweep;
+        for layer in &mut layers.layers {
+            layer.colouring.outside.offset += sweep;
+            layer.colouring.inside.offset += sweep;
+        }
         let colouring_uniforms = ColouringUniforms::new(
-            &colouring,
+            &layers,
             animation::frame_pixel_log(magnification, job.animation.height),
         );
 
@@ -3277,6 +3446,30 @@ impl eframe::App for App {
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("ITERASCOPE").strong().color(TEXT));
                     ui.label(egui::RichText::new("Complex dynamics laboratory").color(MUTED));
+                    ui.add_space(10.0);
+                    if ui
+                        .selectable_label(!self.single_image, "Panes")
+                        .on_hover_text("Linked parameter and dynamical panes")
+                        .clicked()
+                    {
+                        self.single_image = false;
+                    }
+                    if ui
+                        .selectable_label(self.single_image, "Image")
+                        .on_hover_text("One composited image (the active pane, full window)")
+                        .clicked()
+                    {
+                        self.single_image = true;
+                    }
+                    if self.single_image {
+                        let (left, right) = self.pane_labels();
+                        if ui.selectable_label(self.active_pane == 0, left).clicked() {
+                            self.active_pane = 0;
+                        }
+                        if ui.selectable_label(self.active_pane == 1, right).clicked() {
+                            self.active_pane = 1;
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
                         ui.label(
@@ -3341,7 +3534,7 @@ struct ExportJob {
     /// `f64` projection of the (possibly arbitrary-precision) centre; the
     /// perturbation scale carries the depth.
     centre: [f64; 2],
-    colouring: Colouring,
+    layers: LayerStack,
     gradient: Arc<GradientTable>,
     /// Arbitrary-precision reference for frames beyond the handoff.
     ap_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,

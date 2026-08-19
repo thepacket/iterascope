@@ -3,11 +3,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::arbitrary::MAX_DECIMAL_ZOOM_EXPONENT;
-use crate::colouring::Colouring;
+use crate::colouring::{Colouring, Layer, MAX_LAYERS};
 use crate::family::{FamilyParameters, FractalFamily, Linkage};
 
 pub(crate) const FORMAT_ID: &str = "iterascope-experiment";
-pub(crate) const FORMAT_VERSION: u32 = 5;
+pub(crate) const FORMAT_VERSION: u32 = 6;
 /// Largest escape radius a document may ask for. Large radii give the
 /// triangle-inequality and stripe colourings their smoothest results.
 pub(crate) const MAX_BAILOUT: f32 = 1e10;
@@ -35,10 +35,14 @@ pub(crate) struct ExperimentDocument {
     pub(crate) family_parameters: Option<FamilyParametersDocument>,
     pub(crate) computation: ComputationDocument,
     pub(crate) display: DisplayDocument,
-    /// Gradient and colouring algorithms (format version 5). Absent in older
-    /// documents, which are coloured with the defaults.
+    /// Gradient and colouring algorithms of a single-layer image (format
+    /// version 5); superseded by `layers`. Absent in older documents, which
+    /// are coloured with the defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) colouring: Option<Colouring>,
+    /// The layer stack, bottom first (format version 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) layers: Option<Vec<Layer>>,
     #[serde(
         default,
         alias = "initial_julia_zoom_exponent",
@@ -245,6 +249,22 @@ impl ExperimentDocument {
                 return Err("colouring requires document version 5".to_owned());
             }
         }
+        if let Some(layers) = &self.layers {
+            if layers.is_empty() || layers.len() > MAX_LAYERS {
+                return Err(format!(
+                    "layers must hold between 1 and {MAX_LAYERS} layers"
+                ));
+            }
+            for (index, layer) in layers.iter().enumerate() {
+                layer.validate(index)?;
+            }
+            if self.version < 6 {
+                return Err("layers require document version 6".to_owned());
+            }
+            if self.colouring.is_some() {
+                return Err("a document records either layers or colouring, not both".to_owned());
+            }
+        }
         if !self.display.palette_phase.is_finite()
             || !(-1.0..=1.0).contains(&self.display.palette_phase)
         {
@@ -395,6 +415,7 @@ mod tests {
                 interior_shading: true,
             },
             colouring: None,
+            layers: None,
             progressive_julia_zoom_target_exponent: 0,
             deep_parameter_plane: None,
             deep_dynamical_plane: None,
@@ -442,6 +463,7 @@ mod tests {
             .set_algorithm(ColouringAlgorithm::OrbitTrap);
         document.colouring = Some(colouring);
         document.computation.bailout = 1e8;
+        document.version = 5;
         let json = document.to_pretty_json().unwrap();
         assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
 
@@ -456,6 +478,39 @@ mod tests {
 
         document.computation.bailout = 1e11;
         assert!(ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).is_err());
+    }
+
+    #[test]
+    fn layer_stacks_round_trip_and_require_version_six() {
+        use crate::colouring::{ColouringAlgorithm, Gradient, MergeMode};
+        let mut document = example();
+        let mut top = Layer {
+            name: "Stripes".to_owned(),
+            opacity: 0.6,
+            merge_mode: MergeMode::Multiply,
+            ..Layer::default()
+        };
+        top.colouring.gradient = Gradient::random(21);
+        top.colouring
+            .outside
+            .set_algorithm(ColouringAlgorithm::Stripes);
+        document.layers = Some(vec![Layer::default(), top]);
+        let json = document.to_pretty_json().unwrap();
+        assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
+
+        document.version = 5;
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("version 6"), "{error}");
+
+        document.version = 6;
+        document.layers = Some(vec![Layer::default(); MAX_LAYERS + 1]);
+        assert!(ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).is_err());
+        document.layers = Some(vec![Layer {
+            opacity: 2.0,
+            ..Layer::default()
+        }]);
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("opacity"), "{error}");
     }
 
     #[test]

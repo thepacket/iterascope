@@ -1057,12 +1057,19 @@ impl Default for Colouring {
     }
 }
 
+/// Most layers one image may composite; must match `MAX_LAYERS` in
+/// `fractal.wgsl`.
+pub(crate) const MAX_LAYERS: usize = 8;
+/// `vec4<f32>` words per layer in the uniform block: outside a–d,
+/// inside a–d, blend.
+const LAYER_WORDS: usize = 9;
 /// Number of `vec4<f32>` words in the colouring uniform block; must match
-/// `ColouringUniforms` in `fractal.wgsl`.
-pub(crate) const GPU_WORDS: usize = 10;
-/// Index of the word holding the accumulator flags (trap, triangle
+/// `ColouringUniforms` in `fractal.wgsl`: header, needs union, then the
+/// layer array.
+pub(crate) const GPU_WORDS: usize = 2 + MAX_LAYERS * LAYER_WORDS;
+/// Index of the word holding the union of accumulator flags (trap, triangle
 /// inequality, stripes, derivative).
-pub(crate) const NEEDS_WORD: usize = 8;
+pub(crate) const NEEDS_WORD: usize = 1;
 
 impl Colouring {
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -1095,30 +1102,236 @@ impl Colouring {
     fn needs(&self, algorithm: ColouringAlgorithm) -> bool {
         self.outside.algorithm == algorithm || self.inside.algorithm == algorithm
     }
+}
+
+// ---------------------------------------------------------------------------
+// Layers
+// ---------------------------------------------------------------------------
+
+/// How a layer combines with the layers beneath it. The bottom layer's mode
+/// is ignored (it composites over black by its opacity alone).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MergeMode {
+    #[default]
+    Normal,
+    Add,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    Difference,
+}
+
+impl MergeMode {
+    pub(crate) const ALL: [Self; 8] = [
+        Self::Normal,
+        Self::Add,
+        Self::Multiply,
+        Self::Screen,
+        Self::Overlay,
+        Self::Darken,
+        Self::Lighten,
+        Self::Difference,
+    ];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Add => "Add",
+            Self::Multiply => "Multiply",
+            Self::Screen => "Screen",
+            Self::Overlay => "Overlay",
+            Self::Darken => "Darken",
+            Self::Lighten => "Lighten",
+            Self::Difference => "Difference",
+        }
+    }
+
+    const fn code(self) -> u32 {
+        match self {
+            Self::Normal => 0,
+            Self::Add => 1,
+            Self::Multiply => 2,
+            Self::Screen => 3,
+            Self::Overlay => 4,
+            Self::Darken => 5,
+            Self::Lighten => 6,
+            Self::Difference => 7,
+        }
+    }
+}
+
+/// One layer of the composited image: a complete colour stage plus how it
+/// merges with the layers beneath. Layers share the image's location,
+/// family and iteration — the orbit is computed once per pixel and coloured
+/// once per layer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct Layer {
+    pub(crate) name: String,
+    pub(crate) visible: bool,
+    pub(crate) opacity: f32,
+    pub(crate) merge_mode: MergeMode,
+    pub(crate) colouring: Colouring,
+}
+
+impl Default for Layer {
+    fn default() -> Self {
+        Self {
+            name: "Layer".to_owned(),
+            visible: true,
+            opacity: 1.0,
+            merge_mode: MergeMode::Normal,
+            colouring: Colouring::default(),
+        }
+    }
+}
+
+impl Layer {
+    pub(crate) fn validate(&self, index: usize) -> Result<(), String> {
+        if !self.opacity.is_finite() || !(0.0..=1.0).contains(&self.opacity) {
+            return Err(format!("layer {index}: opacity must be between 0 and 1"));
+        }
+        self.colouring
+            .validate()
+            .map_err(|error| format!("layer {index}: {error}"))
+    }
+}
+
+/// The image's layer stack, bottom first. Always holds at least one layer.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LayerStack {
+    pub(crate) layers: Vec<Layer>,
+    pub(crate) active: usize,
+}
+
+impl Default for LayerStack {
+    fn default() -> Self {
+        Self::single(Colouring::default())
+    }
+}
+
+impl LayerStack {
+    pub(crate) fn single(colouring: Colouring) -> Self {
+        Self {
+            layers: vec![Layer {
+                colouring,
+                ..Layer::default()
+            }],
+            active: 0,
+        }
+    }
+
+    pub(crate) fn from_layers(layers: Vec<Layer>) -> Self {
+        let mut stack = Self { layers, active: 0 };
+        if stack.layers.is_empty() {
+            stack.layers.push(Layer::default());
+        }
+        stack.layers.truncate(MAX_LAYERS);
+        stack
+    }
+
+    pub(crate) fn active_layer(&self) -> &Layer {
+        &self.layers[self.active.min(self.layers.len() - 1)]
+    }
+
+    pub(crate) fn active_layer_mut(&mut self) -> &mut Layer {
+        let index = self.active.min(self.layers.len() - 1);
+        self.active = index;
+        &mut self.layers[index]
+    }
+
+    pub(crate) fn active_colouring(&self) -> &Colouring {
+        &self.active_layer().colouring
+    }
+
+    pub(crate) fn active_colouring_mut(&mut self) -> &mut Colouring {
+        &mut self.active_layer_mut().colouring
+    }
+
+    /// The layers that contribute to the image (visible and not fully
+    /// transparent), bottom first — the order the shader composites and the
+    /// order the gradient tables are packed. Skipping transparent layers
+    /// also keeps their accumulators out of the needs union, so an opacity-0
+    /// layer costs nothing.
+    pub(crate) fn visible(&self) -> impl Iterator<Item = &Layer> {
+        self.layers
+            .iter()
+            .filter(|layer| layer.visible && layer.opacity > 0.0)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.layers.is_empty() {
+            return Err("the layer stack needs at least one layer".to_owned());
+        }
+        if self.layers.len() > MAX_LAYERS {
+            return Err(format!("at most {MAX_LAYERS} layers are supported"));
+        }
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.validate(index)?;
+        }
+        Ok(())
+    }
+
+    /// The gradient tables of the visible layers, concatenated bottom first
+    /// for the shader's single lookup buffer.
+    pub(crate) fn lookup_tables(&self) -> Vec<[f32; 4]> {
+        let mut entries = Vec::with_capacity(LOOKUP_TABLE_LEN);
+        for layer in self.visible() {
+            entries.extend(layer.colouring.gradient.lookup_table());
+        }
+        if entries.is_empty() {
+            entries.extend(Gradient::default().lookup_table());
+        }
+        entries
+    }
 
     /// The uniform block for the shader. `pixel_log` is the natural log of
     /// one pixel's height in world units (distance estimates are expressed
-    /// in pixels).
+    /// in pixels). Only visible layers are uploaded; the bottom layer's
+    /// merge mode is forced in the shader, not here.
     pub(crate) fn gpu_words(&self, pixel_log: f32) -> [[f32; 4]; GPU_WORDS] {
-        let outside = self.outside.gpu_words();
-        let inside = self.inside.gpu_words();
-        [
-            outside[0],
-            outside[1],
-            outside[2],
-            outside[3],
-            inside[0],
-            inside[1],
-            inside[2],
-            inside[3],
-            [
-                self.needs(ColouringAlgorithm::OrbitTrap) as u8 as f32,
-                self.needs(ColouringAlgorithm::TriangleInequality) as u8 as f32,
-                self.needs(ColouringAlgorithm::Stripes) as u8 as f32,
-                self.needs(ColouringAlgorithm::DistanceEstimate) as u8 as f32,
-            ],
-            [LOOKUP_TABLE_LEN as f32, pixel_log, 0.0, 0.0],
-        ]
+        let mut words = [[0.0f32; 4]; GPU_WORDS];
+        let mut needs = [false; 4];
+        let mut count = 0usize;
+        for layer in self.visible().take(MAX_LAYERS) {
+            let colouring = &layer.colouring;
+            let outside = colouring.outside.gpu_words();
+            let inside = colouring.inside.gpu_words();
+            let base = 2 + count * LAYER_WORDS;
+            words[base..base + 4].copy_from_slice(&outside);
+            words[base + 4..base + 8].copy_from_slice(&inside);
+            let needs_trap = colouring.needs(ColouringAlgorithm::OrbitTrap);
+            let needs_stripes = colouring.needs(ColouringAlgorithm::Stripes);
+            words[base + 8] = [
+                layer.merge_mode.code() as f32,
+                layer.opacity,
+                needs_trap as u8 as f32,
+                needs_stripes as u8 as f32,
+            ];
+            needs[0] |= needs_trap;
+            needs[1] |= colouring.needs(ColouringAlgorithm::TriangleInequality);
+            needs[2] |= needs_stripes;
+            needs[3] |= colouring.needs(ColouringAlgorithm::DistanceEstimate);
+            count += 1;
+        }
+        if count == 0 {
+            // Nothing visible: upload one fully transparent layer so the
+            // image renders black rather than stale.
+            words[2 + 8] = [0.0, 0.0, 0.0, 0.0];
+            count = 1;
+        }
+        words[0] = [count as f32, pixel_log, LOOKUP_TABLE_LEN as f32, 0.0];
+        words[NEEDS_WORD] = [
+            needs[0] as u8 as f32,
+            needs[1] as u8 as f32,
+            needs[2] as u8 as f32,
+            needs[3] as u8 as f32,
+        ];
+        words
     }
 }
 
@@ -1301,19 +1514,69 @@ gradient:
     }
 
     #[test]
-    fn gpu_words_encode_both_sides_and_the_needs_flags() {
-        let mut colouring = Colouring::default();
-        colouring
-            .inside
-            .set_algorithm(ColouringAlgorithm::OrbitTrap);
-        let words = colouring.gpu_words(-3.0);
-        assert_eq!(words[0][0], 0.0);
-        assert_eq!(words[4][0], 5.0);
-        assert_eq!(words[NEEDS_WORD], [1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(words[9][0], LOOKUP_TABLE_LEN as f32);
-        assert_eq!(words[9][1], -3.0);
-        assert_eq!(colouring.inside.transfer, Transfer::Sqrt);
-        colouring.validate().unwrap();
+    fn gpu_words_encode_the_visible_layers_and_the_needs_union() {
+        let mut bottom = Colouring::default();
+        bottom.inside.set_algorithm(ColouringAlgorithm::OrbitTrap);
+        assert_eq!(bottom.inside.transfer, Transfer::Sqrt);
+        let mut top = Layer {
+            opacity: 0.5,
+            merge_mode: MergeMode::Screen,
+            ..Layer::default()
+        };
+        top.colouring
+            .outside
+            .set_algorithm(ColouringAlgorithm::Stripes);
+        let mut hidden = Layer {
+            visible: false,
+            ..Layer::default()
+        };
+        hidden
+            .colouring
+            .outside
+            .set_algorithm(ColouringAlgorithm::DistanceEstimate);
+        let mut stack = LayerStack::single(bottom);
+        stack.layers.push(hidden);
+        stack.layers.push(top);
+        let words = stack.gpu_words(-3.0);
+        // Header: two visible layers, pixel log, entries per table.
+        assert_eq!(words[0][0], 2.0);
+        assert_eq!(words[0][1], -3.0);
+        assert_eq!(words[0][2], LOOKUP_TABLE_LEN as f32);
+        // Needs union: traps (bottom) and stripes (top); no distance,
+        // because that layer is hidden.
+        assert_eq!(words[NEEDS_WORD], [1.0, 0.0, 1.0, 0.0]);
+        // Layer 0: outside iteration, inside trap; per-layer trap flag set.
+        assert_eq!(words[2][0], 0.0);
+        assert_eq!(words[2 + 4][0], 5.0);
+        assert_eq!(words[2 + 8][2], 1.0);
+        // Layer 1 (the visible top layer, packed second): stripes outside,
+        // Screen at half opacity, stripes flag set, trap flag clear.
+        assert_eq!(words[2 + 9][0], 3.0);
+        assert_eq!(words[2 + 9 + 8], [3.0, 0.5, 0.0, 1.0]);
+        stack.validate().unwrap();
+        // The combined gradient table packs one table per visible layer.
+        assert_eq!(stack.lookup_tables().len(), 2 * LOOKUP_TABLE_LEN);
+    }
+
+    #[test]
+    fn layer_stack_guards_its_shape() {
+        let mut stack = LayerStack::from_layers(Vec::new());
+        assert_eq!(stack.layers.len(), 1);
+        stack.active = 7;
+        assert_eq!(stack.active_layer_mut().name, "Layer");
+        assert_eq!(stack.active, 0);
+        stack.layers = vec![Layer::default(); MAX_LAYERS + 2];
+        assert!(stack.validate().is_err());
+        let stack = LayerStack::from_layers(vec![Layer::default(); MAX_LAYERS + 2]);
+        assert_eq!(stack.layers.len(), MAX_LAYERS);
+        // All layers hidden: the uniforms still describe one (transparent)
+        // layer so the shader has defined input.
+        let mut hidden = LayerStack::default();
+        hidden.layers[0].visible = false;
+        let words = hidden.gpu_words(0.0);
+        assert_eq!(words[0][0], 1.0);
+        assert_eq!(words[2 + 8][1], 0.0);
+        assert_eq!(hidden.lookup_tables().len(), LOOKUP_TABLE_LEN);
     }
 
     #[test]

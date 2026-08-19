@@ -129,7 +129,7 @@ from it.
 - Keyboard arrows and four on-screen buttons for deterministic fine panning by
   one tenth of the displayed range (Shift + arrows: one hundredth)
 - Adjustable iteration limit up to 50,000 and escape radius up to `1e10`
-- A colour stage in the Ultra Fractal mould: one cyclic gradient per image
+- A colour stage in the Ultra Fractal mould: cyclic gradients
   (control points, RGB or HSL blending, cubic smoothing, rotation, presets,
   random generation, `.ugr` and Fractint `.map` import, `.ugr` export) and
   independent outside/inside colouring algorithms — (smooth) iteration count,
@@ -139,6 +139,14 @@ from it.
   Every algorithm works through the perturbation paths at any depth; the
   distance estimate is evaluated in logarithms and verified at `1e4000×`
   (Ultra Fractal 5's limit; IteraScope navigates to `1e5000×`)
+- Layers: up to eight complete colour stages composited over one iteration
+  pass — each layer has its own gradient, algorithms, opacity and merge mode
+  (Normal, Add, Multiply, Screen, Overlay, Darken, Lighten, Difference) —
+  with an optional single-image workspace that gives the composited image
+  the full window. Layers share the image's location and family, so one
+  reference orbit serves the whole stack and the deep-zoom engine is
+  untouched; a single-layer stack renders byte-identically to, and as fast
+  as, the pre-layer renderer
 - Optional scale-aware coordinate grid
 - Zoom-path animation: a dive to the current centre between two magnification
   exponents at constant or eased logarithmic speed, with an optional gradient
@@ -190,6 +198,23 @@ scale for every frame; frames below the `1.14e14×` handoff use the same orbit
 projected to `f64`, and the switch between the paths is seamless. Export runs
 in the native application; the browser build shows the settings but cannot
 write files.
+
+### Layers
+
+The **Layers** section holds the image's layer stack, shown top first. The
+orbit is iterated once per pixel; every visible layer then colours that same
+result with its own gradient and algorithms and is merged over the layers
+beneath it by its opacity and merge mode (the bottom layer composites over
+black, its mode ignored). Duplicate the active layer, restyle it — a stripe
+average multiplied over an iteration-count base, an orbit trap screened on
+top — and reorder or hide layers freely; the **Colouring** section always
+edits the active layer. Layers currently share the image's location, family
+and iteration settings (per-layer formulas and locations are future work),
+which is what keeps the whole stack exact at any magnification: one
+reference orbit drives every layer. The **Image** toggle in the top bar
+swaps the two linked panes for the composited image alone, full-window;
+**Panes** brings the linked layout back — that is also where the parameter
+plane remains available for picking a new `c`.
 
 ### Colouring
 
@@ -460,8 +485,11 @@ at `1e30×`, preview-blit and pan consistency, a gallery of every colouring
 algorithm at the default view and around an `f64` reference at `1e12×`, the
 iteration, distance, stripe and triangle colourings around an
 arbitrary-precision reference at `1e4000×`, a five-frame zoom-path export
-crossing every precision path at a row-padded width, and a timing probe that
-also records the cost of the orbit-statistics variant:
+crossing every precision path at a row-padded width, a layer-compositing test
+(a single-layer stack must reproduce the pre-layer renderer byte for byte,
+every merge mode must be distinct, and an eight-layer stack must survive),
+and a timing probe that also records the cost of the orbit-statistics
+variant:
 
 ```sh
 ITERASCOPE_RENDER_DIR=out cargo test --release gpu_ -- --ignored --nocapture
@@ -470,12 +498,14 @@ ITERASCOPE_RENDER_DIR=out cargo test --release gpu_ -- --ignored --nocapture
 ## Experiment documents
 
 Open **Document → Export / Import JSON** to capture the complete reproducible
-experiment state. The versioned document (format version 5) records the
+experiment state. The versioned document (format version 6) records the
 active family, both plane centres and scales, the selected parameter or
 starting value, the family parameters the active family uses, computation
-limits, the gradient and colouring algorithms, and display settings, including
-critical-orbit overlay visibility. Documents from earlier versions load with the
-default colouring (their palette phase becomes the outside offset). Runtime
+limits, the layer stack with each layer's gradient and colouring algorithms,
+and display settings, including critical-orbit overlay visibility. Version-5
+documents load their single colouring as a one-layer stack; documents from
+before version 5 load with the default colouring (their palette phase becomes
+the outside offset). Runtime
 diagnostics, selected inspector step and frame timing are deliberately not
 stored. Copy the JSON to export it; paste another IteraScope document into the
 editor and choose **Load JSON** to import it. Imports are validated before any
@@ -492,11 +522,13 @@ live state is changed.
 5. Orbit probes for the non-quadratic escape-time families, and
    arbitrary-precision exponential/trigonometric reference orbits so the
    transcendental families can join the deep-zoom path
-6. Towards generative fractal art: layers with merge modes and masks over a
-   single composited image (zoom-path animation and image-sequence export
-   landed); keyframed centre drift and per-parameter animation curves;
-   orbit-trap options that skip the shared leading iterations of deep orbits;
-   derivatives for the remaining families' distance estimates
+6. Towards generative fractal art: per-layer formulas, locations and masks
+   (layers with merge modes over one composited image landed, sharing the
+   image's location); a UF-style switch picker with a cursor-following Julia
+   preview to replace the permanent parameter pane; keyframed centre drift
+   and per-parameter animation curves; orbit-trap options that skip the
+   shared leading iterations of deep orbits; derivatives for the remaining
+   families' distance estimates
 
 ## Project status
 
