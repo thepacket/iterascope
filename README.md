@@ -262,6 +262,13 @@ replacement reference is prepared. Progressive stages are spaced by 750 ms so
 WebGPU is not continuously fed full-screen deep renders faster than they can
 be presented.
 
+While input is active (dragging, zooming, stepping, clicking) each pane is
+rendered at one third of its resolution into a texture and scaled up, so a
+frame stays cheap at any depth and the view follows the pointer instead of
+lurching after long frames; the settled frame renders at full resolution
+(a milder half-resolution preview is used while a reference orbit is still
+being extended).
+
 Reference orbits are built so that navigation stays responsive. Below the
 handoff the `f64` reference is chosen as the longest-lived orbit among the
 view centre and a coarse grid of candidates, so few pixels outlive it (those

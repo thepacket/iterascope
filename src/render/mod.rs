@@ -358,17 +358,63 @@ impl DeepRenderData {
     }
 }
 
+/// Reduced-resolution target used while input is active.
+struct PreviewTarget {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
 struct PaneResources {
     buffer: wgpu::Buffer,
     reference_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     reference_generation: Mutex<Option<u64>>,
+    preview: Mutex<Option<PreviewTarget>>,
 }
 
 pub struct FractalPipeline {
     pipeline: wgpu::RenderPipeline,
+    /// Draws a preview texture onto the pane.
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    target_format: wgpu::TextureFormat,
     panes: [PaneResources; PANE_COUNT],
 }
+
+/// Fullscreen-triangle blit of a sampled texture; used to present preview
+/// renders made at reduced resolution while input is active.
+const BLIT_SHADER: &str = r#"
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@group(0) @binding(0) var preview_texture: texture_2d<f32>;
+@group(0) @binding(1) var preview_sampler: sampler;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
+    var corners = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0),
+    );
+    let corner = corners[vertex_index];
+    var out: VertexOut;
+    out.position = vec4<f32>(corner, 0.0, 1.0);
+    // Texture rows run top-down while clip space runs bottom-up.
+    out.uv = vec2<f32>(corner.x * 0.5 + 0.5, 0.5 - corner.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    return textureSample(preview_texture, preview_sampler, in.uv);
+}
+"#;
 
 impl FractalPipeline {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
@@ -436,6 +482,70 @@ impl FractalPipeline {
             cache: None,
         });
 
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("iterascope.blit.shader"),
+            source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
+        });
+        let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("iterascope.blit.bind-group-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iterascope.blit.pipeline-layout"),
+            bind_group_layouts: &[Some(&blit_layout)],
+            immediate_size: 0,
+        });
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("iterascope.blit.pipeline"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("iterascope.blit.sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
         let panes = std::array::from_fn(|index| {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(if index == 0 {
@@ -476,10 +586,62 @@ impl FractalPipeline {
                 reference_buffer,
                 bind_group,
                 reference_generation: Mutex::new(None),
+                preview: Mutex::new(None),
             }
         });
 
-        Self { pipeline, panes }
+        Self {
+            pipeline,
+            blit_pipeline,
+            blit_layout,
+            sampler,
+            target_format,
+            panes,
+        }
+    }
+
+    /// Returns the pane's preview target, recreating it when the requested
+    /// size changes.
+    fn preview_target(&self, device: &wgpu::Device, pane: usize, size: (u32, u32)) {
+        let mut slot = self.panes[pane].preview.lock().unwrap();
+        if slot.as_ref().is_some_and(|target| target.size == size) {
+            return;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iterascope.preview"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("iterascope.preview.bind-group"),
+            layout: &self.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        *slot = Some(PreviewTarget {
+            _texture: texture,
+            view,
+            bind_group,
+            size,
+        });
     }
 }
 
@@ -487,15 +649,29 @@ struct FractalCallback {
     pane: usize,
     uniforms: Uniforms,
     deep: Option<Arc<DeepRenderData>>,
+    /// Preview reduction factor: 1 renders directly at full resolution;
+    /// larger values render into a texture of 1/factor the size and blit it.
+    preview_scale: u32,
+    /// Pane size in physical pixels.
+    pixel_size: (u32, u32),
+}
+
+impl FractalCallback {
+    fn preview_size(&self) -> (u32, u32) {
+        (
+            self.pixel_size.0.div_ceil(self.preview_scale).max(1),
+            self.pixel_size.1.div_ceil(self.preview_scale).max(1),
+        )
+    }
 }
 
 impl CallbackTrait for FractalCallback {
     fn prepare(
         &self,
-        _device: &wgpu::Device,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         _screen_descriptor: &ScreenDescriptor,
-        _encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut wgpu::CommandEncoder,
         resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         if let Some(renderer) = resources.get::<FractalPipeline>() {
@@ -516,6 +692,33 @@ impl CallbackTrait for FractalCallback {
                     *uploaded = Some(deep.generation);
                 }
             }
+            if self.preview_scale > 1 {
+                // Render the fractal at reduced resolution now; `paint` only
+                // has to blit the result into the pane.
+                renderer.preview_target(device, self.pane, self.preview_size());
+                let slot = renderer.panes[self.pane].preview.lock().unwrap();
+                if let Some(target) = slot.as_ref() {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("iterascope.preview.pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &target.view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&renderer.pipeline);
+                    pass.set_bind_group(0, &renderer.panes[self.pane].bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
         }
         Vec::new()
     }
@@ -529,6 +732,15 @@ impl CallbackTrait for FractalCallback {
         let Some(renderer) = resources.get::<FractalPipeline>() else {
             return;
         };
+        if self.preview_scale > 1 {
+            let slot = renderer.panes[self.pane].preview.lock().unwrap();
+            if let Some(target) = slot.as_ref() {
+                render_pass.set_pipeline(&renderer.blit_pipeline);
+                render_pass.set_bind_group(0, &target.bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+                return;
+            }
+        }
         render_pass.set_pipeline(&renderer.pipeline);
         render_pass.set_bind_group(0, &renderer.panes[self.pane].bind_group, &[]);
         render_pass.draw(0..3, 0..1);
@@ -540,13 +752,21 @@ pub(crate) fn callback(
     pane: usize,
     uniforms: Uniforms,
     deep: Option<Arc<DeepRenderData>>,
+    preview_scale: u32,
+    pixels_per_point: f32,
 ) -> egui::PaintCallback {
+    let pixel_size = (
+        (rect.width() * pixels_per_point).round().max(1.0) as u32,
+        (rect.height() * pixels_per_point).round().max(1.0) as u32,
+    );
     egui_wgpu::Callback::new_paint_callback(
         rect,
         FractalCallback {
             pane,
             uniforms,
             deep,
+            preview_scale: preview_scale.max(1),
+            pixel_size,
         },
     )
 }
@@ -860,6 +1080,111 @@ mod tests {
             self.readback.unmap();
             // The quad maps uv.y = 0 to the bottom of the viewport; return
             // rows top-first so images are upright.
+            let mut rgb = Vec::with_capacity((self.width * self.height * 3) as usize);
+            for row in pixels.chunks(bytes_per_row as usize).rev() {
+                for pixel in row.chunks(4) {
+                    rgb.extend_from_slice(&pixel[..3]);
+                }
+            }
+            rgb
+        }
+
+        /// Renders through the preview path: fractal into a reduced target,
+        /// then blit into the main texture. Returns RGB rows, top first.
+        fn render_preview(&self, pane: usize, uniforms: Uniforms, scale: u32) -> Vec<u8> {
+            let bytes_per_row = self.width * 4;
+            self.queue.write_buffer(
+                &self.pipeline.panes[pane].buffer,
+                0,
+                bytemuck::bytes_of(&uniforms),
+            );
+            let size = (
+                self.width.div_ceil(scale).max(1),
+                self.height.div_ceil(scale).max(1),
+            );
+            self.pipeline.preview_target(&self.device, pane, size);
+            let view = self.texture.create_view(&Default::default());
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            {
+                let slot = self.pipeline.panes[pane].preview.lock().unwrap();
+                let target = slot.as_ref().unwrap();
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("preview.pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target.view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.pipeline.pipeline);
+                pass.set_bind_group(0, &self.pipeline.panes[pane].bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            {
+                let slot = self.pipeline.panes[pane].preview.lock().unwrap();
+                let target = slot.as_ref().unwrap();
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("blit.pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.pipeline.blit_pipeline);
+                pass.set_bind_group(0, &target.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &self.readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(self.height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.queue.submit([encoder.finish()]);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            self.readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    sender.send(result).unwrap()
+                });
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            receiver.recv().unwrap().unwrap();
+            let pixels = self.readback.slice(..).get_mapped_range().to_vec();
+            self.readback.unmap();
             let mut rgb = Vec::with_capacity((self.width * self.height * 3) as usize);
             for row in pixels.chunks(bytes_per_row as usize).rev() {
                 for pixel in row.chunks(4) {
@@ -1753,5 +2078,69 @@ mod tests {
                 start.elapsed().as_secs_f64() * 1e3 / 10.0
             );
         }
+    }
+
+    /// The preview path (reduced render + blit) must reproduce the direct
+    /// render exactly at scale 1 (orientation, format round trip) and
+    /// closely at scale 2.
+    #[test]
+    #[ignore]
+    fn gpu_preview_blit_matches_direct_render() {
+        use crate::family::{FamilyParameters, FractalFamily};
+        let gpu = GpuHarness::new(384, 256);
+        let parameters = FamilyParameters::default();
+        let family = FractalFamily::BurningShip;
+        let plane = family.default_parameter_view();
+        let uniforms = Uniforms::new(
+            plane.centre,
+            plane.half_height,
+            gpu.aspect(),
+            family.default_parameter(),
+            256,
+            4.0,
+            family.shader_flag(),
+            0,
+            0.0,
+            true,
+            false,
+            true,
+            PrecisionMode::F32,
+            parameters.uniform_words(false),
+        );
+        let direct = gpu.render(0, uniforms, None);
+        let preview_full = gpu.render_preview(0, uniforms, 1);
+        assert_eq!(
+            direct, preview_full,
+            "scale-1 preview must be pixel identical"
+        );
+        let preview_half = gpu.render_preview(0, uniforms, 2);
+        // Compare downsampled: average 4x4 blocks of both images.
+        let (w, h) = (gpu.width as usize, gpu.height as usize);
+        let block = 4;
+        let mut total = 0.0;
+        let mut count = 0;
+        for by in 0..h / block {
+            for bx in 0..w / block {
+                let mut a = [0.0f64; 3];
+                let mut b = [0.0f64; 3];
+                for y in 0..block {
+                    for x in 0..block {
+                        let i = ((by * block + y) * w + bx * block + x) * 3;
+                        for k in 0..3 {
+                            a[k] += direct[i + k] as f64;
+                            b[k] += preview_half[i + k] as f64;
+                        }
+                    }
+                }
+                total += (0..3).map(|k| (a[k] - b[k]).abs()).sum::<f64>() / (block * block) as f64;
+                count += 1;
+            }
+        }
+        let mean_difference = total / count as f64;
+        eprintln!("mean block difference scale 2: {mean_difference:.2}");
+        assert!(
+            mean_difference < 40.0,
+            "half-resolution preview is misaligned: {mean_difference}"
+        );
     }
 }

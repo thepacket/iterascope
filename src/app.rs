@@ -51,6 +51,11 @@ const PROBE_DS_MIN_ZOOM: f64 = 256.0;
 /// Arbitrary-precision reference orbits are extended across frames so a
 /// long, high-precision orbit never freezes the interface.
 const DEEP_REFERENCE_FRAME_BUDGET: Duration = Duration::from_millis(6);
+/// Linear reduction of the render resolution while input is active (a
+/// factor of 3 means one ninth of the fragments) and while a reference orbit
+/// is still being extended.
+const PREVIEW_SCALE_INTERACTING: u32 = 3;
+const PREVIEW_SCALE_BUILDING: u32 = 2;
 
 const BG: egui::Color32 = egui::Color32::from_rgb(10, 13, 18);
 const PANEL: egui::Color32 = egui::Color32::from_rgb(22, 24, 29);
@@ -1505,10 +1510,22 @@ impl App {
         };
         self.f64_reference_active[pane] = deep.is_some() && deep_view.is_none();
         self.deep_active[pane] = deep.is_some();
-        if self.deep_reference_building[pane] {
+        let building = self.deep_reference_building[pane];
+        if building {
             self.deep_reference_building[pane] = false;
             ui.ctx().request_repaint();
         }
+        // Render at reduced resolution while input is active (and, more
+        // mildly, while a reference orbit is still being extended) so each
+        // frame stays cheap and the view follows the input instead of
+        // lurching after long frames. The settled frame renders in full.
+        let preview_scale = if interacting {
+            PREVIEW_SCALE_INTERACTING
+        } else if building {
+            PREVIEW_SCALE_BUILDING
+        } else {
+            1
+        };
 
         let (precision_text, zoom_colour) = if deep.is_some() && deep_view.is_some() {
             ("AP PERT", BLUE)
@@ -1575,8 +1592,14 @@ impl App {
                 data.reference_offset,
             );
         }
-        ui.painter()
-            .add(render::callback(viewport, pane, uniforms, deep));
+        ui.painter().add(render::callback(
+            viewport,
+            pane,
+            uniforms,
+            deep,
+            preview_scale,
+            ui.ctx().pixels_per_point(),
+        ));
 
         if self.family.is_quadratic() && pane == 1 && self.show_orbit_overlay && deep_view.is_none()
         {
