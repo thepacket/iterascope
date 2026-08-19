@@ -4,7 +4,7 @@ use std::time::Duration;
 use web_time::Instant;
 
 use crate::arbitrary::{
-    ARBITRARY_HANDOFF_ZOOM, DeepComplex, DeepState, DeepView, MAX_DECIMAL_ZOOM_EXPONENT,
+    ARBITRARY_HANDOFF_ZOOM, DeepComplex, DeepReal, DeepState, DeepView, MAX_DECIMAL_ZOOM_EXPONENT,
     ReferenceOrbitBuilder,
 };
 use crate::experiment::{
@@ -110,12 +110,27 @@ impl DeepReferenceKey {
 
 struct DeepReferenceCache {
     key: DeepReferenceKey,
+    /// The view the reference was built for; during navigation the same
+    /// orbit is re-described relative to the current view.
+    reference_centre: DeepComplex,
+    reference_half_height: DeepReal,
     data: Arc<DeepRenderData>,
     /// Still-extending builder while the orbit is incomplete.
     builder: Option<ReferenceOrbitBuilder>,
-    scale_mantissa: f32,
-    scale_exponent: i32,
     ds_fallback: bool,
+}
+
+impl DeepReferenceKey {
+    /// Same family, parameters, dynamics and pane — only the view differs.
+    fn same_dynamics(&self, other: &Self) -> bool {
+        self.family == other.family
+            && self.parameters == other.parameters
+            && self.julia_re == other.julia_re
+            && self.julia_im == other.julia_im
+            && self.iterations == other.iterations
+            && self.bailout == other.bailout
+            && self.pane == other.pane
+    }
 }
 
 /// Cache key for the `f64` reference orbit used below the handoff.
@@ -134,6 +149,18 @@ struct F64ReferenceKey {
 struct F64ReferenceCache {
     key: F64ReferenceKey,
     data: Arc<DeepRenderData>,
+}
+
+/// A centred arbitrary-precision reference being built for a view that is
+/// currently served by a re-described older reference.
+struct PendingDeepReference {
+    key: DeepReferenceKey,
+    centre: DeepComplex,
+    half_height: DeepReal,
+    ds_fallback: bool,
+    scale_mantissa: f32,
+    scale_exponent: i32,
+    builder: ReferenceOrbitBuilder,
 }
 
 impl PlaneView {
@@ -221,6 +248,7 @@ pub struct App {
     deep_views: [Option<DeepView>; 2],
     deep_julia_c: Option<DeepComplex>,
     deep_references: [Option<DeepReferenceCache>; 2],
+    deep_pending: [Option<PendingDeepReference>; 2],
     f64_references: [Option<F64ReferenceCache>; 2],
     /// Set during a frame in which a pane's arbitrary-precision reference is
     /// still being extended; the pane then requests another repaint.
@@ -280,6 +308,7 @@ impl App {
             deep_views: [None, None],
             deep_julia_c: None,
             deep_references: [None, None],
+            deep_pending: [None, None],
             f64_references: [None, None],
             deep_reference_building: [false; 2],
             f64_reference_active: [false; 2],
@@ -818,9 +847,9 @@ impl App {
                 let (left, right) = self.pane_labels();
                 ui.label(
                     egui::RichText::new(if parameter_dynamical {
-                        "Click: centre + ×2 zoom"
+                        "Click: centre + ×2 zoom · right-click: centre only"
                     } else {
-                        "Overview click: select the point + open detail"
+                        "Overview click: select the point + open detail · right-click: centre only"
                     })
                     .color(TEXT),
                 );
@@ -864,7 +893,7 @@ impl App {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Buttons and arrow keys pan by 1/10 of the displayed range. Hover a pane or select its target above.",
+                        "Buttons and arrow keys pan by 1/10 of the displayed range (Shift + arrows: 1/100). Hover a pane or select its target above.",
                     )
                     .small()
                     .color(MUTED),
@@ -1226,18 +1255,23 @@ impl App {
             fine_pan = self.pending_pan_steps;
             self.pending_pan_steps = [0.0; 2];
             if !ui.ctx().egui_wants_keyboard_input() {
-                let keyboard_pan = ui.input(|input| {
-                    [
-                        (input.key_pressed(egui::Key::ArrowRight) as i8
-                            - input.key_pressed(egui::Key::ArrowLeft) as i8)
-                            as f64,
-                        (input.key_pressed(egui::Key::ArrowUp) as i8
-                            - input.key_pressed(egui::Key::ArrowDown) as i8)
-                            as f64,
-                    ]
+                // Arrow keys pan by 1/10 of the view; with Shift held by 1/100.
+                let (keyboard_pan, fine) = ui.input(|input| {
+                    (
+                        [
+                            (input.key_pressed(egui::Key::ArrowRight) as i8
+                                - input.key_pressed(egui::Key::ArrowLeft) as i8)
+                                as f64,
+                            (input.key_pressed(egui::Key::ArrowUp) as i8
+                                - input.key_pressed(egui::Key::ArrowDown) as i8)
+                                as f64,
+                        ],
+                        input.modifiers.shift,
+                    )
                 });
-                fine_pan[0] += keyboard_pan[0];
-                fine_pan[1] += keyboard_pan[1];
+                let step = if fine { 0.1 } else { 1.0 };
+                fine_pan[0] += keyboard_pan[0] * step;
+                fine_pan[1] += keyboard_pan[1] * step;
             }
         }
         if fine_pan != [0.0; 2] {
@@ -1295,7 +1329,9 @@ impl App {
                 self.zoom_pane(pane, accelerate_zoom_factor(factor, accelerated));
             }
         }
-        if response.clicked() && !response.dragged() {
+        let primary_click = response.clicked() && !response.dragged();
+        let secondary_click = response.secondary_clicked() && !response.dragged();
+        if primary_click || secondary_click {
             if let Some(position) = response.interact_pointer_pos() {
                 interacting = true;
                 if pane == 1 {
@@ -1303,14 +1339,23 @@ impl App {
                     self.progressive_julia_next_stage_at = None;
                 }
                 let accelerated = ui.input(|input| input.modifiers.shift);
+                // A secondary (right) click recentres without zooming, so a
+                // region can be framed precisely before magnifying it.
+                let click_zoom = if secondary_click {
+                    1.0
+                } else {
+                    accelerate_zoom_factor(0.5, accelerated)
+                };
                 let overview_detail = self.family.linkage() == Linkage::OverviewDetail;
                 if let Some(deep) = &mut self.deep_views[pane] {
                     // Deep navigation: recentre and zoom in arbitrary precision.
                     let local = local_coordinate(viewport, position);
                     let _ = deep.recenter_local(local);
                     if overview_detail {
-                        self.selected_z = deep.centre_preview();
-                        if pane == 0 {
+                        if pane == 0 && secondary_click {
+                            // Recentre the overview only.
+                        } else if pane == 0 {
+                            self.selected_z = deep.centre_preview();
                             // Open a linked detail region around the selected
                             // point at the same depth plus one more decade.
                             let mut detail = deep.clone();
@@ -1318,10 +1363,11 @@ impl App {
                             self.deep_views[1] = Some(detail);
                             self.zoom_focus[1] = None;
                         } else {
-                            let _ = deep.zoom(accelerate_zoom_factor(0.5, accelerated));
+                            self.selected_z = deep.centre_preview();
+                            let _ = deep.zoom(click_zoom);
                         }
                     } else {
-                        let _ = deep.zoom(accelerate_zoom_factor(0.5, accelerated));
+                        let _ = deep.zoom(click_zoom);
                         if pane == 0 {
                             self.deep_julia_c = Some(deep.centre.clone());
                             self.julia_c = deep.centre_preview();
@@ -1335,8 +1381,12 @@ impl App {
                     } else {
                         self.dynamical.point_at(viewport, position)
                     };
-                    self.selected_z = point;
-                    if pane == 0 {
+                    if pane == 0 && secondary_click {
+                        // Recentre the overview only.
+                        self.parameter.centre = point;
+                        self.zoom_focus[0] = None;
+                    } else if pane == 0 {
+                        self.selected_z = point;
                         self.dynamical.centre = point;
                         self.dynamical.half_height = (self.parameter.half_height * 0.22)
                             .clamp(1.45 / ARBITRARY_HANDOFF_ZOOM, 1e6);
@@ -1344,9 +1394,10 @@ impl App {
                         self.zoom_focus[0] = Some(point);
                         self.zoom_focus[1] = None;
                     } else {
+                        self.selected_z = point;
                         self.dynamical.centre = point;
                         self.zoom_focus[1] = Some(point);
-                        self.zoom_pane(1, accelerate_zoom_factor(0.5, accelerated));
+                        self.zoom_pane(1, click_zoom);
                     }
                 } else {
                     let point = if pane == 0 {
@@ -1359,22 +1410,23 @@ impl App {
                         self.julia_c = point;
                         self.deep_julia_c = None;
                         self.parameter.centre = point;
-                        self.zoom_pane(0, accelerate_zoom_factor(0.5, accelerated));
+                        self.zoom_pane(0, click_zoom);
                         if let Some(deep) = &self.deep_views[0] {
                             self.deep_julia_c = Some(deep.centre.clone());
                         }
                         self.reframe_dynamical_plane();
                     } else {
                         self.dynamical.centre = point;
-                        self.zoom_pane(1, accelerate_zoom_factor(0.5, accelerated));
+                        self.zoom_pane(1, click_zoom);
                     }
                 }
             }
         }
         if interacting {
-            // Deep navigation deliberately retains the previous completed
-            // image while input is active. Schedule exactly one settled frame
-            // so its replacement reference can be built after input stops.
+            // While input is active a deep view is rendered around its
+            // existing reference orbit, re-described for the moved view.
+            // Schedule exactly one settled frame so the centred replacement
+            // reference can start building after input stops.
             ui.ctx().request_repaint();
         }
 
@@ -1565,6 +1617,7 @@ impl App {
         self.deep_views = [None, None];
         self.deep_julia_c = None;
         self.deep_references = [None, None];
+        self.deep_pending = [None, None];
         self.f64_references = [None, None];
         self.f64_reference_active = [false; 2];
         self.deep_active = [false; 2];
@@ -1785,10 +1838,15 @@ impl App {
         Some(data)
     }
 
-    /// Arbitrary-precision reference orbit for a deep view. Orbits are built
-    /// incrementally under a per-frame time budget; while incomplete the GPU
-    /// renders with the points available so far (pixels beyond the available
-    /// length continue in f32) and the pane requests another repaint.
+    /// Arbitrary-precision reference orbit for a deep view.
+    ///
+    /// Orbits are built incrementally under a per-frame time budget; while
+    /// incomplete the GPU renders with the points available so far (pixels
+    /// beyond the available length continue in f32) and the pane requests
+    /// another repaint. While the view moves, the existing orbit is simply
+    /// re-described relative to the new view (perturbation does not need a
+    /// centred reference), so navigation is immediate; a fresh centred
+    /// reference is rebuilt once input settles and swapped in when complete.
     fn deep_reference(
         &mut self,
         pane: usize,
@@ -1808,21 +1866,97 @@ impl App {
             self.iterations,
             self.bailout,
         );
-        let matches = self.deep_references[pane]
+        let (scale_mantissa, scale_exponent) = view.half_height.scaled_f32();
+        let ds_fallback =
+            view.magnification_log10 <= ARBITRARY_HANDOFF_ZOOM.log10() + f64::EPSILON * 8.0;
+
+        let same_view = self.deep_references[pane]
             .as_ref()
             .is_some_and(|cached| cached.key == key);
-        if !matches {
+        let reusable = !same_view
+            && self.deep_references[pane]
+                .as_ref()
+                .is_some_and(|cached| cached.key.same_dynamics(&key));
+        if reusable {
+            // Re-describe the existing orbit for the new view: offset of the
+            // reference point from the new centre, in local units.
+            let cached = self.deep_references[pane].as_ref().unwrap();
+            let scale = view.half_height.with_zoom_exponent(view.zoom_exponent);
+            let dx = cached
+                .reference_centre
+                .re
+                .with_zoom_exponent(view.zoom_exponent)
+                .sub(&view.centre.re)
+                .div(&scale)
+                .to_f64();
+            let dy = cached
+                .reference_centre
+                .im
+                .with_zoom_exponent(view.zoom_exponent)
+                .sub(&view.centre.im)
+                .div(&scale)
+                .to_f64();
+            let ratio = cached.reference_half_height.to_f64() / view.half_height.to_f64();
+            let offset_ok = dx.is_finite()
+                && dy.is_finite()
+                && dx.abs() < 64.0
+                && dy.abs() < 64.0
+                && ratio.is_finite()
+                && (1e-6..=1e6).contains(&ratio);
+            if offset_ok {
+                let redescribed = Arc::new(cached.data.redescribed(
+                    scale_mantissa,
+                    scale_exponent,
+                    [dx as f32, dy as f32],
+                    ds_fallback,
+                ));
+                if !may_build {
+                    return Some(redescribed);
+                }
+                // Settled on a new view: keep serving the re-described orbit
+                // while a fresh centred reference is built for this view.
+                let pending_matches = self.deep_pending[pane]
+                    .as_ref()
+                    .is_some_and(|pending| pending.key == key);
+                if !pending_matches {
+                    let dynamical = self.pane_is_dynamical(pane);
+                    let initial =
+                        DeepState::initial(self.family, &view.centre, dynamical, &julia_c).ok()?;
+                    let builder = ReferenceOrbitBuilder::new(
+                        self.family,
+                        &self.family_parameters,
+                        initial,
+                        self.iterations,
+                        self.bailout as f64,
+                    )
+                    .ok()?;
+                    self.deep_pending[pane] = Some(PendingDeepReference {
+                        key,
+                        centre: view.centre.clone(),
+                        half_height: view.half_height.clone(),
+                        ds_fallback,
+                        scale_mantissa,
+                        scale_exponent,
+                        builder,
+                    });
+                }
+                self.advance_pending_reference(pane);
+                if self.deep_pending[pane].is_none() {
+                    // The centred reference completed within budget.
+                    let cached = self.deep_references[pane].as_ref()?;
+                    return Some(Arc::clone(&cached.data));
+                }
+                return Some(redescribed);
+            }
+        }
+
+        if !same_view {
             if !may_build {
                 // Keep the last completed deep frame on screen while navigation
                 // changes and a replacement reference orbit is not ready yet.
-                // Returning `None` here exposes the frozen DS handoff snapshot,
-                // which appears as a distracting 1.14e14× flash.
                 if let Some(cached) = &self.deep_references[pane] {
                     return Some(Arc::clone(&cached.data));
                 }
-                // On the first transition there is no deep frame to retain.
-                // Start building so the previously presented shallow frame
-                // stays visible until the first AP frame can replace it.
             }
             let dynamical = self.pane_is_dynamical(pane);
             let initial =
@@ -1835,9 +1969,6 @@ impl App {
                 self.bailout as f64,
             )
             .ok()?;
-            let (scale_mantissa, scale_exponent) = view.half_height.scaled_f32();
-            let ds_fallback =
-                view.magnification_log10 <= ARBITRARY_HANDOFF_ZOOM.log10() + f64::EPSILON * 8.0;
             self.deep_generation = self.deep_generation.wrapping_add(1).max(1);
             let data = Arc::new(DeepRenderData::from_points(
                 self.deep_generation,
@@ -1846,18 +1977,20 @@ impl App {
                 &builder.points,
                 ds_fallback,
             ));
+            self.deep_pending[pane] = None;
             self.deep_references[pane] = Some(DeepReferenceCache {
                 key,
+                reference_centre: view.centre.clone(),
+                reference_half_height: view.half_height.clone(),
                 data,
                 builder: Some(builder),
-                scale_mantissa,
-                scale_exponent,
                 ds_fallback,
             });
         }
+        // Extend the current orbit (and any pending replacement) under budget.
+        self.advance_pending_reference(pane);
         let cached = self.deep_references[pane].as_mut()?;
         if let Some(builder) = cached.builder.as_mut() {
-            // Extend the orbit for at most a few milliseconds per frame.
             let start = Instant::now();
             let mut complete = builder.is_complete();
             while !complete && start.elapsed() < DEEP_REFERENCE_FRAME_BUDGET {
@@ -1866,8 +1999,8 @@ impl App {
             self.deep_generation = self.deep_generation.wrapping_add(1).max(1);
             cached.data = Arc::new(DeepRenderData::from_points(
                 self.deep_generation,
-                cached.scale_mantissa,
-                cached.scale_exponent,
+                cached.data.scale_mantissa,
+                cached.data.scale_exponent,
                 &builder.points,
                 cached.ds_fallback,
             ));
@@ -1878,6 +2011,40 @@ impl App {
             }
         }
         Some(Arc::clone(&cached.data))
+    }
+
+    /// Advances the pending centred reference for a pane under the frame
+    /// budget and swaps it into the cache once complete.
+    fn advance_pending_reference(&mut self, pane: usize) {
+        let Some(pending) = self.deep_pending[pane].as_mut() else {
+            return;
+        };
+        let start = Instant::now();
+        let mut complete = pending.builder.is_complete();
+        while !complete && start.elapsed() < DEEP_REFERENCE_FRAME_BUDGET {
+            complete = pending.builder.advance(64);
+        }
+        if complete {
+            let pending = self.deep_pending[pane].take().unwrap();
+            self.deep_generation = self.deep_generation.wrapping_add(1).max(1);
+            let data = Arc::new(DeepRenderData::from_points(
+                self.deep_generation,
+                pending.scale_mantissa,
+                pending.scale_exponent,
+                &pending.builder.points,
+                pending.ds_fallback,
+            ));
+            self.deep_references[pane] = Some(DeepReferenceCache {
+                key: pending.key,
+                reference_centre: pending.centre,
+                reference_half_height: pending.half_height,
+                data,
+                builder: None,
+                ds_fallback: pending.ds_fallback,
+            });
+        } else {
+            self.deep_reference_building[pane] = true;
+        }
     }
 
     fn draw_focus_marker(

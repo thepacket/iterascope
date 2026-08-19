@@ -118,14 +118,15 @@ from it.
   `ITERASCOPE_RENDER_DIR=out cargo test --release <name> -- --ignored`
 - Pointwise Newton diagnostics reporting the attracting root, iteration count,
   polynomial residual, final value, last step and derivative singularities
-- Click-to-centre 2× zoom; parameter-plane clicks also select the Julia parameter
+- Click-to-centre 2× zoom; parameter-plane clicks also select the Julia
+  parameter; right-click recentres without zooming
 - Wheel, trackpad pinch and drag navigation in either plane
 - Shift-modified click, wheel or pinch for accelerated logarithmic zoom in
   either direction
 - Automatic progressive Julia navigation to a selected `10^n` target, up to
   `10^5000×`, with visible intermediate renders and Start/Stop controls
 - Keyboard arrows and four on-screen buttons for deterministic fine panning by
-  one tenth of the displayed range
+  one tenth of the displayed range (Shift + arrows: one hundredth)
 - Adjustable iteration limit up to 50,000, bailout, palette phase and smooth colouring
 - Optional interior shading of bounded orbits by the minimum modulus they
   reach (an orbit trap at the origin), exposing basin structure without
@@ -151,11 +152,14 @@ from it.
 ## Using the laboratory
 
 Click a point in either plane to make it the centre and immediately zoom by
-2×. Clicking in the parameter plane additionally sets `c`, so the Julia plane
-on the right updates to the corresponding dynamical system. Drag to pan, use
-the wheel or trackpad to zoom, or select a **Fine pan target** and use the arrow
-keys or `< ^ v >` controls. Each fine-pan step moves exactly one tenth of the
-currently displayed horizontal or vertical range.
+2×; right-click to make it the centre without zooming, which is the way to
+frame a region precisely before magnifying it. Clicking in the parameter
+plane additionally sets `c`, so the Julia plane on the right updates to the
+corresponding dynamical system. Drag to pan, use the wheel or trackpad to
+zoom, or select a **Fine pan target** and use the arrow keys or `< ^ v >`
+controls. Each fine-pan step moves exactly one tenth of the currently
+displayed horizontal or vertical range; holding Shift with the arrow keys
+moves one hundredth.
 
 The **Critical orbit** section computes
 
@@ -265,7 +269,11 @@ that do continue in plain `f32` from their already-separated state).
 Arbitrary-precision references are extended across frames under a 6 ms
 budget: the GPU renders with the points available so far and refines as the
 orbit grows, instead of freezing the interface for a long high-precision
-orbit. The delta recurrence itself runs in plain `f32` below the handoff and
+orbit. While a deep view is being dragged, zoomed or stepped, its existing
+reference orbit is kept and merely re-described relative to the moved view
+(perturbation does not require a centred reference), so the image follows
+the input immediately; a fresh centred reference is built once input
+settles and swapped in when complete. The delta recurrence itself runs in plain `f32` below the handoff and
 in scaled mantissa/exponent arithmetic only at arbitrary-precision depth;
 the two are instantiated from one template at shader-load time.
 

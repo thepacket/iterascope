@@ -263,7 +263,9 @@ pub(crate) struct DeepRenderData {
     pub(crate) generation: u64,
     pub(crate) scale_mantissa: f32,
     pub(crate) scale_exponent: i32,
-    pub(crate) reference: Vec<GpuReferencePoint>,
+    /// Shared so a reference can be re-described (new scale, new offset)
+    /// without copying or re-uploading its points.
+    pub(crate) reference: Arc<Vec<GpuReferencePoint>>,
     pub(crate) ds_fallback: bool,
     /// Reference point relative to the view centre in shader local units.
     pub(crate) reference_offset: [f32; 2],
@@ -285,10 +287,32 @@ impl DeepRenderData {
             generation,
             scale_mantissa: mantissa,
             scale_exponent: exponent,
-            reference: points
-                .iter()
-                .map(|point| GpuReferencePoint::new(*point))
-                .collect(),
+            reference: Arc::new(
+                points
+                    .iter()
+                    .map(|point| GpuReferencePoint::new(*point))
+                    .collect(),
+            ),
+            ds_fallback,
+            reference_offset,
+        }
+    }
+
+    /// The same reference orbit described for another view: new pixel scale
+    /// and the reference point's offset from the new centre. Keeps the
+    /// generation so the GPU does not re-upload the points.
+    pub(crate) fn redescribed(
+        &self,
+        scale_mantissa: f32,
+        scale_exponent: i32,
+        reference_offset: [f32; 2],
+        ds_fallback: bool,
+    ) -> Self {
+        Self {
+            generation: self.generation,
+            scale_mantissa,
+            scale_exponent,
+            reference: Arc::clone(&self.reference),
             ds_fallback,
             reference_offset,
         }
@@ -305,10 +329,12 @@ impl DeepRenderData {
             generation,
             scale_mantissa,
             scale_exponent,
-            reference: points
-                .iter()
-                .map(|point| GpuReferencePoint::new([point.re.to_f64(), point.im.to_f64()]))
-                .collect(),
+            reference: Arc::new(
+                points
+                    .iter()
+                    .map(|point| GpuReferencePoint::new([point.re.to_f64(), point.im.to_f64()]))
+                    .collect(),
+            ),
             ds_fallback,
             reference_offset: [0.0; 2],
         }
@@ -485,7 +511,7 @@ impl CallbackTrait for FractalCallback {
                     queue.write_buffer(
                         &pane.reference_buffer,
                         0,
-                        bytemuck::cast_slice(&deep.reference),
+                        bytemuck::cast_slice(deep.reference.as_slice()),
                     );
                     *uploaded = Some(deep.generation);
                 }
@@ -1107,7 +1133,8 @@ mod tests {
                     true,
                     [0.0; 2],
                 );
-                let perturbed = gpu.render(pane, perturbed_uniforms, Some(&data.reference));
+                let perturbed =
+                    gpu.render(pane, perturbed_uniforms, Some(data.reference.as_slice()));
                 // The same view through the f64 reference used below the handoff.
                 let f64_orbit = crate::family::reference_orbit_f64(
                     family,
@@ -1151,7 +1178,8 @@ mod tests {
                     true,
                     [0.0; 2],
                 );
-                let f64_perturbed = gpu.render(pane, f64_uniforms, Some(&f64_data.reference));
+                let f64_perturbed =
+                    gpu.render(pane, f64_uniforms, Some(f64_data.reference.as_slice()));
                 // And once more around an off-centre reference point; the
                 // image must not depend on where the reference sits.
                 let offset = [0.31f32, -0.22f32];
@@ -1201,8 +1229,19 @@ mod tests {
                     true,
                     offset,
                 );
-                let offset_perturbed =
-                    gpu.render(pane, offset_uniforms, Some(&offset_data.reference));
+                let offset_perturbed = gpu.render(
+                    pane,
+                    offset_uniforms,
+                    Some(offset_data.reference.as_slice()),
+                );
+                // Same off-centre reference through the scaled instantiation.
+                let mut scaled_offset_uniforms = offset_uniforms;
+                scaled_offset_uniforms.deep[0] = 2.0;
+                let scaled_offset_perturbed = gpu.render(
+                    pane,
+                    scaled_offset_uniforms,
+                    Some(offset_data.reference.as_slice()),
+                );
 
                 let pixels = (gpu.width * gpu.height) as usize;
                 let mut differing = 0usize;
@@ -1235,6 +1274,17 @@ mod tests {
                     }
                 }
                 let offset_fraction = offset_differing as f64 / pixels as f64;
+                let scaled_offset_differing = scaled_offset_perturbed
+                    .chunks(3)
+                    .zip(f64_perturbed.chunks(3))
+                    .filter(|(a, b)| {
+                        (0..3)
+                            .map(|k| (a[k] as i32 - b[k] as i32).abs())
+                            .sum::<i32>()
+                            > 60
+                    })
+                    .count();
+                let scaled_offset_fraction = scaled_offset_differing as f64 / pixels as f64;
                 let distinct_ds: std::collections::HashSet<&[u8]> = ds.chunks(3).collect();
                 let distinct_perturbed: std::collections::HashSet<&[u8]> =
                     perturbed.chunks(3).collect();
@@ -1242,13 +1292,14 @@ mod tests {
                     collapsed.push(format!("{family:?} pane {pane}"));
                 }
                 report.push(format!(
-                    "{:26} pane {pane}: reference {} points (ends {:?}), DS vs AP {:.2}%, f64 vs AP {:.2}%, off-centre vs centred {:.2}% pixels differ",
+                    "{:26} pane {pane}: reference {} points (ends {:?}), DS vs AP {:.2}%, f64 vs AP {:.2}%, off-centre vs centred {:.2}% (scaled {:.2}%) pixels differ",
                     format!("{family:?}"),
                     orbit.points.len(),
                     orbit.escape_iteration,
                     100.0 * fraction,
                     100.0 * f64_fraction,
-                    100.0 * offset_fraction
+                    100.0 * offset_fraction,
+                    100.0 * scaled_offset_fraction
                 ));
                 if let Some(directory) = &directory {
                     let stem = format!(
@@ -1550,7 +1601,7 @@ mod tests {
                 false,
                 [0.0; 2],
             );
-            let rgb = gpu.render(pane, uniforms, Some(&data.reference));
+            let rgb = gpu.render(pane, uniforms, Some(data.reference.as_slice()));
             let distinct: std::collections::HashSet<&[u8]> = rgb.chunks(3).collect();
             report.push(format!(
                 "{:26} at 1e{zoom_exponent}: centre {:?}, reference {} points (ends {:?}), {} distinct colours",
