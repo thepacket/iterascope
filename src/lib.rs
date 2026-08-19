@@ -9,6 +9,7 @@
 //! independent outside/inside colouring algorithms — whose settings and
 //! rasterised gradient the shader reads alongside the view uniforms.
 
+mod animation;
 mod app;
 pub mod arbitrary;
 mod colouring;

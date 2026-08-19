@@ -140,6 +140,12 @@ from it.
   distance estimate is evaluated in logarithms and verified at `1e4000×`
   (Ultra Fractal 5's limit; IteraScope navigates to `1e5000×`)
 - Optional scale-aware coordinate grid
+- Zoom-path animation: a dive to the current centre between two magnification
+  exponents at constant or eased logarithmic speed, with an optional gradient
+  sweep, exported (native app) as a PNG image sequence at up to 8192×8192 and
+  optionally encoded to MP4 with ffmpeg. One reference orbit serves every
+  frame — the arbitrary-precision orbit of the centre is re-described per
+  frame, so a `10^1000×` dive costs one orbit, not one per frame
 - Live magnification plus navigation, rendered-coordinate, rounding-delta and
   pixel-scale readouts
 - Versioned JSON experiment documents with cross-platform copy/paste import and export
@@ -168,6 +174,22 @@ zoom, or select a **Fine pan target** and use the arrow keys or `< ^ v >`
 controls. Each fine-pan step moves exactly one tenth of the currently
 displayed horizontal or vertical range; holding Shift with the arrow keys
 moves one hundredth.
+
+### Animation
+
+The **Animation** section renders the classic deep-zoom video: a dive to the
+active pane's centre, from a start to an end magnification exponent (defaults:
+`10^0` to the current view via **End = view**) at constant logarithmic speed,
+optionally eased at both ends, with an optional constant-speed gradient sweep.
+The exporter writes `frame-00000.png …` at the chosen resolution and frame
+rate into a new directory under the configured folder, one frame per UI
+update so the interface stays live, and — when ffmpeg is installed — encodes
+`zoom.mp4` when the sequence completes. Because the centre is fixed, the
+arbitrary-precision reference orbit is computed once and re-described in
+scale for every frame; frames below the `1.14e14×` handoff use the same orbit
+projected to `f64`, and the switch between the paths is seamless. Export runs
+in the native application; the browser build shows the settings but cannot
+write files.
 
 ### Colouring
 
@@ -437,8 +459,9 @@ perturbation-versus-double-single-versus-CPU comparison, deep-zoom structure
 at `1e30×`, preview-blit and pan consistency, a gallery of every colouring
 algorithm at the default view and around an `f64` reference at `1e12×`, the
 iteration, distance, stripe and triangle colourings around an
-arbitrary-precision reference at `1e4000×`, and a timing probe that also
-records the cost of the orbit-statistics variant:
+arbitrary-precision reference at `1e4000×`, a five-frame zoom-path export
+crossing every precision path at a row-padded width, and a timing probe that
+also records the cost of the orbit-statistics variant:
 
 ```sh
 ITERASCOPE_RENDER_DIR=out cargo test --release gpu_ -- --ignored --nocapture
@@ -469,10 +492,11 @@ live state is changed.
 5. Orbit probes for the non-quadratic escape-time families, and
    arbitrary-precision exponential/trigonometric reference orbits so the
    transcendental families can join the deep-zoom path
-6. Towards generative fractal art: zoom-path animation with image-sequence
-   export, then layers with merge modes and masks over the single composited
-   image; orbit-trap options that skip the shared leading iterations of deep
-   orbits; derivatives for the remaining families' distance estimates
+6. Towards generative fractal art: layers with merge modes and masks over a
+   single composited image (zoom-path animation and image-sequence export
+   landed); keyframed centre drift and per-parameter animation curves;
+   orbit-trap options that skip the shared leading iterations of deep orbits;
+   derivatives for the remaining families' distance estimates
 
 ## Project status
 

@@ -3,6 +3,9 @@ use std::time::Duration;
 
 use web_time::Instant;
 
+use crate::animation::{self, ZoomAnimation};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::arbitrary::ReferenceOrbit;
 use crate::arbitrary::{
     ARBITRARY_HANDOFF_ZOOM, DeepComplex, DeepReal, DeepState, DeepView, MAX_DECIMAL_ZOOM_EXPONENT,
     ReferenceOrbitBuilder,
@@ -27,6 +30,8 @@ use crate::precision::{
     DoubleSingle, DsValidity, PathProbeResult, PrecisionMode, ProbeCache, ProbeInput, ProbeResult,
     ValidityLevel,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use crate::render::GpuReferencePoint;
 use crate::render::{
     self, ColouringUniforms, DeepRenderData, FractalPipeline, GradientTable, Uniforms,
 };
@@ -250,6 +255,14 @@ pub struct App {
     gradient_import_text: String,
     gradient_message: Option<(String, bool)>,
     gradient_random_seed: u64,
+    render_state: eframe::egui_wgpu::RenderState,
+    animation: ZoomAnimation,
+    export_directory: String,
+    #[cfg(not(target_arch = "wasm32"))]
+    export: Option<ExportJob>,
+    #[cfg(not(target_arch = "wasm32"))]
+    export_generation: u64,
+    export_message: Option<(String, bool)>,
     zoom_focus: [Option<[f64; 2]>; 2],
     active_pane: usize,
     pending_pan_steps: [f64; 2],
@@ -315,6 +328,14 @@ impl App {
             gradient_import_text: String::new(),
             gradient_message: None,
             gradient_random_seed: 1,
+            render_state: render_state.clone(),
+            animation: ZoomAnimation::default(),
+            export_directory: default_export_directory(),
+            #[cfg(not(target_arch = "wasm32"))]
+            export: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            export_generation: 0,
+            export_message: None,
             zoom_focus: [None, None],
             active_pane: 0,
             pending_pan_steps: [0.0; 2],
@@ -848,6 +869,8 @@ impl App {
             });
 
             section(ui, "Colouring", |ui| self.colouring_controls(ui));
+
+            section(ui, "Animation", |ui| self.animation_controls(ui));
 
             section(ui, "Navigation", |ui| {
                 let parameter_dynamical = self.family.linkage() == Linkage::ParameterDynamical;
@@ -2027,6 +2050,391 @@ impl App {
         }
     }
 
+    fn animation_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "A zoom dive to the current view's centre: the magnification moves between the start and end exponents at constant (optionally eased) logarithmic speed. One reference orbit serves every frame.",
+            )
+            .small()
+            .color(MUTED),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.animation.duration_seconds, 1.0..=180.0)
+                .logarithmic(true)
+                .text("duration s"),
+        );
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("iterascope.animation.fps")
+                .selected_text(format!("{} fps", self.animation.fps))
+                .width(76.0)
+                .show_ui(ui, |ui| {
+                    for fps in [24u32, 25, 30, 50, 60] {
+                        ui.selectable_value(&mut self.animation.fps, fps, format!("{fps} fps"));
+                    }
+                });
+            ui.add(
+                egui::DragValue::new(&mut self.animation.width)
+                    .range(16..=animation::MAX_DIMENSION)
+                    .speed(8),
+            );
+            ui.label("×");
+            ui.add(
+                egui::DragValue::new(&mut self.animation.height)
+                    .range(16..=animation::MAX_DIMENSION)
+                    .speed(8),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("magnification 10^").color(MUTED));
+            ui.add(
+                egui::DragValue::new(&mut self.animation.start_magnification_log10)
+                    .range(-3.0..=MAX_DECIMAL_ZOOM_EXPONENT as f64)
+                    .speed(0.25)
+                    .fixed_decimals(2),
+            );
+            ui.label("→ 10^");
+            ui.add(
+                egui::DragValue::new(&mut self.animation.end_magnification_log10)
+                    .range(-3.0..=MAX_DECIMAL_ZOOM_EXPONENT as f64)
+                    .speed(0.25)
+                    .fixed_decimals(2),
+            );
+            if ui
+                .button("End = view")
+                .on_hover_text("Set the end magnification to the active pane's current zoom")
+                .clicked()
+            {
+                self.animation.end_magnification_log10 = self.magnification_log10(self.active_pane);
+            }
+        });
+        ui.checkbox(&mut self.animation.ease, "Ease in and out");
+        ui.add(
+            egui::Slider::new(&mut self.animation.gradient_sweep_turns, -4.0..=4.0)
+                .text("gradient sweep (turns)"),
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.animation_export_controls(ui);
+        }
+        #[cfg(target_arch = "wasm32")]
+        ui.label(
+            egui::RichText::new("Image-sequence export runs in the native application.")
+                .small()
+                .color(CREAM),
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn animation_export_controls(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(
+            &mut self.animation.encode_video,
+            "Encode MP4 with ffmpeg (if installed)",
+        );
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Into").color(MUTED));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.export_directory).desired_width(f32::INFINITY),
+            );
+        });
+        if let Some(job) = &self.export {
+            let total = job.animation.frame_count();
+            let done = job.next_frame;
+            let elapsed = job.started.elapsed().as_secs_f64();
+            let remaining = if done > 0 {
+                format!(
+                    " · ~{:.0} s left",
+                    elapsed / done as f64 * (total - done) as f64
+                )
+            } else {
+                String::new()
+            };
+            ui.add(
+                egui::ProgressBar::new(done as f32 / total as f32)
+                    .text(format!("frame {done}/{total}{remaining}")),
+            );
+            if ui.button("Cancel").clicked() {
+                self.export = None;
+                self.export_message = Some(("Export cancelled".to_owned(), true));
+            }
+        } else {
+            let frames = self.animation.frame_count();
+            ui.label(
+                egui::RichText::new(format!(
+                    "{frames} frames at {}×{}",
+                    self.animation.width, self.animation.height
+                ))
+                .small()
+                .color(MUTED),
+            );
+            if ui.button("Render image sequence").clicked() {
+                self.start_export();
+            }
+        }
+        if let Some((message, error)) = &self.export_message {
+            let colour = if *error { CORAL } else { BLUE };
+            ui.label(egui::RichText::new(message).color(colour));
+        }
+    }
+
+    /// Freezes the current view, dynamics and colouring into an export job
+    /// and builds its reference orbit. The centre never moves during the
+    /// animation, so the orbit of the (deep) centre serves every frame:
+    /// re-described in scale for arbitrary-precision frames, projected to
+    /// `f64` for frames below the handoff.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_export(&mut self) {
+        if self.export.is_some() {
+            return;
+        }
+        self.export_message = None;
+        let mut animation = self.animation.clone();
+        // Video encoders want even dimensions.
+        animation.width &= !1;
+        animation.height &= !1;
+        if let Err(error) = animation.validate() {
+            self.export_message = Some((error, true));
+            return;
+        }
+        let pane = self.active_pane;
+        let dynamical = self.pane_is_dynamical(pane);
+        let current = self.magnification_log10(pane);
+        let mut clamped = false;
+        for target in [
+            &mut animation.start_magnification_log10,
+            &mut animation.end_magnification_log10,
+        ] {
+            if *target > current + 1e-9 {
+                *target = current;
+                clamped = true;
+            }
+        }
+
+        self.export_generation += 1;
+        let base = self.export_generation * 4;
+        let mut ap_reference = None;
+        let f64_points;
+        let centre;
+        if let Some(view) = &self.deep_views[pane] {
+            let julia_c = self.deep_julia_c.clone().unwrap_or_else(|| {
+                DeepComplex::from_f64(self.julia_c, view.zoom_exponent)
+                    .expect("finite Julia parameter")
+            });
+            let initial = match DeepState::initial(self.family, &view.centre, dynamical, &julia_c) {
+                Ok(initial) => initial,
+                Err(error) => {
+                    self.export_message = Some((error, true));
+                    return;
+                }
+            };
+            let orbit = match ReferenceOrbit::family(
+                self.family,
+                &self.family_parameters,
+                initial,
+                self.iterations,
+                self.bailout as f64,
+            ) {
+                Ok(orbit) => orbit,
+                Err(error) => {
+                    self.export_message = Some((error, true));
+                    return;
+                }
+            };
+            centre = view.centre_preview();
+            f64_points = orbit
+                .points
+                .iter()
+                .map(|point| [point.re.to_f64(), point.im.to_f64()])
+                .collect::<Vec<_>>();
+            ap_reference = Some((
+                base + 1,
+                Arc::clone(
+                    &DeepRenderData::from_points(base + 1, 1.0, 0, &orbit.points, false).reference,
+                ),
+            ));
+        } else {
+            centre = if pane == 0 {
+                self.parameter.centre
+            } else {
+                self.dynamical.centre
+            };
+            if self.family.supports_deep_zoom() {
+                f64_points = reference_orbit_f64(
+                    self.family,
+                    &self.family_parameters,
+                    initial_state_with(self.family, centre, dynamical, self.julia_c),
+                    self.iterations,
+                    self.bailout as f64,
+                )
+                .points;
+            } else {
+                f64_points = Vec::new();
+            }
+        }
+        let f64_reference = (!f64_points.is_empty()).then(|| {
+            (
+                base + 2,
+                Arc::clone(
+                    &DeepRenderData::from_f64_orbit(base + 2, 1.0, &f64_points, true, [0.0; 2])
+                        .reference,
+                ),
+            )
+        });
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let directory = std::path::PathBuf::from(self.export_directory.trim())
+            .join(format!("zoom-{}-{stamp}", self.family.document_id()));
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            self.export_message = Some((format!("cannot create {directory:?}: {error}"), true));
+            return;
+        }
+
+        self.export = Some(ExportJob {
+            gradient: Arc::new(GradientTable::new(base + 3, &self.colouring.gradient)),
+            colouring: self.colouring.clone(),
+            animation,
+            family: self.family,
+            dynamical,
+            family_words: self.family_parameters.uniform_words(dynamical),
+            iterations: self.iterations,
+            bailout: self.bailout,
+            julia_c: self.julia_c,
+            centre,
+            ap_reference,
+            f64_reference,
+            directory,
+            next_frame: 0,
+            started: Instant::now(),
+        });
+        if clamped {
+            self.export_message = Some((
+                "Magnification clamped to the current view (zoom further first to go deeper)"
+                    .to_owned(),
+                false,
+            ));
+        }
+    }
+
+    /// Renders one export frame per UI update so the interface stays
+    /// responsive; the export pane's GPU resources are separate from the
+    /// interactive panes'.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn advance_export(&mut self, ctx: &egui::Context) {
+        let device = self.render_state.device.clone();
+        let queue = self.render_state.queue.clone();
+        let renderer = Arc::clone(&self.render_state.renderer);
+        let Some(job) = &mut self.export else {
+            return;
+        };
+        let frame = job.next_frame;
+        let total = job.animation.frame_count();
+        let magnification = job.animation.magnification_log10_at(frame);
+        let handoff_log = ARBITRARY_HANDOFF_ZOOM.log10();
+        let (scale_mantissa, scale_exponent) = animation::frame_scale(magnification);
+        let aspect = job.animation.width as f32 / job.animation.height as f32;
+
+        // Reference selection mirrors the interactive renderer: plain f32
+        // for families without perturbation, an f64 reference below the
+        // handoff, the arbitrary-precision reference beyond it.
+        let reference = if magnification > handoff_log {
+            job.ap_reference
+                .as_ref()
+                .map(|r| (r.0, r.1.as_slice(), false))
+        } else {
+            job.f64_reference
+                .as_ref()
+                .map(|r| (r.0, r.1.as_slice(), true))
+                .or_else(|| {
+                    job.ap_reference
+                        .as_ref()
+                        .map(|r| (r.0, r.1.as_slice(), false))
+                })
+        };
+        let mut uniforms = Uniforms::new(
+            job.centre,
+            animation::frame_half_height_f64(magnification),
+            aspect,
+            job.julia_c,
+            job.iterations,
+            job.bailout,
+            job.family.shader_flag(),
+            usize::from(job.dynamical),
+            job.colouring.outside.smooth,
+            false,
+            if reference.is_some() {
+                PrecisionMode::DoubleSingle
+            } else {
+                PrecisionMode::F32
+            },
+            job.family_words,
+        );
+        if let Some((_, points, ds_fallback)) = reference {
+            uniforms = uniforms.enable_perturbation(
+                scale_mantissa,
+                scale_exponent,
+                points.len(),
+                ds_fallback,
+                [0.0; 2],
+            );
+        }
+        let mut colouring = job.colouring.clone();
+        let sweep = job.animation.gradient_offset_at(frame);
+        colouring.outside.offset += sweep;
+        colouring.inside.offset += sweep;
+        let colouring_uniforms = ColouringUniforms::new(
+            &colouring,
+            animation::frame_pixel_log(magnification, job.animation.height),
+        );
+
+        let rgba = {
+            let renderer = renderer.read();
+            let Some(pipeline) = renderer.callback_resources.get::<FractalPipeline>() else {
+                self.export = None;
+                self.export_message = Some(("renderer not initialised".to_owned(), true));
+                return;
+            };
+            pipeline.render_export(
+                &device,
+                &queue,
+                &uniforms,
+                &colouring_uniforms,
+                &job.gradient,
+                reference.map(|(generation, points, _)| (generation, points)),
+                (job.animation.width, job.animation.height),
+            )
+        };
+
+        let path = job.directory.join(format!("frame-{frame:05}.png"));
+        if let Err(error) = write_png(&path, job.animation.width, job.animation.height, &rgba) {
+            self.export = None;
+            self.export_message = Some((format!("cannot write {path:?}: {error}"), true));
+            return;
+        }
+
+        job.next_frame += 1;
+        if job.next_frame >= total {
+            let directory = job.directory.clone();
+            let fps = job.animation.fps;
+            let encode = job.animation.encode_video;
+            let elapsed = job.started.elapsed().as_secs_f64();
+            self.export = None;
+            let mut message = format!(
+                "Wrote {total} frames to {} in {elapsed:.0} s",
+                directory.display()
+            );
+            if encode {
+                match encode_video(&directory, fps) {
+                    Ok(output) => message = format!("{message}; encoded {output}"),
+                    Err(error) => message = format!("{message}; video not encoded: {error}"),
+                }
+            }
+            self.export_message = Some((message, false));
+        }
+        ctx.request_repaint();
+    }
+
     fn reframe_dynamical_plane(&mut self) {
         self.dynamical = PlaneView::from_default(self.family.default_dynamical_view());
         self.deep_views[1] = None;
@@ -2904,6 +3312,8 @@ impl eframe::App for App {
         self.experiment_editor(ui.ctx());
         self.orbit_inspector(ui.ctx());
         self.gradient_editor(ui.ctx());
+        #[cfg(not(target_arch = "wasm32"))]
+        self.advance_export(ui.ctx());
 
         let elapsed = (Instant::now() - update_start).as_secs_f32() * 1000.0;
         self.ui_update_ms = if self.ui_update_ms == 0.0 {
@@ -2916,6 +3326,102 @@ impl eframe::App for App {
     #[cfg(target_arch = "wasm32")]
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ExportJob {
+    animation: ZoomAnimation,
+    family: FractalFamily,
+    dynamical: bool,
+    family_words: [f32; 8],
+    iterations: u32,
+    bailout: f32,
+    julia_c: [f64; 2],
+    /// `f64` projection of the (possibly arbitrary-precision) centre; the
+    /// perturbation scale carries the depth.
+    centre: [f64; 2],
+    colouring: Colouring,
+    gradient: Arc<GradientTable>,
+    /// Arbitrary-precision reference for frames beyond the handoff.
+    ap_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
+    /// The same orbit projected to `f64` for frames below the handoff.
+    f64_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
+    directory: std::path::PathBuf,
+    next_frame: usize,
+    started: Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn default_export_directory() -> String {
+    std::env::var("HOME")
+        .map(|home| format!("{home}/iterascope-exports"))
+        .unwrap_or_else(|_| "iterascope-exports".to_owned())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn default_export_directory() -> String {
+    String::new()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .and_then(|mut writer| writer.write_image_data(rgba))
+        .map_err(|error| error.to_string())
+}
+
+/// Encodes `frame-%05d.png` in `directory` into `zoom.mp4` with ffmpeg.
+#[cfg(not(target_arch = "wasm32"))]
+fn encode_video(directory: &std::path::Path, fps: u32) -> Result<String, String> {
+    // A GUI launch may not inherit the shell's PATH; try the common
+    // package-manager locations after the bare name.
+    let ffmpeg = [
+        "ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+    ]
+    .into_iter()
+    .find(|candidate| {
+        std::process::Command::new(candidate)
+            .arg("-version")
+            .output()
+            .is_ok_and(|probe| probe.status.success())
+    })
+    .ok_or_else(|| "ffmpeg not found".to_owned())?;
+    let output = std::process::Command::new(ffmpeg)
+        .args([
+            "-y",
+            "-framerate",
+            &fps.to_string(),
+            "-i",
+            "frame-%05d.png",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "18",
+            "zoom.mp4",
+        ])
+        .current_dir(directory)
+        .output()
+        .map_err(|error| format!("ffmpeg failed to start ({error})"))?;
+    if output.status.success() {
+        Ok("zoom.mp4".to_owned())
+    } else {
+        Err(format!(
+            "ffmpeg failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown error")
+        ))
     }
 }
 
@@ -3436,6 +3942,24 @@ fn badge(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn png_writer_produces_a_decodable_file() {
+        let directory = std::env::temp_dir().join("iterascope-png-test");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("frame-00000.png");
+        let rgba: Vec<u8> = (0..4 * 4 * 4).map(|i| (i * 7 % 256) as u8).collect();
+        write_png(&path, 4, 4, &rgba).unwrap();
+        let decoder =
+            png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap()));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buffer = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buffer).unwrap();
+        assert_eq!((info.width, info.height), (4, 4));
+        assert_eq!(&buffer[..rgba.len()], &rgba[..]);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 
     #[test]
     fn click_target_can_recentre_and_zoom_two_times() {

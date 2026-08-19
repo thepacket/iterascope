@@ -14,7 +14,11 @@ use crate::precision::{PrecisionMode, split_f64};
 
 /// Raw WGSL with the delta-algebra template; see [`shader_source`].
 const SHADER: &str = include_str!("fractal.wgsl");
-const PANE_COUNT: usize = 2;
+/// Two interactive panes plus one set of resources reserved for the
+/// image-sequence exporter, which renders between UI frames on the same
+/// queue and must not disturb the panes' uploaded state.
+const PANE_COUNT: usize = 3;
+pub(crate) const EXPORT_PANE: usize = 2;
 
 const TEMPLATE_BEGIN: &str = "// BEGIN DELTA TEMPLATE\n";
 const TEMPLATE_END: &str = "// END DELTA TEMPLATE\n";
@@ -445,12 +449,26 @@ pub struct FractalPipeline {
     /// Fractal pipeline gathering orbit statistics for the trap, average
     /// and distance-estimate colourings.
     stats_pipeline: wgpu::RenderPipeline,
+    /// The same two variants targeting `Rgba8Unorm` for the exporter, whose
+    /// readback format must not depend on the window surface.
+    export_pipeline: wgpu::RenderPipeline,
+    export_stats_pipeline: wgpu::RenderPipeline,
     /// Draws a preview texture onto the pane.
     blit_pipeline: wgpu::RenderPipeline,
     blit_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     target_format: wgpu::TextureFormat,
     panes: [PaneResources; PANE_COUNT],
+    /// Offscreen target reused across exported frames of one size.
+    export_target: Mutex<Option<ExportTarget>>,
+}
+
+/// Texture and readback buffer for one export frame size.
+struct ExportTarget {
+    texture: wgpu::Texture,
+    readback: wgpu::Buffer,
+    size: (u32, u32),
+    padded_bytes_per_row: u32,
 }
 
 /// Fullscreen-triangle blit of a sampled texture; used to present preview
@@ -551,36 +569,50 @@ impl FractalPipeline {
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
-        let fractal_pipeline = |label: &str, module: &wgpu::ShaderModule| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some("fs_main"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: target_format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let pipeline = fractal_pipeline("iterascope.fractal.pipeline", &shader);
-        let stats_pipeline =
-            fractal_pipeline("iterascope.fractal.pipeline.orbit-stats", &stats_shader);
+        let fractal_pipeline =
+            |label: &str, module: &wgpu::ShaderModule, format: wgpu::TextureFormat| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module,
+                        entry_point: Some("fs_main"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+        let pipeline = fractal_pipeline("iterascope.fractal.pipeline", &shader, target_format);
+        let stats_pipeline = fractal_pipeline(
+            "iterascope.fractal.pipeline.orbit-stats",
+            &stats_shader,
+            target_format,
+        );
+        let export_pipeline = fractal_pipeline(
+            "iterascope.fractal.pipeline.export",
+            &shader,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let export_stats_pipeline = fractal_pipeline(
+            "iterascope.fractal.pipeline.export.orbit-stats",
+            &stats_shader,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
 
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("iterascope.blit.shader"),
@@ -732,12 +764,148 @@ impl FractalPipeline {
         Self {
             pipeline,
             stats_pipeline,
+            export_pipeline,
+            export_stats_pipeline,
             blit_pipeline,
             blit_layout,
             sampler,
             target_format,
             panes,
+            export_target: Mutex::new(None),
         }
+    }
+
+    /// Renders one export frame at `size` and returns tightly packed RGBA
+    /// rows, top first. Blocks until the GPU finishes; the exporter calls
+    /// this between UI frames, one frame per update. `reference` carries a
+    /// generation so an orbit shared by many frames uploads once.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn render_export(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        uniforms: &Uniforms,
+        colouring: &ColouringUniforms,
+        gradient: &GradientTable,
+        reference: Option<(u64, &[GpuReferencePoint])>,
+        size: (u32, u32),
+    ) -> Vec<u8> {
+        let resources = &self.panes[EXPORT_PANE];
+        queue.write_buffer(&resources.buffer, 0, bytemuck::bytes_of(uniforms));
+        self.upload_colouring(queue, EXPORT_PANE, colouring, Some(gradient));
+        if let Some((generation, points)) = reference {
+            let mut uploaded = resources.reference_generation.lock().unwrap();
+            if *uploaded != Some(generation) {
+                queue.write_buffer(&resources.reference_buffer, 0, bytemuck::cast_slice(points));
+                *uploaded = Some(generation);
+            }
+        }
+
+        let mut slot = self.export_target.lock().unwrap();
+        if !slot.as_ref().is_some_and(|target| target.size == size) {
+            let padded_bytes_per_row = (size.0 * 4).div_ceil(256) * 256;
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("iterascope.export"),
+                size: wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iterascope.export.readback"),
+                size: (padded_bytes_per_row * size.1) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            *slot = Some(ExportTarget {
+                texture,
+                readback,
+                size,
+                padded_bytes_per_row,
+            });
+        }
+        let target = slot.as_ref().unwrap();
+
+        let view = target.texture.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iterascope.export.pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if colouring.needs_orbit_stats() {
+                pass.set_pipeline(&self.export_stats_pipeline);
+            } else {
+                pass.set_pipeline(&self.export_pipeline);
+            }
+            pass.set_bind_group(0, &resources.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &target.readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(target.padded_bytes_per_row),
+                    rows_per_image: Some(size.1),
+                },
+            },
+            wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        target
+            .readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
+        let padded = target.readback.slice(..).get_mapped_range().to_vec();
+        target.readback.unmap();
+
+        // The fullscreen triangle maps uv.y = 0 to the bottom of the
+        // viewport; return rows top-first and strip the copy padding.
+        let tight_row = (size.0 * 4) as usize;
+        let mut rgba = Vec::with_capacity(tight_row * size.1 as usize);
+        for row in padded
+            .chunks(target.padded_bytes_per_row as usize)
+            .take(size.1 as usize)
+            .rev()
+        {
+            rgba.extend_from_slice(&row[..tight_row]);
+        }
+        rgba
     }
 
     /// Uploads the colour stage for a pane: the uniform block every time,
@@ -1788,6 +1956,153 @@ mod tests {
                 black < rgb.len() / 3 / 2,
                 "{label} is mostly black at 1e{zoom_exponent}"
             );
+        }
+    }
+
+    /// Exports a five-frame zoom path through `render_export` — plain f32,
+    /// f64-reference perturbation and arbitrary-precision perturbation, at a
+    /// width whose rows need copy padding — and checks that every frame is
+    /// varied, that consecutive frames differ (the zoom actually moves), and
+    /// that the padded readback carries no artefacts. Run with
+    /// `ITERASCOPE_RENDER_DIR=out cargo test --release gpu_zoom_export_frames -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gpu_zoom_export_frames() {
+        use crate::animation::{self, ZoomAnimation};
+        use crate::arbitrary::{DeepComplex, DeepReal, DeepState, DeepView, ReferenceOrbit};
+        use crate::family::{FamilyParameters, FractalFamily};
+
+        let directory = std::env::var("ITERASCOPE_RENDER_DIR").ok();
+        if let Some(directory) = &directory {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let gpu = GpuHarness::new(64, 64); // harness unused; device via its fields
+        let parameters = FamilyParameters::default();
+        let family = FractalFamily::Quadratic;
+        let iterations = 2_048u32;
+        // 322 × 4 = 1288 bytes per row: not a multiple of 256, so the copy
+        // path must pad and the readback must strip the padding.
+        let size = (322u32, 240u32);
+        let zoom_exponent = 30u32;
+        let precision_exponent = zoom_exponent + 40;
+        let c_f64 = family.default_parameter();
+        let c = DeepComplex::from_f64(c_f64, precision_exponent).unwrap();
+        let (centre, _) = [[0.6, 0.4], [-0.5, 0.7], [1.1, -0.3]]
+            .iter()
+            .filter_map(|start| {
+                repelling_fixed_point(family, &parameters, &c, *start, precision_exponent)
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("a repelling fixed point");
+        let view = DeepView {
+            centre: centre.clone(),
+            half_height: DeepReal::parse(&format!("1.45e-{zoom_exponent}"), precision_exponent)
+                .unwrap(),
+            zoom_exponent: precision_exponent,
+            magnification_log10: zoom_exponent as f64,
+        };
+        let initial = DeepState::initial(family, &view.centre, true, &c).unwrap();
+        let orbit = ReferenceOrbit::family(family, &parameters, initial, iterations, 4.0).unwrap();
+        let centre_f64 = view.centre_preview();
+        let f64_points: Vec<[f64; 2]> = orbit
+            .points
+            .iter()
+            .map(|point| [point.re.to_f64(), point.im.to_f64()])
+            .collect();
+        let ap = DeepRenderData::from_points(11, 1.0, 0, &orbit.points, false).reference;
+        let f64_reference =
+            DeepRenderData::from_f64_orbit(12, 1.0, &f64_points, true, [0.0; 2]).reference;
+
+        let animation = ZoomAnimation {
+            duration_seconds: 0.2,
+            fps: 25,
+            width: size.0,
+            height: size.1,
+            start_magnification_log10: 0.0,
+            end_magnification_log10: zoom_exponent as f64,
+            ease: false,
+            gradient_sweep_turns: 0.25,
+            encode_video: false,
+        };
+        assert_eq!(animation.frame_count(), 5);
+        let handoff_log = crate::arbitrary::ARBITRARY_HANDOFF_ZOOM.log10();
+        let colouring_base = Colouring::default();
+        let gradient = GradientTable::new(13, &colouring_base.gradient);
+
+        let mut previous: Option<Vec<u8>> = None;
+        for frame in 0..animation.frame_count() {
+            let magnification = animation.magnification_log10_at(frame);
+            let (mantissa, exponent) = animation::frame_scale(magnification);
+            let reference = if magnification > handoff_log {
+                Some((11u64, ap.as_slice(), false))
+            } else {
+                Some((12u64, f64_reference.as_slice(), true))
+            };
+            let mut uniforms = Uniforms::new(
+                centre_f64,
+                animation::frame_half_height_f64(magnification),
+                size.0 as f32 / size.1 as f32,
+                c_f64,
+                iterations,
+                4.0,
+                family.shader_flag(),
+                1,
+                true,
+                false,
+                PrecisionMode::DoubleSingle,
+                parameters.uniform_words(true),
+            );
+            if let Some((_, points, ds_fallback)) = reference {
+                uniforms = uniforms.enable_perturbation(
+                    mantissa,
+                    exponent,
+                    points.len(),
+                    ds_fallback,
+                    [0.0; 2],
+                );
+            }
+            let mut colouring = colouring_base.clone();
+            colouring.outside.offset += animation.gradient_offset_at(frame);
+            let rgba = gpu.pipeline.render_export(
+                &gpu.device,
+                &gpu.queue,
+                &uniforms,
+                &ColouringUniforms::new(
+                    &colouring,
+                    animation::frame_pixel_log(magnification, size.1),
+                ),
+                &gradient,
+                reference.map(|(generation, points, _)| (generation, points)),
+                size,
+            );
+            assert_eq!(rgba.len(), (size.0 * size.1 * 4) as usize);
+            let distinct: std::collections::HashSet<&[u8]> = rgba.chunks(4).collect();
+            eprintln!(
+                "frame {frame} at 1e{magnification:.1}: {} distinct colours",
+                distinct.len()
+            );
+            assert!(
+                distinct.len() > 50,
+                "frame {frame} at 1e{magnification:.1} collapsed"
+            );
+            // Alpha is opaque everywhere (no padding bleed into the rows).
+            assert!(rgba.chunks(4).all(|pixel| pixel[3] == 255));
+            if let Some(previous) = &previous {
+                assert_ne!(
+                    previous, &rgba,
+                    "frame {frame} identical to its predecessor"
+                );
+            }
+            if let Some(directory) = &directory {
+                let rgb: Vec<u8> = rgba
+                    .chunks(4)
+                    .flat_map(|pixel| pixel[..3].to_vec())
+                    .collect();
+                let mut ppm = format!("P6\n{} {}\n255\n", size.0, size.1).into_bytes();
+                ppm.extend_from_slice(&rgb);
+                std::fs::write(format!("{directory}/export-frame-{frame}.ppm"), ppm).unwrap();
+            }
+            previous = Some(rgba);
         }
     }
 

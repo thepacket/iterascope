@@ -38,6 +38,7 @@ web-sys = { version = "0.3.103", features = [
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger = "0.11.11"
+png = "0.18.0"
 
 [dev-dependencies]
 # Deliberately pinned to the Naga release used by wgpu 29.
