@@ -474,6 +474,22 @@ impl FractalFamily {
         )
     }
 
+    /// Families whose orbits end by converging to a root or a fixed point,
+    /// so the argument of the limit separates their basins.
+    pub(crate) const fn converges(self) -> bool {
+        matches!(
+            self,
+            Self::NewtonCubic | Self::Nova | Self::MagnetOne | Self::MagnetTwo
+        )
+    }
+
+    /// Families whose derivative the shader tracks, so the distance-estimate
+    /// colouring is exact. Must agree with `family_has_derivative` in
+    /// fractal.wgsl.
+    pub(crate) const fn has_distance_estimate(self) -> bool {
+        matches!(self, Self::Quadratic | Self::Multibrot | Self::Lambda)
+    }
+
     pub(crate) const fn uses_bailout(self) -> bool {
         !matches!(
             self,

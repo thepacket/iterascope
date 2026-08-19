@@ -7,9 +7,14 @@ use crate::arbitrary::{
     ARBITRARY_HANDOFF_ZOOM, DeepComplex, DeepReal, DeepState, DeepView, MAX_DECIMAL_ZOOM_EXPONENT,
     ReferenceOrbitBuilder,
 };
+use crate::colouring::{
+    Colouring, ColouringAlgorithm, ColouringSide, Gradient, Interpolation, Transfer, TrapShape,
+    presets,
+};
 use crate::experiment::{
     ComplexDocument, ComputationDocument, DeepComplexDocument, DeepPlaneDocument, DisplayDocument,
-    ExperimentDocument, FORMAT_ID, FORMAT_VERSION, FamilyParametersDocument, PlaneDocument,
+    ExperimentDocument, FORMAT_ID, FORMAT_VERSION, FamilyParametersDocument, MAX_BAILOUT,
+    PlaneDocument,
 };
 use crate::family::{
     FamilyParameters, FractalFamily, Linkage, MAX_DEGREE, MIN_DEGREE, OrbitFate, PlaneDefault,
@@ -22,7 +27,9 @@ use crate::precision::{
     DoubleSingle, DsValidity, PathProbeResult, PrecisionMode, ProbeCache, ProbeInput, ProbeResult,
     ValidityLevel,
 };
-use crate::render::{self, DeepRenderData, FractalPipeline, Uniforms};
+use crate::render::{
+    self, ColouringUniforms, DeepRenderData, FractalPipeline, GradientTable, Uniforms,
+};
 
 const PANEL_WIDTH: f32 = 286.0;
 const HEADER_HEIGHT: f32 = 33.0;
@@ -232,10 +239,17 @@ pub struct App {
     lyapunov_sequence_draft: String,
     iterations: u32,
     bailout: f32,
-    palette_phase: f32,
-    smooth: bool,
     grid: bool,
-    interior_shading: bool,
+    colouring: Colouring,
+    /// Rasterised gradient shared with the render callbacks; rebuilt when
+    /// `colouring.gradient` differs from `gradient_table_source`.
+    gradient_table: Arc<GradientTable>,
+    gradient_table_source: Gradient,
+    gradient_editor_open: bool,
+    gradient_selected_stop: usize,
+    gradient_import_text: String,
+    gradient_message: Option<(String, bool)>,
+    gradient_random_seed: u64,
     zoom_focus: [Option<[f64; 2]>; 2],
     active_pane: usize,
     pending_pan_steps: [f64; 2],
@@ -292,10 +306,15 @@ impl App {
             lyapunov_sequence_draft: FamilyParameters::default().lyapunov_sequence,
             iterations: 256,
             bailout: 4.0,
-            palette_phase: 0.0,
-            smooth: true,
             grid: false,
-            interior_shading: true,
+            colouring: Colouring::default(),
+            gradient_table: Arc::new(GradientTable::new(0, &Gradient::default())),
+            gradient_table_source: Gradient::default(),
+            gradient_editor_open: false,
+            gradient_selected_stop: 0,
+            gradient_import_text: String::new(),
+            gradient_message: None,
+            gradient_random_seed: 1,
             zoom_focus: [None, None],
             active_pane: 0,
             pending_pan_steps: [0.0; 2],
@@ -350,6 +369,13 @@ impl App {
                     });
                 if self.family != previous_family {
                     self.reset_for_family();
+                    if self.family.converges() != previous_family.converges() {
+                        self.colouring.outside = if self.family.converges() {
+                            ColouringSide::default_basins()
+                        } else {
+                            ColouringSide::default()
+                        };
+                    }
                 }
                 ui.label(
                     egui::RichText::new(self.family.name())
@@ -555,7 +581,7 @@ impl App {
                 );
                 if self.family.uses_bailout() {
                     ui.add(
-                        egui::Slider::new(&mut self.bailout, 2.0..=32.0)
+                        egui::Slider::new(&mut self.bailout, 2.0..=MAX_BAILOUT)
                             .logarithmic(true)
                             .text("bailout"),
                     );
@@ -821,31 +847,7 @@ impl App {
                 }
             });
 
-            section(ui, "Display", |ui| {
-                ui.checkbox(
-                    &mut self.smooth,
-                    if self.family.is_newton() {
-                        "Convergence shading"
-                    } else if self.family == FractalFamily::Lyapunov {
-                        "Smooth colouring (unused by the Lyapunov plane)"
-                    } else {
-                        "Smooth escape-time colouring"
-                    },
-                );
-                if self.family.is_escape_time() && self.family != FractalFamily::Lyapunov {
-                    ui.checkbox(&mut self.interior_shading, "Interior shading by min |zₙ|")
-                        .on_hover_text(
-                            "Bounded orbits are shaded by the smallest modulus they reach; dark still means not escaped, not proven interior.",
-                        );
-                }
-                ui.checkbox(&mut self.grid, "Coordinate grid");
-                ui.add(
-                    egui::Slider::new(&mut self.palette_phase, -1.0..=1.0).text("palette phase"),
-                );
-                if ui.button("Reset palette").clicked() {
-                    self.palette_phase = 0.0;
-                }
-            });
+            section(ui, "Colouring", |ui| self.colouring_controls(ui));
 
             section(ui, "Navigation", |ui| {
                 let parameter_dynamical = self.family.linkage() == Linkage::ParameterDynamical;
@@ -983,12 +985,13 @@ impl App {
                 bailout: self.bailout,
             },
             display: DisplayDocument {
-                smooth_escape_time: self.smooth,
+                smooth_escape_time: self.colouring.outside.smooth,
                 coordinate_grid: self.grid,
-                palette_phase: self.palette_phase,
+                palette_phase: 0.0,
                 critical_orbit_overlay: self.show_orbit_overlay,
-                interior_shading: self.interior_shading,
+                interior_shading: true,
             },
+            colouring: Some(self.colouring.clone()),
             progressive_julia_zoom_target_exponent: if self.family.supports_deep_zoom() {
                 self.progressive_julia_zoom_target_exponent
             } else {
@@ -1058,11 +1061,21 @@ impl App {
         self.progressive_julia_next_stage_at = None;
         self.iterations = document.computation.iterations;
         self.bailout = document.computation.bailout;
-        self.smooth = document.display.smooth_escape_time;
         self.grid = document.display.coordinate_grid;
-        self.palette_phase = document.display.palette_phase;
         self.show_orbit_overlay = document.display.critical_orbit_overlay;
-        self.interior_shading = document.display.interior_shading;
+        self.colouring = document.colouring.unwrap_or_else(|| {
+            // Documents from before format version 5: the palette phase was
+            // the gradient offset and the only colouring choice was the
+            // smoothing of the outside iteration count.
+            let mut colouring = Colouring::default();
+            if self.family.converges() {
+                colouring.outside = ColouringSide::default_basins();
+            }
+            colouring.outside.smooth = document.display.smooth_escape_time;
+            colouring.outside.offset = document.display.palette_phase;
+            colouring
+        });
+        self.gradient_selected_stop = 0;
 
         self.zoom_focus = [None, None];
         self.pending_pan_steps = [0.0; 2];
@@ -1575,10 +1588,8 @@ impl App {
             self.bailout,
             self.family.shader_flag(),
             pane,
-            self.palette_phase,
-            self.smooth,
+            self.colouring.outside.smooth,
             self.grid,
-            self.interior_shading,
             precision,
             self.family_parameters
                 .uniform_words(self.pane_is_dynamical(pane)),
@@ -1592,10 +1603,20 @@ impl App {
                 data.reference_offset,
             );
         }
+        // Natural log of one pixel's height in world units, from the
+        // magnification so it stays finite far below f64 range.
+        let pixel_height_points = viewport.height().max(1.0) as f64;
+        let pixel_log = std::f64::consts::LN_10
+            * (1.45_f64.log10() - self.magnification_log10(pane))
+            + (2.0 / (pixel_height_points * ui.ctx().pixels_per_point() as f64)).ln();
+        let colouring_uniforms = ColouringUniforms::new(&self.colouring, pixel_log as f32);
+        let gradient = self.gradient_table();
         ui.painter().add(render::callback(
             viewport,
             pane,
             uniforms,
+            colouring_uniforms,
+            gradient,
             deep,
             preview_scale,
             ui.ctx().pixels_per_point(),
@@ -1622,6 +1643,387 @@ impl App {
             self.draw_readout(ui, viewport, response.hover_pos(), &view, precision);
         } else if let Some(deep_view) = &deep_view {
             self.draw_deep_readout(ui, viewport, response.hover_pos(), deep_view);
+        }
+    }
+
+    /// The rasterised gradient for the render callbacks, rebuilt only when
+    /// the gradient changed.
+    fn gradient_table(&mut self) -> Arc<GradientTable> {
+        if self.colouring.gradient != self.gradient_table_source {
+            let generation = self.gradient_table.generation + 1;
+            self.gradient_table =
+                Arc::new(GradientTable::new(generation, &self.colouring.gradient));
+            self.gradient_table_source = self.colouring.gradient.clone();
+        }
+        Arc::clone(&self.gradient_table)
+    }
+
+    fn colouring_controls(&mut self, ui: &mut egui::Ui) {
+        let family = self.family;
+        // Gradient preview; click to open the editor.
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+        paint_gradient(ui.painter(), rect, &self.colouring.gradient, 96);
+        ui.painter().rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(1.0, if response.hovered() { CREAM } else { BORDER }),
+            egui::StrokeKind::Inside,
+        );
+        if response.clicked() {
+            self.gradient_editor_open = true;
+        }
+        response.on_hover_text("Open the gradient editor");
+        ui.horizontal(|ui| {
+            if ui.button("Edit gradient…").clicked() {
+                self.gradient_editor_open = true;
+            }
+            egui::ComboBox::from_id_salt("iterascope.gradient.preset")
+                .selected_text("Presets")
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for name in presets::NAMES {
+                        if ui.selectable_label(false, name).clicked()
+                            && let Some(gradient) = presets::by_name(name)
+                        {
+                            self.colouring.gradient = gradient;
+                            self.gradient_selected_stop = 0;
+                        }
+                    }
+                });
+        });
+        ui.add_space(4.0);
+
+        let outside_label = if family.converges() {
+            "Outside · converged"
+        } else if family == FractalFamily::Lyapunov {
+            "Stable regions"
+        } else {
+            "Outside · escaped"
+        };
+        egui::CollapsingHeader::new(outside_label)
+            .id_salt("iterascope.colouring.outside")
+            .default_open(true)
+            .show(ui, |ui| {
+                colouring_side_controls(ui, &mut self.colouring.outside, family, true);
+            });
+        if family != FractalFamily::Lyapunov {
+            egui::CollapsingHeader::new("Inside · bounded")
+                .id_salt("iterascope.colouring.inside")
+                .default_open(false)
+                .show(ui, |ui| {
+                    colouring_side_controls(ui, &mut self.colouring.inside, family, false);
+                });
+        }
+        ui.add_space(2.0);
+        ui.checkbox(&mut self.grid, "Coordinate grid");
+    }
+
+    fn gradient_editor(&mut self, ctx: &egui::Context) {
+        if !self.gradient_editor_open {
+            return;
+        }
+        let mut open = self.gradient_editor_open;
+        egui::Window::new("Gradient")
+            .open(&mut open)
+            .default_width(560.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                self.gradient_editor_contents(ui);
+            });
+        self.gradient_editor_open = open;
+    }
+
+    fn gradient_editor_contents(&mut self, ui: &mut egui::Ui) {
+        let gradient = &mut self.colouring.gradient;
+        gradient.normalise();
+        if self.gradient_selected_stop >= gradient.stops.len() {
+            self.gradient_selected_stop = 0;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Name").color(MUTED));
+            ui.add(egui::TextEdit::singleline(&mut gradient.name).desired_width(180.0));
+            ui.add_space(8.0);
+            egui::ComboBox::from_id_salt("iterascope.gradient.editor.preset")
+                .selected_text("Presets")
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for name in presets::NAMES {
+                        if ui.selectable_label(false, name).clicked()
+                            && let Some(preset) = presets::by_name(name)
+                        {
+                            *gradient = preset;
+                            self.gradient_selected_stop = 0;
+                        }
+                    }
+                });
+            if ui.button("Random").clicked() {
+                self.gradient_random_seed = self
+                    .gradient_random_seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *gradient = Gradient::random(self.gradient_random_seed >> 20);
+                self.gradient_selected_stop = 0;
+            }
+        });
+        ui.add_space(6.0);
+
+        // The gradient bar with draggable stop markers beneath it.
+        let bar_height = 44.0;
+        let marker_height = 14.0;
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), bar_height + marker_height + 2.0),
+            egui::Sense::click(),
+        );
+        let bar = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), bar_height));
+        paint_gradient(ui.painter(), bar, gradient, 256);
+        ui.painter().rect_stroke(
+            bar,
+            2.0,
+            egui::Stroke::new(1.0, BORDER),
+            egui::StrokeKind::Inside,
+        );
+        let rotation = gradient.rotation;
+        let to_x = |position: f32| bar.min.x + wrap_turns(position + rotation) * bar.width();
+        if response.double_clicked()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let position = ((pointer.x - bar.min.x) / bar.width()).clamp(0.0, 0.9999);
+            self.gradient_selected_stop = gradient.insert_stop(position);
+        }
+        response.on_hover_text("Double-click to add a stop; drag the markers to move stops");
+        let mut drag: Option<(usize, f32)> = None;
+        for (index, stop) in gradient.stops.iter().enumerate() {
+            let x = to_x(stop.position);
+            let marker = egui::Rect::from_center_size(
+                egui::pos2(x, bar.max.y + 1.0 + marker_height * 0.5),
+                egui::vec2(10.0, marker_height),
+            );
+            let id = ui.id().with(("gradient-stop", index));
+            let marker_response = ui.interact(marker, id, egui::Sense::click_and_drag());
+            if marker_response.clicked() || marker_response.drag_started() {
+                self.gradient_selected_stop = index;
+            }
+            if marker_response.dragged() {
+                drag = Some((index, marker_response.drag_delta().x / bar.width()));
+            }
+            let selected = index == self.gradient_selected_stop;
+            let colour = egui::Color32::from_rgb(
+                (stop.colour[0] * 255.0).round() as u8,
+                (stop.colour[1] * 255.0).round() as u8,
+                (stop.colour[2] * 255.0).round() as u8,
+            );
+            // Triangle pointing at the bar, filled with the stop colour.
+            let points = vec![
+                egui::pos2(x, bar.max.y + 1.0),
+                egui::pos2(x - 5.0, bar.max.y + 1.0 + marker_height),
+                egui::pos2(x + 5.0, bar.max.y + 1.0 + marker_height),
+            ];
+            ui.painter().add(egui::Shape::convex_polygon(
+                points,
+                colour,
+                egui::Stroke::new(
+                    if selected { 2.0 } else { 1.0 },
+                    if selected { egui::Color32::WHITE } else { TEXT },
+                ),
+            ));
+            if selected {
+                ui.painter().vline(
+                    x,
+                    bar.y_range(),
+                    egui::Stroke::new(1.0, egui::Color32::from_white_alpha(160)),
+                );
+            }
+        }
+        if let Some((index, delta)) = drag {
+            let stop = &mut gradient.stops[index];
+            stop.position = wrap_turns(stop.position + delta);
+            // Keep the dragged stop selected through the re-sort.
+            let position = stop.position;
+            let colour = stop.colour;
+            gradient.normalise();
+            if let Some(found) = gradient
+                .stops
+                .iter()
+                .position(|s| s.position == position && s.colour == colour)
+            {
+                self.gradient_selected_stop = found;
+            }
+        }
+        ui.add_space(4.0);
+
+        // Selected stop.
+        let count = gradient.stops.len();
+        let index = self.gradient_selected_stop.min(count - 1);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("Stop {} of {count}", index + 1)).color(CREAM));
+            let stop = &mut gradient.stops[index];
+            let mut rgb = [
+                (stop.colour[0] * 255.0).round() as u8,
+                (stop.colour[1] * 255.0).round() as u8,
+                (stop.colour[2] * 255.0).round() as u8,
+            ];
+            if egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed() {
+                stop.colour = [
+                    rgb[0] as f32 / 255.0,
+                    rgb[1] as f32 / 255.0,
+                    rgb[2] as f32 / 255.0,
+                ];
+            }
+            let mut position = stop.position;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut position)
+                        .speed(0.002)
+                        .range(0.0..=0.9999)
+                        .fixed_decimals(4)
+                        .prefix("position "),
+                )
+                .changed()
+            {
+                stop.position = position;
+                let colour = stop.colour;
+                gradient.normalise();
+                if let Some(found) = gradient
+                    .stops
+                    .iter()
+                    .position(|s| s.position == wrap_turns(position) && s.colour == colour)
+                {
+                    self.gradient_selected_stop = found;
+                }
+            }
+            if ui
+                .button("Add")
+                .on_hover_text("Insert a stop halfway to the next one")
+                .clicked()
+            {
+                let this = gradient.stops[index].position;
+                let next = gradient.stops[(index + 1) % count].position;
+                let mut mid = if count == 1 {
+                    this + 0.5
+                } else if next > this {
+                    0.5 * (this + next)
+                } else {
+                    0.5 * (this + next + 1.0)
+                };
+                mid = wrap_turns(mid + gradient.rotation);
+                self.gradient_selected_stop = gradient.insert_stop(mid);
+            }
+            if ui
+                .add_enabled(count > 1, egui::Button::new("Remove"))
+                .clicked()
+            {
+                gradient.remove_stop(index);
+                self.gradient_selected_stop = index.saturating_sub(1);
+            }
+        });
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("iterascope.gradient.interpolation")
+                .selected_text(gradient.interpolation.name())
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for mode in Interpolation::ALL {
+                        ui.selectable_value(&mut gradient.interpolation, mode, mode.name());
+                    }
+                });
+            ui.checkbox(&mut gradient.smooth, "Smooth")
+                .on_hover_text("Cubic blending between stops instead of linear");
+            if ui.button("Reverse").clicked() {
+                gradient.reverse();
+            }
+            if ui
+                .button("Distribute")
+                .on_hover_text("Space the stops evenly")
+                .clicked()
+            {
+                gradient.distribute_evenly();
+            }
+        });
+        ui.add(egui::Slider::new(&mut gradient.rotation, 0.0..=1.0).text("rotation"));
+        ui.add_space(6.0);
+
+        egui::CollapsingHeader::new("Import / export")
+            .id_salt("iterascope.gradient.import")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Paste an Ultra Fractal .ugr gradient or a Fractint .map palette and choose Import; or drop the file onto the window. Export copies the gradient as .ugr text.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.gradient_import_text)
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(6),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Import").clicked() {
+                        match Gradient::parse(&self.gradient_import_text) {
+                            Ok(mut gradients) => {
+                                let found = gradients.len();
+                                *gradient = gradients.swap_remove(0);
+                                self.gradient_selected_stop = 0;
+                                self.gradient_message = Some((
+                                    if found > 1 {
+                                        format!("Imported the first of {found} gradients")
+                                    } else {
+                                        format!("Imported {}", gradient.name)
+                                    },
+                                    false,
+                                ));
+                            }
+                            Err(error) => {
+                                self.gradient_message = Some((format!("Import failed: {error}"), true));
+                            }
+                        }
+                    }
+                    if ui.button("Export (.ugr to clipboard)").clicked() {
+                        let text = gradient.to_ugr();
+                        self.gradient_import_text = text.clone();
+                        ui.ctx().copy_text(text);
+                        self.gradient_message = Some(("Gradient copied as .ugr".to_owned(), false));
+                    }
+                });
+                if let Some((message, error)) = &self.gradient_message {
+                    ui.label(egui::RichText::new(message).color(if *error { CORAL } else { BLUE }));
+                }
+            });
+
+        // Dropped files anywhere in the window import as gradients.
+        let dropped: Vec<String> = ui.ctx().input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| {
+                    file.bytes
+                        .as_ref()
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                        .or_else(|| {
+                            file.path
+                                .as_ref()
+                                .and_then(|path| std::fs::read_to_string(path).ok())
+                        })
+                })
+                .collect()
+        });
+        if let Some(text) = dropped.into_iter().next() {
+            match Gradient::parse(&text) {
+                Ok(mut gradients) => {
+                    *gradient = gradients.swap_remove(0);
+                    self.gradient_selected_stop = 0;
+                    self.gradient_message = Some((format!("Imported {}", gradient.name), false));
+                }
+                Err(error) => {
+                    self.gradient_message = Some((format!("Import failed: {error}"), true));
+                }
+            }
         }
     }
 
@@ -2501,6 +2903,7 @@ impl eframe::App for App {
 
         self.experiment_editor(ui.ctx());
         self.orbit_inspector(ui.ctx());
+        self.gradient_editor(ui.ctx());
 
         let elapsed = (Instant::now() - update_start).as_secs_f32() * 1000.0;
         self.ui_update_ms = if self.ui_update_ms == 0.0 {
@@ -2513,6 +2916,170 @@ impl eframe::App for App {
     #[cfg(target_arch = "wasm32")]
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+}
+
+fn wrap_turns(value: f32) -> f32 {
+    let wrapped = value - value.floor();
+    if wrapped >= 1.0 || !wrapped.is_finite() {
+        0.0
+    } else {
+        wrapped
+    }
+}
+
+/// Paints a gradient into `rect` as `columns` vertical strips.
+fn paint_gradient(painter: &egui::Painter, rect: egui::Rect, gradient: &Gradient, columns: usize) {
+    let mut mesh = egui::Mesh::default();
+    let width = rect.width() / columns as f32;
+    for column in 0..columns {
+        let t = (column as f32 + 0.5) / columns as f32;
+        let c = gradient.colour_at(t);
+        let colour = egui::Color32::from_rgb(
+            (c[0] * 255.0).round() as u8,
+            (c[1] * 255.0).round() as u8,
+            (c[2] * 255.0).round() as u8,
+        );
+        let strip = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + column as f32 * width, rect.min.y),
+            egui::pos2(rect.min.x + (column as f32 + 1.0) * width + 0.5, rect.max.y),
+        );
+        mesh.add_colored_rect(strip, colour);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+fn colouring_side_controls(
+    ui: &mut egui::Ui,
+    side: &mut ColouringSide,
+    family: FractalFamily,
+    outside: bool,
+) {
+    let salt = if outside { "outside" } else { "inside" };
+    let mut algorithm = side.algorithm;
+    egui::ComboBox::from_id_salt(("iterascope.colouring.algorithm", salt))
+        .selected_text(algorithm.name())
+        .width(230.0)
+        .show_ui(ui, |ui| {
+            for candidate in ColouringAlgorithm::ALL {
+                ui.selectable_value(&mut algorithm, candidate, candidate.name())
+                    .on_hover_text(candidate.description());
+            }
+        });
+    side.set_algorithm(algorithm);
+    ui.label(
+        egui::RichText::new(algorithm.description())
+            .small()
+            .color(MUTED),
+    );
+
+    match algorithm {
+        ColouringAlgorithm::Solid => {
+            let mut rgb = [
+                (side.solid[0] * 255.0).round() as u8,
+                (side.solid[1] * 255.0).round() as u8,
+                (side.solid[2] * 255.0).round() as u8,
+            ];
+            ui.horizontal(|ui| {
+                ui.label("Colour");
+                if egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed() {
+                    side.solid = [
+                        rgb[0] as f32 / 255.0,
+                        rgb[1] as f32 / 255.0,
+                        rgb[2] as f32 / 255.0,
+                    ];
+                }
+            });
+            return;
+        }
+        ColouringAlgorithm::Iteration => {
+            if outside {
+                ui.checkbox(
+                    &mut side.smooth,
+                    if family.converges() {
+                        "Smooth convergence time"
+                    } else {
+                        "Smooth escape time"
+                    },
+                );
+            }
+        }
+        ColouringAlgorithm::Decomposition => {
+            ui.add(
+                egui::Slider::new(&mut side.sectors, 0..=64)
+                    .text("sectors")
+                    .clamping(egui::SliderClamping::Never),
+            );
+        }
+        ColouringAlgorithm::Stripes => {
+            ui.add(egui::Slider::new(&mut side.stripe_frequency, 0.5..=32.0).text("frequency"));
+        }
+        ColouringAlgorithm::TriangleInequality => {
+            if outside && family.uses_bailout() {
+                ui.label(
+                    egui::RichText::new("Raise the bailout (Computation) for smoother results.")
+                        .small()
+                        .color(MUTED),
+                );
+            }
+        }
+        ColouringAlgorithm::DistanceEstimate => {
+            if !family.has_distance_estimate() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} has no derivative in the shader; falling back to the iteration count.",
+                        family.name()
+                    ))
+                    .small()
+                    .color(CORAL),
+                );
+            }
+        }
+        ColouringAlgorithm::OrbitTrap => {
+            egui::ComboBox::from_id_salt(("iterascope.colouring.trap", salt))
+                .selected_text(side.trap_shape.name())
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for shape in TrapShape::ALL {
+                        ui.selectable_value(&mut side.trap_shape, shape, shape.name());
+                    }
+                });
+            ui.horizontal(|ui| {
+                ui.label("centre");
+                ui.add(
+                    egui::DragValue::new(&mut side.trap_centre[0])
+                        .speed(0.01)
+                        .fixed_decimals(3),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut side.trap_centre[1])
+                        .speed(0.01)
+                        .fixed_decimals(3),
+                );
+            });
+            if side.trap_shape.uses_size() {
+                ui.add(egui::Slider::new(&mut side.trap_size, 0.0..=4.0).text("size"));
+            }
+        }
+    }
+
+    ui.add(
+        egui::Slider::new(&mut side.density, 0.001..=100.0)
+            .logarithmic(true)
+            .text("density"),
+    );
+    ui.add(egui::Slider::new(&mut side.offset, 0.0..=1.0).text("offset"));
+    egui::ComboBox::from_id_salt(("iterascope.colouring.transfer", salt))
+        .selected_text(side.transfer.name())
+        .width(150.0)
+        .show_ui(ui, |ui| {
+            for transfer in Transfer::ALL {
+                ui.selectable_value(&mut side.transfer, transfer, transfer.name());
+            }
+        });
+    if outside && algorithm != ColouringAlgorithm::Iteration {
+        ui.add(egui::Slider::new(&mut side.shading, 0.0..=1.0).text("iteration shading"))
+            .on_hover_text("Darken slowly escaping or converging pixels");
     }
 }
 

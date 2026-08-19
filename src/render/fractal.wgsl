@@ -87,6 +87,47 @@ struct ReferencePoint {
 
 @group(0) @binding(1) var<storage, read> reference_orbit: array<ReferencePoint>;
 
+// Colour stage settings; see `Colouring::gpu_words` in colouring.rs.
+struct ColouringUniforms {
+    // Outside (escaped or converged) algorithm:
+    // a = [algorithm, transfer, density, offset],
+    // b = [smooth, decomposition sectors, stripe frequency, trap shape],
+    // c = [trap centre x, trap centre y, trap size, shading],
+    // d = [solid colour rgb, unused].
+    outside_a: vec4<f32>,
+    outside_b: vec4<f32>,
+    outside_c: vec4<f32>,
+    outside_d: vec4<f32>,
+    // Inside (bounded) algorithm, same layout.
+    inside_a: vec4<f32>,
+    inside_b: vec4<f32>,
+    inside_c: vec4<f32>,
+    inside_d: vec4<f32>,
+    // Which per-iteration accumulators are needed: x = orbit trap,
+    // y = triangle inequality, z = stripes, w = derivative.
+    needs: vec4<f32>,
+    // x = gradient table length, y = ln(pixel height in world units).
+    table: vec4<f32>,
+};
+@group(0) @binding(2) var<uniform> colouring: ColouringUniforms;
+// Rasterised cyclic gradient, RGBA.
+@group(0) @binding(3) var<storage, read> gradient_table: array<vec4<f32>>;
+
+// Whether the iteration loops gather orbit statistics (orbit traps,
+// triangle-inequality and stripe averages, the derivative). The renderer
+// compiles the shader twice — see `render::shader_source_variant` — and uses
+// the plain variant whenever no selected algorithm needs them, so the
+// accumulators cost nothing in the default configuration.
+const ORBIT_STATS: bool = true; // ORBIT_STATS_MARKER
+
+const ALGORITHM_ITERATION: u32 = 0u;
+const ALGORITHM_DECOMPOSITION: u32 = 1u;
+const ALGORITHM_TRIANGLE: u32 = 2u;
+const ALGORITHM_STRIPES: u32 = 3u;
+const ALGORITHM_DISTANCE: u32 = 4u;
+const ALGORITHM_TRAP: u32 = 5u;
+const ALGORITHM_SOLID: u32 = 6u;
+
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -102,27 +143,38 @@ struct Ds2 {
     y: Ds,
 };
 
-struct EscapeResult {
-    escaped: bool,
-    iteration: u32,
-    z: vec2<f32>,
-    // Minimum |z_n|² along the orbit: an orbit trap at the origin that
-    // reveals the basin structure of bounded orbits.
-    trap: f32,
-};
-
 struct ScaledComplex {
     mantissa: vec2<f32>,
     exponent: i32,
 };
 
-struct NewtonResult {
-    converged: bool,
-    root: u32,
+// Statistics gathered along an orbit for the colour stage. Every iteration
+// loop feeds its f32 orbit values through `observe`; which accumulators are
+// live is decided per frame by `colouring.needs`.
+struct OrbitStats {
+    // Best (smallest) trap metric for the outside and inside trap shapes.
+    trap_outside: f32,
+    trap_inside: f32,
+    // Triangle-inequality terms: running sum, the most recent term and the
+    // number of terms, so the last term can be blended by the fractional
+    // iteration count.
+    tia_sum: f32,
+    tia_last: f32,
+    tia_count: f32,
+    // Stripe-average terms, same scheme.
+    stripe_sum: f32,
+    stripe_last: f32,
+    stripe_count: f32,
+    // Derivative of z_n with respect to the pixel coordinate, for distance
+    // estimation; scaled so it survives deep zooms.
+    derivative: ScaledComplex,
+};
+
+struct EscapeResult {
+    escaped: bool,
     iteration: u32,
-    continuous_iteration: f32,
-    residual: f32,
     z: vec2<f32>,
+    stats: OrbitStats,
 };
 
 struct GenericState {
@@ -144,8 +196,7 @@ struct GenericResult {
     // Continuous iteration count (escape- or convergence-time smoothed when
     // smooth colouring is enabled).
     value: f32,
-    // Minimum |z_n|² along the orbit.
-    trap: f32,
+    stats: OrbitStats,
 };
 
 @vertex
@@ -276,86 +327,6 @@ fn complex_div(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     );
 }
 
-fn nearest_newton_root(z: vec2<f32>) -> u32 {
-    let distance_a = distance(z, vec2<f32>(1.0, 0.0));
-    let distance_b = distance(z, vec2<f32>(-0.5, 0.8660254));
-    let distance_c = distance(z, vec2<f32>(-0.5, -0.8660254));
-    if (distance_b < distance_a && distance_b <= distance_c) {
-        return 1u;
-    }
-    if (distance_c < distance_a && distance_c < distance_b) {
-        return 2u;
-    }
-    return 0u;
-}
-
-fn continuous_newton_iteration(
-    iteration: u32,
-    previous_residual: f32,
-    residual: f32,
-) -> f32 {
-    if (iteration == 0u) {
-        return 0.0;
-    }
-    let threshold_log = log(1e-6);
-    let previous_log = log(max(previous_residual, 1e-30));
-    let current_log = log(max(residual, 1e-30));
-    let denominator = max(previous_log - current_log, 1e-20);
-    let fraction = clamp(
-        (previous_log - threshold_log) / denominator,
-        0.0,
-        1.0,
-    );
-    return f32(iteration - 1u) + fraction;
-}
-
-fn iterate_newton(initial: vec2<f32>) -> NewtonResult {
-    var z = initial;
-    var previous_residual = 1e30;
-    let requested = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
-    let max_iterations = min(requested, 2048u);
-    for (var i = 0u; i < 2048u; i = i + 1u) {
-        if (i >= max_iterations) { break; }
-        let z2 = complex_mul(z, z);
-        let z3 = complex_mul(z2, z);
-        let polynomial = z3 - vec2<f32>(1.0, 0.0);
-        let residual = length(polynomial);
-        if (residual <= 1e-6) {
-            return NewtonResult(
-                true,
-                nearest_newton_root(z),
-                i,
-                continuous_newton_iteration(i, previous_residual, residual),
-                residual,
-                z,
-            );
-        }
-        let derivative = 3.0 * z2;
-        if (dot(derivative, derivative) <= 1e-18) {
-            return NewtonResult(false, 0u, i, f32(i), residual, z);
-        }
-        previous_residual = residual;
-        z = z - complex_div(polynomial, derivative);
-        if (any(abs(z) > vec2<f32>(1e18))) {
-            return NewtonResult(false, 0u, i + 1u, f32(i + 1u), 1e18, z);
-        }
-    }
-    let z2 = complex_mul(z, z);
-    let polynomial = complex_mul(z2, z) - vec2<f32>(1.0, 0.0);
-    let residual = length(polynomial);
-    if (residual <= 1e-6) {
-        return NewtonResult(
-            true,
-            nearest_newton_root(z),
-            max_iterations,
-            continuous_newton_iteration(max_iterations, previous_residual, residual),
-            residual,
-            z,
-        );
-    }
-    return NewtonResult(false, 0u, max_iterations, f32(max_iterations), residual, z);
-}
-
 // Power-of-two scaling through the float exponent field; no transcendental
 // functions. `exp2i` is exact for -126 <= n <= 127 and returns 0 below.
 fn exp2i(n: i32) -> f32 {
@@ -428,19 +399,20 @@ fn iterate_f32(world: vec2<f32>, julia: bool) -> EscapeResult {
     let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
     var escaped = false;
     var iteration = 0u;
-    var trap = 1e30;
+    var stats = stats_new(julia);
     for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
+        let z_prev = z;
         z = complex_square(z) + c;
         iteration = i + 1u;
+        observe(&stats, FAMILY_QUADRATIC, z, z_prev, c, iteration, julia);
         let magnitude_squared = dot(z, z);
-        trap = min(trap, magnitude_squared);
         if (magnitude_squared > u.dynamics_hi.w) {
             escaped = true;
             break;
         }
     }
-    return EscapeResult(escaped, iteration, z, trap);
+    return EscapeResult(escaped, iteration, z, stats);
 }
 
 fn continue_f32(
@@ -448,19 +420,22 @@ fn continue_f32(
     c: vec2<f32>,
     first_iteration: u32,
     max_iterations: u32,
+    initial_stats: OrbitStats,
+    julia: bool,
 ) -> EscapeResult {
     var z = initial_z;
-    var trap = 1e30;
+    var stats = initial_stats;
     for (var i = first_iteration; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
+        let z_prev = z;
         z = complex_square(z) + c;
+        observe(&stats, FAMILY_QUADRATIC, z, z_prev, c, i + 1u, julia);
         let magnitude_squared = dot(z, z);
-        trap = min(trap, magnitude_squared);
         if (magnitude_squared > u.dynamics_hi.w) {
-            return EscapeResult(true, i + 1u, z, trap);
+            return EscapeResult(true, i + 1u, z, stats);
         }
     }
-    return EscapeResult(false, max_iterations, z, trap);
+    return EscapeResult(false, max_iterations, z, stats);
 }
 
 fn iterate_ds(centre: Ds2, local_offset: vec2<f32>, julia: bool) -> EscapeResult {
@@ -487,10 +462,11 @@ fn iterate_ds(centre: Ds2, local_offset: vec2<f32>, julia: bool) -> EscapeResult
     let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
     var escaped = false;
     var iteration = 0u;
-    var trap = 1e30;
+    var stats = stats_new(julia);
     var approximate = ds2_approx(reference_z) + delta_z;
     for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
+        let z_prev = approximate;
         let reference_before = ds2_approx(reference_z);
         delta_z = 2.0 * complex_mul(reference_before, delta_z)
             + complex_square(delta_z)
@@ -521,14 +497,15 @@ fn iterate_ds(centre: Ds2, local_offset: vec2<f32>, julia: bool) -> EscapeResult
             approximate = ds2_approx(reference_z);
         }
         iteration = i + 1u;
+        observe(&stats, FAMILY_QUADRATIC, approximate, z_prev,
+            ds2_approx(reference_c) + delta_c, iteration, julia);
         let magnitude_squared = dot(approximate, approximate);
-        trap = min(trap, magnitude_squared);
         if (magnitude_squared > u.dynamics_hi.w) {
             escaped = true;
             break;
         }
     }
-    return EscapeResult(escaped, iteration, approximate, trap);
+    return EscapeResult(escaped, iteration, approximate, stats);
 }
 
 fn iterate_perturbation(
@@ -552,19 +529,21 @@ fn iterate_perturbation(
         delta_c = ScaledComplex(vec2<f32>(0.0), 0);
     }
 
-    var approximate = reference_value(0u);
-    var trap = 1e30;
+    let c = select(reference_c + scaled_to_f32(delta_c), u.dynamics_hi.xy, julia);
+    var approximate = reference_value(0u) + scaled_to_f32(delta_z);
+    var stats = stats_new(julia);
     for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= available_iterations) { break; }
         let reference_before = reference_value(i);
+        let z_prev = approximate;
         let linear = scaled_mul_plain(delta_z, 2.0 * reference_before);
         let quadratic = scaled_complex_mul(delta_z, delta_z);
         delta_z = scaled_add(scaled_add(linear, quadratic), delta_c);
         approximate = reference_value(i + 1u) + scaled_to_f32(delta_z);
+        observe(&stats, FAMILY_QUADRATIC, approximate, z_prev, c, i + 1u, julia);
         let magnitude_squared = dot(approximate, approximate);
-        trap = min(trap, magnitude_squared);
         if (magnitude_squared > u.dynamics_hi.w) {
-            return EscapeResult(true, i + 1u, approximate, trap);
+            return EscapeResult(true, i + 1u, approximate, stats);
         }
     }
 
@@ -579,12 +558,9 @@ fn iterate_perturbation(
         // DS. Continue from the already-separated perturbed state instead of
         // restarting from a collapsed coordinate. Automatic reference
         // rebasing will ultimately replace this conservative visual tail.
-        let c = select(reference_c, u.dynamics_hi.xy, julia);
-        var tail = continue_f32(approximate, c, available_iterations, max_iterations);
-        tail.trap = min(tail.trap, trap);
-        return tail;
+        return continue_f32(approximate, c, available_iterations, max_iterations, stats, julia);
     }
-    return EscapeResult(false, max_iterations, approximate, trap);
+    return EscapeResult(false, max_iterations, approximate, stats);
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,20 +1028,20 @@ fn iterate_family_f32(family: u32, world: vec2<f32>, dynamical: bool) -> Generic
     let radius_squared = family_escape_radius_squared(family);
     let threshold = family_convergence_threshold(family);
     var previous_residual = 1e30;
-    var trap = 1e30;
+    var stats = stats_new(dynamical);
     for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
         let previous = state.z;
         state = family_step_f32(family, state);
         let iteration = i + 1u;
-        trap = min(trap, dot(state.z, state.z));
+        observe(&stats, family, state.z, previous, state.c, iteration, dynamical);
         if (family_escaped(family, state.z, radius_squared)) {
             return GenericResult(
                 RESULT_ESCAPED,
                 iteration,
                 state.z,
                 smooth_escape_value(family, iteration, state.z),
-                trap,
+                stats,
             );
         }
         let residual = family_residual(family, state.z, previous);
@@ -1075,12 +1051,12 @@ fn iterate_family_f32(family: u32, world: vec2<f32>, dynamical: bool) -> Generic
                 iteration,
                 state.z,
                 smooth_convergence_value(iteration, previous_residual, residual, threshold),
-                trap,
+                stats,
             );
         }
         previous_residual = residual;
     }
-    return GenericResult(RESULT_BOUNDED, max_iterations, state.z, f32(max_iterations), trap);
+    return GenericResult(RESULT_BOUNDED, max_iterations, state.z, f32(max_iterations), stats);
 }
 
 // Double-single rendering of the generic families.
@@ -1121,7 +1097,7 @@ fn iterate_family_ds(
     }
 
     var previous_residual = 1e30;
-    var trap = 1e30;
+    var stats = stats_new(dynamical);
     var approximate = ds2_approx(reference.z) + deltas.dz;
     for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
@@ -1154,14 +1130,14 @@ fn iterate_family_ds(
         }
 
         let iteration = i + 1u;
-        trap = min(trap, dot(approximate, approximate));
+        observe(&stats, family, approximate, previous, deltas.c_ref + deltas.dc, iteration, dynamical);
         if (family_escaped(family, approximate, radius_squared)) {
             return GenericResult(
                 RESULT_ESCAPED,
                 iteration,
                 approximate,
                 smooth_escape_value(family, iteration, approximate),
-                trap,
+                stats,
             );
         }
         let residual = family_residual(family, approximate, previous);
@@ -1171,12 +1147,12 @@ fn iterate_family_ds(
                 iteration,
                 approximate,
                 smooth_convergence_value(iteration, previous_residual, residual, threshold),
-                trap,
+                stats,
             );
         }
         previous_residual = residual;
     }
-    return GenericResult(RESULT_BOUNDED, max_iterations, approximate, f32(max_iterations), trap);
+    return GenericResult(RESULT_BOUNDED, max_iterations, approximate, f32(max_iterations), stats);
 }
 
 // --- Lyapunov plane --------------------------------------------------------
@@ -1209,59 +1185,24 @@ fn lyapunov_exponent(a: f32, b: f32) -> f32 {
     return sum / f32(count);
 }
 
+// The Lyapunov plane has no orbit result: stable regions (negative
+// exponent) sweep through the gradient by the outside density and offset,
+// chaotic regions darken with the exponent.
 fn lyapunov_colour(exponent: f32) -> vec3<f32> {
     if (exponent >= 1e3) {
         return vec3<f32>(0.02, 0.024, 0.03);
     }
     if (exponent < 0.0) {
-        // Stable (negative exponent): warm tones, brighter when more stable.
         let strength = clamp(-exponent / 1.5, 0.0, 1.0);
-        let base = vec3<f32>(0.16, 0.10, 0.03);
-        let bright = vec3<f32>(0.98, 0.84, 0.36);
-        let rotated = palette(0.18 * strength + u.display.y + 0.08);
-        return mix(base, mix(bright, rotated, 0.25), pow(strength, 0.65));
+        let position = transfer(u32(colouring.outside_a.y + 0.5), -exponent)
+            * colouring.outside_a.z / 0.035 * 0.18 + colouring.outside_a.w;
+        let base = vec3<f32>(0.06, 0.05, 0.04);
+        return mix(base, gradient_colour(position), pow(strength, 0.65));
     }
-    // Chaotic (positive exponent): cool tones darkening with the exponent.
     let strength = clamp(exponent / 1.2, 0.0, 1.0);
     let near_zero = vec3<f32>(0.30, 0.36, 0.52);
     let deep_chaos = vec3<f32>(0.03, 0.05, 0.11);
     return mix(near_zero, deep_chaos, pow(strength, 0.5));
-}
-
-// Colour of a bounded orbit. With interior shading enabled the minimum
-// modulus reached along the orbit (an orbit trap at the origin) modulates a
-// dim gradient, exposing the basin structure of attracting cycles without
-// suggesting that a dark pixel has been proven interior.
-fn interior_colour(trap_squared: f32) -> vec3<f32> {
-    let base = vec3<f32>(0.025, 0.040, 0.058);
-    if (u.dynamics_lo.w < 0.5 || trap_squared >= 1e29) {
-        return base;
-    }
-    let trap = sqrt(max(trap_squared, 0.0));
-    let shade = clamp(log2(1.0 + 8.0 * trap) / 4.0, 0.0, 1.0);
-    let lit = vec3<f32>(0.30, 0.40, 0.58);
-    let contour = 0.86 + 0.14 * cos(6.2831853 * 5.0 * shade);
-    return mix(base, lit, pow(shade, 0.8)) * contour;
-}
-
-fn generic_colour(family: u32, result: GenericResult) -> vec3<f32> {
-    if (result.kind == RESULT_BOUNDED) {
-        return interior_colour(result.trap);
-    }
-    if (result.kind == RESULT_ESCAPED) {
-        let t = 0.035 * result.value + u.display.y;
-        var colour = palette(t);
-        colour *= 0.82 + 0.18 * cos(6.2831853 * fract(result.value * 0.05));
-        return colour;
-    }
-    // Converged. Nova additionally encodes the attracting root by argument.
-    var hue = 0.035 * result.value + u.display.y + 0.45;
-    if (family == FAMILY_NOVA) {
-        hue = 0.012 * result.value + u.display.y
-            + atan2(result.z.y, result.z.x) / 6.2831853;
-    }
-    let speed = 0.38 + 0.62 * exp(-0.03 * result.value);
-    return palette(hue) * speed;
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,32 +1342,33 @@ fn continue_family_f32(
     initial: GenericState,
     first_iteration: u32,
     max_iterations: u32,
-    initial_trap: f32,
+    initial_stats: OrbitStats,
     initial_previous_residual: f32,
+    dynamical: bool,
 ) -> GenericResult {
     var state = initial;
     let radius_squared = family_escape_radius_squared(family);
     let threshold = family_convergence_threshold(family);
     var previous_residual = initial_previous_residual;
-    var trap = initial_trap;
+    var stats = initial_stats;
     for (var i = first_iteration; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
         let previous = state.z;
         state = family_step_f32(family, state);
         let iteration = i + 1u;
-        trap = min(trap, dot(state.z, state.z));
+        observe(&stats, family, state.z, previous, state.c, iteration, dynamical);
         if (family_escaped(family, state.z, radius_squared)) {
             return GenericResult(RESULT_ESCAPED, iteration, state.z,
-                smooth_escape_value(family, iteration, state.z), trap);
+                smooth_escape_value(family, iteration, state.z), stats);
         }
         let residual = family_residual(family, state.z, previous);
         if (residual >= 0.0 && residual < threshold) {
             return GenericResult(RESULT_CONVERGED, iteration, state.z,
-                smooth_convergence_value(iteration, previous_residual, residual, threshold), trap);
+                smooth_convergence_value(iteration, previous_residual, residual, threshold), stats);
         }
         previous_residual = residual;
     }
-    return GenericResult(RESULT_BOUNDED, max_iterations, state.z, f32(max_iterations), trap);
+    return GenericResult(RESULT_BOUNDED, max_iterations, state.z, f32(max_iterations), stats);
 }
 
 // Plain-f32 delta helpers for the `_f32` instantiation.
@@ -1809,7 +1751,7 @@ fn iterate_family_perturbation__T(
 
     var approximate = z0 + dc_to_f32(state.dz);
     var previous_residual = 1e30;
-    var trap = 1e30;
+    var stats = stats_new(dynamical);
     var z_prev = initial_prev;
     var z = z0;
     for (var i = 0u; i < 50000u; i = i + 1u) {
@@ -1821,15 +1763,15 @@ fn iterate_family_perturbation__T(
         z = z_next;
         approximate = z_next + dc_to_f32(state.dz);
         let iteration = i + 1u;
-        trap = min(trap, dot(approximate, approximate));
+        observe(&stats, family, approximate, previous, state.c_ref + dc_to_f32(state.dc), iteration, dynamical);
         if (family_escaped(family, approximate, radius_squared)) {
             return GenericResult(RESULT_ESCAPED, iteration, approximate,
-                smooth_escape_value(family, iteration, approximate), trap);
+                smooth_escape_value(family, iteration, approximate), stats);
         }
         let residual = family_residual(family, approximate, previous);
         if (residual >= 0.0 && residual < threshold) {
             return GenericResult(RESULT_CONVERGED, iteration, approximate,
-                smooth_convergence_value(iteration, previous_residual, residual, threshold), trap);
+                smooth_convergence_value(iteration, previous_residual, residual, threshold), stats);
         }
         previous_residual = residual;
     }
@@ -1844,53 +1786,261 @@ fn iterate_family_perturbation__T(
             z_prev + dc_to_f32(state.dz_prev),
             state.c_ref + dc_to_f32(state.dc),
         );
-        return continue_family_f32(family, tail, available_iterations, max_iterations, trap, previous_residual);
+        return continue_family_f32(family, tail, available_iterations, max_iterations, stats, previous_residual, dynamical);
     }
-    return GenericResult(RESULT_BOUNDED, max_iterations, approximate, f32(max_iterations), trap);
+    return GenericResult(RESULT_BOUNDED, max_iterations, approximate, f32(max_iterations), stats);
 }
 // END DELTA TEMPLATE
 
-fn newton_from_generic(result: GenericResult) -> NewtonResult {
-    let z2 = complex_mul(result.z, result.z);
-    let residual = length(complex_mul(z2, result.z) - vec2<f32>(1.0, 0.0));
-    return NewtonResult(
-        result.kind == RESULT_CONVERGED,
-        nearest_newton_root(result.z),
-        result.iteration,
-        result.value,
-        residual,
-        result.z,
-    );
+// ---------------------------------------------------------------------------
+// Colour stage.
+//
+// `observe` runs once per iteration in every loop above and keeps the
+// accumulators the selected algorithms need; `colour_stage` reduces a result
+// to a gradient position through the outside or inside algorithm and looks
+// it up in the rasterised gradient.
+// ---------------------------------------------------------------------------
+
+fn stats_new(dynamical: bool) -> OrbitStats {
+    // In the dynamical plane the pixel is z0, so dz0/dz0 = 1; in the
+    // parameter plane the families with derivative support start from a
+    // constant, so dz0/dc = 0 and the first step contributes ∂f/∂c.
+    let derivative = ScaledComplex(vec2<f32>(select(0.0, 1.0, dynamical), 0.0), 0);
+    return OrbitStats(1e30, 1e30, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, derivative);
 }
 
-fn palette(t: f32) -> vec3<f32> {
-    let a = vec3<f32>(0.47, 0.49, 0.52);
-    let b = vec3<f32>(0.42, 0.39, 0.36);
-    let c = vec3<f32>(1.00, 0.82, 0.68);
-    let d = vec3<f32>(0.06, 0.18, 0.36);
-    return a + b * cos(6.2831853 * (c * t + d));
+// Metric of z against a trap shape. Point traps accumulate the squared
+// distance (no square root per iteration); `trap_distance` undoes that.
+fn trap_metric(shape: u32, centre: vec2<f32>, size: f32, z: vec2<f32>) -> f32 {
+    let d = z - centre;
+    switch shape {
+        case 1u: { return min(abs(d.x), abs(d.y)); }
+        case 2u: { return abs(length(d) - size); }
+        case 3u: { return abs(max(abs(d.x), abs(d.y)) - size); }
+        case 4u: { return abs(d.y); }
+        case 5u: { return abs(d.x); }
+        default: { return dot(d, d); }
+    }
 }
 
-fn newton_colour(result: NewtonResult, detail: bool) -> vec3<f32> {
-    if (!result.converged) {
-        let warning = clamp(log2(1.0 + result.residual) * 0.025, 0.0, 0.18);
-        return vec3<f32>(0.025 + warning, 0.031, 0.043);
+fn trap_distance(shape: u32, metric: f32) -> f32 {
+    if (shape == 0u) { return sqrt(max(metric, 0.0)); }
+    return metric;
+}
+
+// Whether `derivative_step` knows the family's derivative; other families
+// fall back to the iteration count when distance estimation is selected.
+fn family_has_derivative(family: u32) -> bool {
+    return family == FAMILY_QUADRATIC || family == FAMILY_MULTIBROT || family == FAMILY_LAMBDA;
+}
+
+// One step of dz_{n+1} = f'(z_n) dz_n (+ ∂f/∂c in the parameter plane).
+fn derivative_step(
+    family: u32,
+    derivative: ScaledComplex,
+    z_prev: vec2<f32>,
+    c: vec2<f32>,
+    dynamical: bool,
+) -> ScaledComplex {
+    var multiplier = 2.0 * z_prev;
+    var offset = vec2<f32>(1.0, 0.0);
+    switch family {
+        case FAMILY_MULTIBROT: {
+            let degree = family_degree();
+            multiplier = f32(degree) * complex_pow(z_prev, degree - 1u);
+        }
+        case FAMILY_LAMBDA: {
+            let one = vec2<f32>(1.0, 0.0);
+            multiplier = complex_mul(c, one - 2.0 * z_prev);
+            offset = complex_mul(z_prev, one - z_prev);
+        }
+        default: {}
     }
-    var root_colour = vec3<f32>(0.20, 0.86, 0.92);
-    if (result.root == 1u) {
-        root_colour = vec3<f32>(0.98, 0.43, 0.30);
-    } else if (result.root == 2u) {
-        root_colour = vec3<f32>(0.96, 0.79, 0.30);
+    var next = scaled_mul_plain(derivative, multiplier);
+    if (!dynamical) {
+        next = scaled_add(next, ScaledComplex(offset, 0));
     }
-    if (u.display.z < 0.5) {
-        return root_colour;
+    return next;
+}
+
+fn observe(
+    stats: ptr<function, OrbitStats>,
+    family: u32,
+    z: vec2<f32>,
+    z_prev: vec2<f32>,
+    c: vec2<f32>,
+    iteration: u32,
+    dynamical: bool,
+) {
+    if (!ORBIT_STATS) { return; }
+    if (colouring.needs.x > 0.5) {
+        (*stats).trap_outside = min((*stats).trap_outside, trap_metric(
+            u32(colouring.outside_b.w + 0.5), colouring.outside_c.xy, colouring.outside_c.z, z));
+        (*stats).trap_inside = min((*stats).trap_inside, trap_metric(
+            u32(colouring.inside_b.w + 0.5), colouring.inside_c.xy, colouring.inside_c.z, z));
     }
-    let speed = exp(-0.055 * result.continuous_iteration);
-    if (!detail) {
-        return root_colour * (0.24 + 0.76 * speed);
+    if (colouring.needs.y > 0.5 && iteration > 1u) {
+        // |z_{n+1}| lies between ||z_n|^d − |c|| and |z_n|^d + |c| for
+        // z_{n+1} = z_n^d + c; record where in that range it fell.
+        let degree = family_degree();
+        var power = dot(z_prev, z_prev);
+        if (degree != 2u) {
+            power = pow(max(length(z_prev), 1e-20), f32(degree));
+        }
+        let c_size = length(c);
+        let low = abs(power - c_size);
+        let high = power + c_size;
+        let span = high - low;
+        var term = 0.0;
+        if (span > 1e-12) {
+            term = clamp((length(z) - low) / span, 0.0, 1.0);
+        }
+        (*stats).tia_sum = (*stats).tia_sum + term;
+        (*stats).tia_last = term;
+        (*stats).tia_count = (*stats).tia_count + 1.0;
     }
-    let convergence = palette(0.043 * result.continuous_iteration + u.display.y);
-    return mix(convergence, root_colour, 0.28) * (0.38 + 0.62 * speed);
+    if (colouring.needs.z > 0.5) {
+        let frequency = select(colouring.inside_b.z, colouring.outside_b.z,
+            u32(colouring.outside_a.x + 0.5) == ALGORITHM_STRIPES);
+        let term = 0.5 + 0.5 * sin(frequency * atan2(z.y, z.x));
+        (*stats).stripe_sum = (*stats).stripe_sum + term;
+        (*stats).stripe_last = term;
+        (*stats).stripe_count = (*stats).stripe_count + 1.0;
+    }
+    if (colouring.needs.w > 0.5 && family_has_derivative(family)) {
+        (*stats).derivative = derivative_step(family, (*stats).derivative, z_prev, c, dynamical);
+    }
+}
+
+fn gradient_colour(position: f32) -> vec3<f32> {
+    let n = max(u32(colouring.table.x + 0.5), 1u);
+    let scaled = fract(position) * f32(n);
+    let base = floor(scaled);
+    let i0 = min(u32(base), n - 1u);
+    let i1 = (i0 + 1u) % n;
+    return mix(gradient_table[i0].rgb, gradient_table[i1].rgb, scaled - base);
+}
+
+fn transfer(code: u32, value: f32) -> f32 {
+    let v = max(value, 0.0);
+    switch code {
+        case 1u: { return sqrt(v); }
+        case 2u: { return pow(v, 1.0 / 3.0); }
+        case 3u: { return log(1.0 + v); }
+        default: { return v; }
+    }
+}
+
+// Weight of an escaped orbit's final term in an average: 1 when the orbit
+// only just crossed the escape radius (its neighbour in the next band has
+// the same term in full), 0 when it nearly escaped one iteration earlier.
+// Derived from the family's own smoothing term, so it matches whatever
+// radius and degree the smoothing uses; integer colouring gives 1.
+fn escape_band_weight(family: u32, z: vec2<f32>) -> f32 {
+    let radius = sqrt(family_escape_radius_squared(family));
+    let at_radius = smooth_escape_value(family, 0u, vec2<f32>(radius, 0.0));
+    let at_z = smooth_escape_value(family, 0u, z);
+    return clamp(1.0 + at_z - at_radius, 0.0, 1.0);
+}
+
+// Weight of the final accumulator term for any finished orbit. Convergence
+// smoothing already yields a fraction that is 0 when the previous iterate
+// had all but converged.
+fn final_term_weight(family: u32, result: GenericResult) -> f32 {
+    if (result.kind == RESULT_ESCAPED) {
+        return escape_band_weight(family, result.z);
+    }
+    if (result.kind == RESULT_CONVERGED && u.display.z > 0.5) {
+        return fract(result.value);
+    }
+    return 1.0;
+}
+
+// Blends the running average of an orbit accumulator with the average that
+// excludes the final term, so the colouring stays continuous across
+// iteration bands.
+fn blended_average(sum: f32, last: f32, count: f32, weight: f32) -> f32 {
+    if (count < 1.0) { return 0.0; }
+    let all = sum / count;
+    if (count < 2.0) { return all; }
+    let previous = (sum - last) / (count - 1.0);
+    return mix(previous, all, weight);
+}
+
+fn colour_side(
+    a: vec4<f32>,
+    b: vec4<f32>,
+    c: vec4<f32>,
+    d: vec4<f32>,
+    family: u32,
+    result: GenericResult,
+    inside: bool,
+) -> vec3<f32> {
+    let algorithm = u32(a.x + 0.5);
+    if (algorithm == ALGORITHM_SOLID) {
+        return d.rgb;
+    }
+    var value = result.value;
+    switch algorithm {
+        case ALGORITHM_DECOMPOSITION: {
+            var angle = atan2(result.z.y, result.z.x) / 6.2831853 + 0.5;
+            let sectors = b.y;
+            if (sectors >= 1.0) {
+                angle = floor(angle * sectors) / sectors;
+            }
+            value = angle;
+        }
+        case ALGORITHM_TRIANGLE: {
+            if (ORBIT_STATS) {
+                value = blended_average(result.stats.tia_sum, result.stats.tia_last,
+                    result.stats.tia_count, final_term_weight(family, result));
+            }
+        }
+        case ALGORITHM_STRIPES: {
+            if (ORBIT_STATS) {
+                value = blended_average(result.stats.stripe_sum, result.stats.stripe_last,
+                    result.stats.stripe_count, final_term_weight(family, result));
+            }
+        }
+        case ALGORITHM_DISTANCE: {
+            if (ORBIT_STATS && family_has_derivative(family) && result.kind == RESULT_ESCAPED) {
+                // Exterior distance |z| ln|z| / |dz| expressed in pixels,
+                // evaluated in logarithms so deep zooms stay in range.
+                let magnitude = max(length(result.z), 1.000001);
+                let mantissa = max(length(result.stats.derivative.mantissa), 1e-30);
+                let log_derivative = log(mantissa) + f32(result.stats.derivative.exponent) * 0.69314718;
+                let log_distance = log(magnitude) + log(max(log(magnitude), 1e-6)) - log_derivative;
+                value = exp(clamp(log_distance - colouring.table.y, -40.0, 40.0));
+            } else if (result.kind != RESULT_ESCAPED) {
+                value = 0.0;
+            }
+        }
+        case ALGORITHM_TRAP: {
+            if (ORBIT_STATS) {
+                let shape = u32(b.w + 0.5);
+                let metric = select(result.stats.trap_outside, result.stats.trap_inside, inside);
+                value = select(trap_distance(shape, metric), 0.0, metric >= 1e29);
+            }
+        }
+        default: {}
+    }
+    let position = transfer(u32(a.y + 0.5), value) * a.z + a.w;
+    var colour = gradient_colour(position);
+    if (c.w > 0.0) {
+        // Darken slowly escaping or converging pixels.
+        let speed = exp(-0.05 * result.value);
+        colour = colour * mix(1.0, 0.3 + 0.7 * speed, c.w);
+    }
+    return colour;
+}
+
+fn colour_stage(family: u32, result: GenericResult) -> vec3<f32> {
+    if (result.kind == RESULT_BOUNDED) {
+        return colour_side(colouring.inside_a, colouring.inside_b, colouring.inside_c,
+            colouring.inside_d, family, result, true);
+    }
+    return colour_side(colouring.outside_a, colouring.outside_b, colouring.outside_c,
+        colouring.outside_d, family, result, false);
 }
 
 fn grid(world: vec2<f32>, scale: f32) -> f32 {
@@ -1989,7 +2139,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         } else {
             result = iterate_family_f32(family, world_f32, dynamical);
         }
-        var colour = generic_colour(family, result);
+        var colour = colour_stage(family, result);
         if (u.display.w > 0.5) {
             colour = mix(
                 colour,
@@ -2000,23 +2150,17 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         return vec4<f32>(colour, 1.0);
     }
     if (newton) {
-        var result: NewtonResult;
+        var result: GenericResult;
         if (perturbation && u.deep.x < 1.5) {
-            result = newton_from_generic(
-                iterate_family_perturbation_f32(FAMILY_NEWTON, reference_c, reference_local, true),
-            );
+            result = iterate_family_perturbation_f32(FAMILY_NEWTON, reference_c, reference_local, true);
         } else if (perturbation) {
-            result = newton_from_generic(
-                iterate_family_perturbation_scaled(FAMILY_NEWTON, reference_c, reference_local, true),
-            );
+            result = iterate_family_perturbation_scaled(FAMILY_NEWTON, reference_c, reference_local, true);
         } else if (double_single) {
-            result = newton_from_generic(
-                iterate_family_ds(FAMILY_NEWTON, centre_ds, local_offset, true),
-            );
+            result = iterate_family_ds(FAMILY_NEWTON, centre_ds, local_offset, true);
         } else {
-            result = iterate_newton(world_f32);
+            result = iterate_family_f32(FAMILY_NEWTON, world_f32, true);
         }
-        var colour = newton_colour(result, u.display.x > 0.5);
+        var colour = colour_stage(FAMILY_NEWTON, result);
         if (u.display.w > 0.5) {
             colour = mix(
                 colour,
@@ -2038,20 +2182,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         result = iterate_f32(world_f32, julia);
     }
 
-    var colour = vec3<f32>(0.025, 0.031, 0.043);
+    var generic = GenericResult(RESULT_BOUNDED, result.iteration, result.z,
+        f32(result.iteration), result.stats);
     if (result.escaped) {
-        var value = f32(result.iteration);
-        if (u.display.z > 0.5) {
-            let magnitude_squared = max(dot(result.z, result.z), 1.000001);
-            let log_zn = 0.5 * log(magnitude_squared);
-            value = value + 1.0 - log2(max(log_zn, 1e-6));
-        }
-        let t = 0.035 * value + u.display.y;
-        colour = palette(t);
-        colour *= 0.82 + 0.18 * cos(6.2831853 * fract(value * 0.05));
-    } else {
-        colour = interior_colour(result.trap);
+        generic.kind = RESULT_ESCAPED;
+        generic.value = smooth_escape_value(FAMILY_QUADRATIC, result.iteration, result.z);
     }
+    var colour = colour_stage(FAMILY_QUADRATIC, generic);
 
     if (u.display.w > 0.5) {
         colour = mix(

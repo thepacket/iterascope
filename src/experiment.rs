@@ -3,10 +3,14 @@
 use serde::{Deserialize, Serialize};
 
 use crate::arbitrary::MAX_DECIMAL_ZOOM_EXPONENT;
+use crate::colouring::Colouring;
 use crate::family::{FamilyParameters, FractalFamily, Linkage};
 
 pub(crate) const FORMAT_ID: &str = "iterascope-experiment";
-pub(crate) const FORMAT_VERSION: u32 = 4;
+pub(crate) const FORMAT_VERSION: u32 = 5;
+/// Largest escape radius a document may ask for. Large radii give the
+/// triangle-inequality and stripe colourings their smoothest results.
+pub(crate) const MAX_BAILOUT: f32 = 1e10;
 #[cfg(test)]
 const QUADRATIC_FAMILY_ID: &str = FractalFamily::Quadratic.document_id();
 #[cfg(test)]
@@ -31,6 +35,10 @@ pub(crate) struct ExperimentDocument {
     pub(crate) family_parameters: Option<FamilyParametersDocument>,
     pub(crate) computation: ComputationDocument,
     pub(crate) display: DisplayDocument,
+    /// Gradient and colouring algorithms (format version 5). Absent in older
+    /// documents, which are coloured with the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) colouring: Option<Colouring>,
     #[serde(
         default,
         alias = "initial_julia_zoom_exponent",
@@ -161,6 +169,9 @@ pub(crate) struct ComputationDocument {
 pub(crate) struct DisplayDocument {
     pub(crate) smooth_escape_time: bool,
     pub(crate) coordinate_grid: bool,
+    /// Gradient offset of documents before format version 5; newer documents
+    /// record the offset inside `colouring`.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
     pub(crate) palette_phase: f32,
     #[serde(default = "default_true")]
     pub(crate) critical_orbit_overlay: bool,
@@ -175,6 +186,10 @@ const fn default_true() -> bool {
 
 const fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+fn is_zero_f32(value: &f32) -> bool {
+    *value == 0.0
 }
 
 impl ExperimentDocument {
@@ -218,9 +233,17 @@ impl ExperimentDocument {
             ));
         }
         if !self.computation.bailout.is_finite()
-            || !(2.0..=32.0).contains(&self.computation.bailout)
+            || !(2.0..=MAX_BAILOUT).contains(&self.computation.bailout)
         {
-            return Err("bailout must be finite and between 2 and 32".to_owned());
+            return Err("bailout must be finite and between 2 and 1e10".to_owned());
+        }
+        if let Some(colouring) = &self.colouring {
+            colouring
+                .validate()
+                .map_err(|error| format!("colouring: {error}"))?;
+            if self.version < 5 {
+                return Err("colouring requires document version 5".to_owned());
+            }
         }
         if !self.display.palette_phase.is_finite()
             || !(-1.0..=1.0).contains(&self.display.palette_phase)
@@ -371,6 +394,7 @@ mod tests {
                 critical_orbit_overlay: true,
                 interior_shading: true,
             },
+            colouring: None,
             progressive_julia_zoom_target_exponent: 0,
             deep_parameter_plane: None,
             deep_dynamical_plane: None,
@@ -400,6 +424,47 @@ mod tests {
         let restored = ExperimentDocument::from_json(&json).unwrap();
         assert_eq!(restored, document);
         assert!(json.contains("1.45e-1000"));
+    }
+
+    #[test]
+    fn colouring_round_trips_and_requires_version_five() {
+        use crate::colouring::{ColouringAlgorithm, Gradient};
+        let mut document = example();
+        let mut colouring = Colouring {
+            gradient: Gradient::random(11),
+            ..Colouring::default()
+        };
+        colouring
+            .outside
+            .set_algorithm(ColouringAlgorithm::TriangleInequality);
+        colouring
+            .inside
+            .set_algorithm(ColouringAlgorithm::OrbitTrap);
+        document.colouring = Some(colouring);
+        document.computation.bailout = 1e8;
+        let json = document.to_pretty_json().unwrap();
+        assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
+
+        document.version = 4;
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("version 5"), "{error}");
+
+        document.version = 5;
+        document.colouring.as_mut().unwrap().outside.density = -1.0;
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("colouring: outside.density"), "{error}");
+
+        document.computation.bailout = 1e11;
+        assert!(ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).is_err());
+    }
+
+    #[test]
+    fn older_documents_without_colouring_still_load() {
+        let mut document = example();
+        document.version = 4;
+        let json = document.to_pretty_json().unwrap();
+        assert!(!json.contains("colouring"));
+        assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
     }
 
     #[test]

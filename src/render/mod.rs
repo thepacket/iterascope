@@ -9,6 +9,7 @@ use crate::MAX_ITERATIONS;
 use crate::arbitrary::DeepComplex;
 #[cfg(test)]
 use crate::arbitrary::ReferenceOrbit;
+use crate::colouring::{self, Colouring};
 use crate::precision::{PrecisionMode, split_f64};
 
 /// Raw WGSL with the delta-algebra template; see [`shader_source`].
@@ -18,17 +19,39 @@ const PANE_COUNT: usize = 2;
 const TEMPLATE_BEGIN: &str = "// BEGIN DELTA TEMPLATE\n";
 const TEMPLATE_END: &str = "// END DELTA TEMPLATE\n";
 
+/// The shader with orbit statistics enabled (see [`shader_source_variant`]).
+#[cfg(test)]
+pub(crate) fn shader_source() -> String {
+    shader_source_variant(true)
+}
+
 /// Expands the delta-algebra template in `fractal.wgsl` into its scaled
 /// (arbitrary-precision depth) and plain-f32 (f64-reference range)
-/// instantiations and returns the compilable shader source.
-pub(crate) fn shader_source() -> String {
-    let begin = SHADER
+/// instantiations and returns the compilable shader source. With
+/// `orbit_stats` false the per-iteration colouring accumulators are compiled
+/// out, which keeps the default configuration as fast as it was before the
+/// colour stage existed.
+pub(crate) fn shader_source_variant(orbit_stats: bool) -> String {
+    const MARKER: &str = "const ORBIT_STATS: bool = true; // ORBIT_STATS_MARKER";
+    assert!(
+        SHADER.contains(MARKER),
+        "fractal.wgsl has the ORBIT_STATS marker"
+    );
+    let shader = SHADER.replace(
+        MARKER,
+        if orbit_stats {
+            "const ORBIT_STATS: bool = true;"
+        } else {
+            "const ORBIT_STATS: bool = false;"
+        },
+    );
+    let begin = shader
         .find(TEMPLATE_BEGIN)
         .expect("fractal.wgsl has a delta template begin marker");
-    let end = SHADER
+    let end = shader
         .find(TEMPLATE_END)
         .expect("fractal.wgsl has a delta template end marker");
-    let template = &SHADER[begin + TEMPLATE_BEGIN.len()..end];
+    let template = &shader[begin + TEMPLATE_BEGIN.len()..end];
     let scaled = instantiate_template(
         template,
         "_scaled",
@@ -91,13 +114,13 @@ pub(crate) fn shader_source() -> String {
             ("dr_scale", "fr_scale"),
         ],
     );
-    let mut source = String::with_capacity(SHADER.len() + template.len());
-    source.push_str(&SHADER[..begin]);
+    let mut source = String::with_capacity(shader.len() + template.len());
+    source.push_str(&shader[..begin]);
     source.push_str("// --- scaled instantiation ---\n");
     source.push_str(&scaled);
     source.push_str("// --- f32 instantiation ---\n");
     source.push_str(&plain);
-    source.push_str(&SHADER[end + TEMPLATE_END.len()..]);
+    source.push_str(&shader[end + TEMPLATE_END.len()..]);
     source
 }
 
@@ -168,10 +191,8 @@ impl Uniforms {
         bailout: f32,
         family: u32,
         pane: usize,
-        palette_phase: f32,
         smooth: bool,
         grid: bool,
-        interior_shading: bool,
         precision: PrecisionMode,
         family_words: [f32; 8],
     ) -> Self {
@@ -184,18 +205,8 @@ impl Uniforms {
             view_hi: [centre_x[0], centre_y[0], scale[0], aspect],
             view_lo: [centre_x[1], centre_y[1], scale[1], precision.shader_flag()],
             dynamics_hi: [julia_x[0], julia_y[0], iterations as f32, bailout * bailout],
-            dynamics_lo: [
-                julia_x[1],
-                julia_y[1],
-                family as f32,
-                interior_shading as u8 as f32,
-            ],
-            display: [
-                pane as f32,
-                palette_phase,
-                smooth as u8 as f32,
-                grid as u8 as f32,
-            ],
+            dynamics_lo: [julia_x[1], julia_y[1], family as f32, 0.0],
+            display: [pane as f32, 0.0, smooth as u8 as f32, grid as u8 as f32],
             deep: [0.0; 4],
             family_a: [
                 family_words[0],
@@ -254,6 +265,55 @@ impl GpuReferencePoint {
         Self {
             z_hi: [x[0], y[0]],
             z_lo: [x[1], y[1]],
+        }
+    }
+}
+
+/// The colour stage's uniform block; layout shared with `ColouringUniforms`
+/// in `fractal.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct ColouringUniforms {
+    words: [[f32; 4]; colouring::GPU_WORDS],
+}
+
+impl ColouringUniforms {
+    /// `pixel_log` is the natural logarithm of one pixel's height in world
+    /// units; distance estimates are expressed in pixels.
+    pub(crate) fn new(colouring: &Colouring, pixel_log: f32) -> Self {
+        Self {
+            words: colouring.gpu_words(pixel_log),
+        }
+    }
+
+    /// Whether a selected algorithm needs the per-iteration accumulators,
+    /// i.e. the orbit-statistics shader variant.
+    pub(crate) fn needs_orbit_stats(&self) -> bool {
+        self.words[colouring::NEEDS_WORD]
+            .iter()
+            .any(|flag| *flag > 0.5)
+    }
+}
+
+impl Default for ColouringUniforms {
+    fn default() -> Self {
+        Self::new(&Colouring::default(), 0.0)
+    }
+}
+
+/// A rasterised gradient ready for upload. The generation lets the renderer
+/// skip re-uploading a table it already holds.
+#[derive(Debug)]
+pub(crate) struct GradientTable {
+    pub(crate) generation: u64,
+    pub(crate) entries: Vec<[f32; 4]>,
+}
+
+impl GradientTable {
+    pub(crate) fn new(generation: u64, gradient: &colouring::Gradient) -> Self {
+        Self {
+            generation,
+            entries: gradient.lookup_table(),
         }
     }
 }
@@ -369,13 +429,22 @@ struct PreviewTarget {
 struct PaneResources {
     buffer: wgpu::Buffer,
     reference_buffer: wgpu::Buffer,
+    colouring_buffer: wgpu::Buffer,
+    gradient_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     reference_generation: Mutex<Option<u64>>,
+    gradient_generation: Mutex<Option<u64>>,
+    /// Whether the uploaded colouring needs the orbit-statistics pipeline.
+    orbit_stats: Mutex<bool>,
     preview: Mutex<Option<PreviewTarget>>,
 }
 
 pub struct FractalPipeline {
+    /// Fractal pipeline with the colouring accumulators compiled out.
     pipeline: wgpu::RenderPipeline,
+    /// Fractal pipeline gathering orbit statistics for the trap, average
+    /// and distance-estimate colourings.
+    stats_pipeline: wgpu::RenderPipeline,
     /// Draws a preview texture onto the pane.
     blit_pipeline: wgpu::RenderPipeline,
     blit_layout: wgpu::BindGroupLayout,
@@ -420,7 +489,11 @@ impl FractalPipeline {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("iterascope.fractal.shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_source().into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source_variant(false).into()),
+        });
+        let stats_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("iterascope.fractal.shader.orbit-stats"),
+            source: wgpu::ShaderSource::Wgsl(shader_source_variant(true).into()),
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("iterascope.fractal.bind-group-layout"),
@@ -449,6 +522,28 @@ impl FractalPipeline {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<ColouringUniforms>() as u64,
+                        ),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(16),
+                    },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -456,31 +551,36 @@ impl FractalPipeline {
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("iterascope.fractal.pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let fractal_pipeline = |label: &str, module: &wgpu::ShaderModule| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = fractal_pipeline("iterascope.fractal.pipeline", &shader);
+        let stats_pipeline =
+            fractal_pipeline("iterascope.fractal.pipeline.orbit-stats", &stats_shader);
 
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("iterascope.blit.shader"),
@@ -567,6 +667,33 @@ impl FractalPipeline {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            // The colour stage starts with the default colouring and
+            // gradient so a pane renders before the application uploads
+            // its own.
+            let colouring_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iterascope.colouring"),
+                size: std::mem::size_of::<ColouringUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: true,
+            });
+            colouring_buffer
+                .slice(..)
+                .get_mapped_range_mut()
+                .copy_from_slice(bytemuck::bytes_of(&ColouringUniforms::default()));
+            colouring_buffer.unmap();
+            let gradient_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iterascope.gradient"),
+                size: (colouring::LOOKUP_TABLE_LEN * std::mem::size_of::<[f32; 4]>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: true,
+            });
+            gradient_buffer
+                .slice(..)
+                .get_mapped_range_mut()
+                .copy_from_slice(bytemuck::cast_slice(
+                    &colouring::Gradient::default().lookup_table(),
+                ));
+            gradient_buffer.unmap();
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("iterascope.fractal.bind-group"),
                 layout: &bind_group_layout,
@@ -579,24 +706,73 @@ impl FractalPipeline {
                         binding: 1,
                         resource: reference_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: colouring_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: gradient_buffer.as_entire_binding(),
+                    },
                 ],
             });
             PaneResources {
                 buffer,
                 reference_buffer,
+                colouring_buffer,
+                gradient_buffer,
                 bind_group,
                 reference_generation: Mutex::new(None),
+                gradient_generation: Mutex::new(None),
+                orbit_stats: Mutex::new(false),
                 preview: Mutex::new(None),
             }
         });
 
         Self {
             pipeline,
+            stats_pipeline,
             blit_pipeline,
             blit_layout,
             sampler,
             target_format,
             panes,
+        }
+    }
+
+    /// Uploads the colour stage for a pane: the uniform block every time,
+    /// the gradient table only when its generation changed.
+    fn upload_colouring(
+        &self,
+        queue: &wgpu::Queue,
+        pane: usize,
+        colouring: &ColouringUniforms,
+        gradient: Option<&GradientTable>,
+    ) {
+        let resources = &self.panes[pane];
+        queue.write_buffer(
+            &resources.colouring_buffer,
+            0,
+            bytemuck::bytes_of(colouring),
+        );
+        *resources.orbit_stats.lock().unwrap() = colouring.needs_orbit_stats();
+        if let Some(gradient) = gradient {
+            let mut uploaded = resources.gradient_generation.lock().unwrap();
+            if *uploaded != Some(gradient.generation) {
+                let entries =
+                    &gradient.entries[..gradient.entries.len().min(colouring::LOOKUP_TABLE_LEN)];
+                queue.write_buffer(&resources.gradient_buffer, 0, bytemuck::cast_slice(entries));
+                *uploaded = Some(gradient.generation);
+            }
+        }
+    }
+
+    /// The fractal pipeline matching the pane's uploaded colouring.
+    fn fractal_pipeline(&self, pane: usize) -> &wgpu::RenderPipeline {
+        if *self.panes[pane].orbit_stats.lock().unwrap() {
+            &self.stats_pipeline
+        } else {
+            &self.pipeline
         }
     }
 
@@ -648,6 +824,8 @@ impl FractalPipeline {
 struct FractalCallback {
     pane: usize,
     uniforms: Uniforms,
+    colouring: ColouringUniforms,
+    gradient: Arc<GradientTable>,
     deep: Option<Arc<DeepRenderData>>,
     /// Preview reduction factor: 1 renders directly at full resolution;
     /// larger values render into a texture of 1/factor the size and blit it.
@@ -680,6 +858,7 @@ impl CallbackTrait for FractalCallback {
                 0,
                 bytemuck::bytes_of(&self.uniforms),
             );
+            renderer.upload_colouring(queue, self.pane, &self.colouring, Some(&self.gradient));
             if let Some(deep) = &self.deep {
                 let pane = &renderer.panes[self.pane];
                 let mut uploaded = pane.reference_generation.lock().unwrap();
@@ -714,7 +893,7 @@ impl CallbackTrait for FractalCallback {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    pass.set_pipeline(&renderer.pipeline);
+                    pass.set_pipeline(renderer.fractal_pipeline(self.pane));
                     pass.set_bind_group(0, &renderer.panes[self.pane].bind_group, &[]);
                     pass.draw(0..3, 0..1);
                 }
@@ -741,16 +920,19 @@ impl CallbackTrait for FractalCallback {
                 return;
             }
         }
-        render_pass.set_pipeline(&renderer.pipeline);
+        render_pass.set_pipeline(renderer.fractal_pipeline(self.pane));
         render_pass.set_bind_group(0, &renderer.panes[self.pane].bind_group, &[]);
         render_pass.draw(0..3, 0..1);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn callback(
     rect: egui::Rect,
     pane: usize,
     uniforms: Uniforms,
+    colouring: ColouringUniforms,
+    gradient: Arc<GradientTable>,
     deep: Option<Arc<DeepRenderData>>,
     preview_scale: u32,
     pixels_per_point: f32,
@@ -764,6 +946,8 @@ pub(crate) fn callback(
         FractalCallback {
             pane,
             uniforms,
+            colouring,
+            gradient,
             deep,
             preview_scale: preview_scale.max(1),
             pixel_size,
@@ -774,6 +958,16 @@ pub(crate) fn callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_shader_variant_compiles_the_accumulators_out() {
+        let plain = shader_source_variant(false);
+        let stats = shader_source_variant(true);
+        assert!(plain.contains("const ORBIT_STATS: bool = false;"));
+        assert!(stats.contains("const ORBIT_STATS: bool = true;"));
+        assert!(!plain.contains("ORBIT_STATS_MARKER"));
+        naga::front::wgsl::parse_str(&plain).expect("plain variant parses");
+    }
 
     #[test]
     fn shader_validates_with_wgpus_naga_version() {
@@ -819,10 +1013,8 @@ mod tests {
             4.0,
             0,
             0,
-            0.0,
             true,
             false,
-            true,
             PrecisionMode::DoubleSingle,
             [0.0; 8],
         );
@@ -845,10 +1037,8 @@ mod tests {
             4.0,
             0,
             1,
-            0.0,
             true,
             false,
-            true,
             PrecisionMode::DoubleSingle,
             [0.0; 8],
         )
@@ -869,10 +1059,8 @@ mod tests {
             4.0,
             1,
             0,
-            0.0,
             true,
             false,
-            true,
             PrecisionMode::F32,
             [0.0; 8],
         );
@@ -927,10 +1115,8 @@ mod tests {
             4.0,
             2,
             1,
-            0.0,
             true,
             false,
-            true,
             PrecisionMode::F32,
             words,
         );
@@ -1040,7 +1226,7 @@ mod tests {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_pipeline(&self.pipeline.pipeline);
+                pass.set_pipeline(self.pipeline.fractal_pipeline(pane));
                 pass.set_bind_group(0, &self.pipeline.panes[pane].bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
@@ -1124,7 +1310,7 @@ mod tests {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_pipeline(&self.pipeline.pipeline);
+                pass.set_pipeline(self.pipeline.fractal_pipeline(pane));
                 pass.set_bind_group(0, &self.pipeline.panes[pane].bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
@@ -1192,6 +1378,25 @@ mod tests {
                 }
             }
             rgb
+        }
+
+        /// Uploads a colour stage for a pane; later renders of that pane use
+        /// it until replaced.
+        fn set_colouring(&self, pane: usize, colouring: &Colouring, pixel_log: f32) {
+            let table = GradientTable::new(
+                self.pipeline.panes[pane]
+                    .gradient_generation
+                    .lock()
+                    .unwrap()
+                    .map_or(1, |generation| generation + 1),
+                &colouring.gradient,
+            );
+            self.pipeline.upload_colouring(
+                &self.queue,
+                pane,
+                &ColouringUniforms::new(colouring, pixel_log),
+                Some(&table),
+            );
         }
 
         fn write_ppm(&self, path: &str, rgb: &[u8]) {
@@ -1281,15 +1486,170 @@ mod tests {
                 4.0,
                 family.shader_flag(),
                 pane,
-                0.0,
                 true,
                 false,
-                true,
                 precision,
                 parameters.uniform_words(dynamical),
             );
             let rgb = gpu.render(pane, uniforms, None);
             gpu.write_ppm(&format!("{directory}/{name}.ppm"), &rgb);
+        }
+    }
+
+    /// Renders the quadratic family through every colouring algorithm, at the
+    /// default view and around an f64 reference at 1e12, and writes the
+    /// images to `$ITERASCOPE_RENDER_DIR` when set. Every algorithm must
+    /// produce a varied image (no collapsed or NaN-black output), and the
+    /// distance estimate must stay varied at depth, where it is evaluated in
+    /// logarithms. Run with
+    /// `ITERASCOPE_RENDER_DIR=out cargo test --release gpu_colouring_gallery -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gpu_colouring_gallery() {
+        use crate::colouring::{ColouringAlgorithm, Gradient, TrapShape};
+        use crate::family::{
+            FamilyParameters, FractalFamily, initial_state_with, reference_orbit_f64,
+        };
+        let directory = std::env::var("ITERASCOPE_RENDER_DIR").ok();
+        if let Some(directory) = &directory {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let gpu = GpuHarness::new(512, 352);
+        let parameters = FamilyParameters::default();
+        let family = FractalFamily::Quadratic;
+        let iterations = 512;
+        let bailout = 1e6_f32;
+        let plane = family.default_parameter_view();
+        let deep_point = boundary_point(
+            family,
+            &parameters,
+            plane.centre,
+            plane.half_height,
+            false,
+            family.default_parameter(),
+            iterations,
+        )
+        .unwrap();
+        let deep_half_height = 1.45 / 1e12;
+        let orbit = reference_orbit_f64(
+            family,
+            &parameters,
+            initial_state_with(family, deep_point, false, family.default_parameter()),
+            iterations,
+            bailout as f64,
+        );
+        let deep =
+            DeepRenderData::from_f64_orbit(1, deep_half_height, &orbit.points, true, [0.0; 2]);
+
+        let render = |colouring: &Colouring, deep_zoom: bool| -> Vec<u8> {
+            let (centre, half_height) = if deep_zoom {
+                (deep_point, deep_half_height)
+            } else {
+                (plane.centre, plane.half_height)
+            };
+            let pixel_log = (2.0 * half_height / gpu.height as f64).ln() as f32;
+            gpu.set_colouring(0, colouring, pixel_log);
+            let mut uniforms = Uniforms::new(
+                centre,
+                half_height,
+                gpu.aspect(),
+                family.default_parameter(),
+                iterations,
+                bailout,
+                family.shader_flag(),
+                0,
+                true,
+                false,
+                if deep_zoom {
+                    PrecisionMode::DoubleSingle
+                } else {
+                    PrecisionMode::F32
+                },
+                parameters.uniform_words(false),
+            );
+            if deep_zoom {
+                uniforms = uniforms.enable_perturbation(
+                    deep.scale_mantissa,
+                    deep.scale_exponent,
+                    deep.reference.len(),
+                    true,
+                    [0.0; 2],
+                );
+                gpu.render(0, uniforms, Some(deep.reference.as_slice()))
+            } else {
+                gpu.render(0, uniforms, None)
+            }
+        };
+        let distinct = |rgb: &[u8]| -> usize {
+            let set: std::collections::HashSet<&[u8]> = rgb.chunks(3).collect();
+            set.len()
+        };
+
+        for algorithm in ColouringAlgorithm::ALL {
+            for deep_zoom in [false, true] {
+                let mut colouring = Colouring {
+                    gradient: Gradient::random(5),
+                    ..Colouring::default()
+                };
+                colouring.outside.set_algorithm(algorithm);
+                colouring
+                    .inside
+                    .set_algorithm(ColouringAlgorithm::OrbitTrap);
+                colouring.inside.trap_shape = TrapShape::Cross;
+                if algorithm == ColouringAlgorithm::Decomposition {
+                    colouring.outside.sectors = 2;
+                }
+                if deep_zoom
+                    && matches!(
+                        algorithm,
+                        ColouringAlgorithm::TriangleInequality | ColouringAlgorithm::Stripes
+                    )
+                {
+                    // Deep orbits share hundreds of identical leading terms,
+                    // so the averages vary little; artists raise the density.
+                    colouring.outside.density = 60.0;
+                }
+                let rgb = render(&colouring, deep_zoom);
+                let colours = distinct(&rgb);
+                let black = rgb
+                    .chunks(3)
+                    .filter(|p| p[0] < 4 && p[1] < 4 && p[2] < 4)
+                    .count();
+                eprintln!(
+                    "{:?} {}: {colours} distinct colours, {:.1}% near-black",
+                    algorithm,
+                    if deep_zoom { "at 1e12" } else { "default view" },
+                    100.0 * black as f64 / (rgb.len() / 3) as f64,
+                );
+                if let Some(directory) = &directory {
+                    let name = format!(
+                        "colouring-{:?}-{}",
+                        algorithm,
+                        if deep_zoom { "deep" } else { "default" }
+                    )
+                    .to_lowercase();
+                    gpu.write_ppm(&format!("{directory}/{name}.ppm"), &rgb);
+                }
+                let minimum = match algorithm {
+                    // Two sectors through a random gradient: few outside
+                    // colours, plus the inside trap shading.
+                    ColouringAlgorithm::Decomposition => 8,
+                    ColouringAlgorithm::Solid => 8,
+                    // The closest approach to the trap happens in the part
+                    // of the orbit every deep pixel shares, so the outside
+                    // trap is flat at depth; only the inside trap varies.
+                    ColouringAlgorithm::OrbitTrap if deep_zoom => 8,
+                    _ => 200,
+                };
+                assert!(
+                    colours >= minimum,
+                    "{algorithm:?} (deep {deep_zoom}) collapsed to {colours} colours"
+                );
+                assert!(
+                    black < rgb.len() / 3 / 2,
+                    "{algorithm:?} (deep {deep_zoom}) is mostly black"
+                );
+            }
         }
     }
 
@@ -1409,10 +1769,8 @@ mod tests {
                     4.0,
                     family.shader_flag(),
                     pane,
-                    0.0,
                     true,
                     false,
-                    true,
                     PrecisionMode::DoubleSingle,
                     words,
                 );
@@ -1444,10 +1802,8 @@ mod tests {
                     4.0,
                     family.shader_flag(),
                     pane,
-                    0.0,
                     true,
                     false,
-                    true,
                     PrecisionMode::DoubleSingle,
                     words,
                 )
@@ -1489,10 +1845,8 @@ mod tests {
                     4.0,
                     family.shader_flag(),
                     pane,
-                    0.0,
                     true,
                     false,
-                    true,
                     PrecisionMode::DoubleSingle,
                     words,
                 )
@@ -1540,10 +1894,8 @@ mod tests {
                     4.0,
                     family.shader_flag(),
                     pane,
-                    0.0,
                     true,
                     false,
-                    true,
                     PrecisionMode::DoubleSingle,
                     words,
                 )
@@ -1701,10 +2053,8 @@ mod tests {
             4.0,
             99,
             0,
-            0.0,
             true,
             false,
-            true,
             PrecisionMode::DoubleSingle,
             [0.0; 8],
         );
@@ -1912,10 +2262,8 @@ mod tests {
                 4.0,
                 family.shader_flag(),
                 pane,
-                0.0,
                 true,
                 false,
-                true,
                 PrecisionMode::DoubleSingle,
                 parameters.uniform_words(dynamical),
             )
@@ -1988,10 +2336,8 @@ mod tests {
                     4.0,
                     family.shader_flag(),
                     0,
-                    0.0,
                     true,
                     false,
-                    true,
                     precision,
                     parameters.uniform_words(false),
                 );
@@ -2039,6 +2385,62 @@ mod tests {
                 );
                 let elapsed = start.elapsed();
                 eprintln!("{family:?} {label}: {:.1} ms", elapsed.as_secs_f64() * 1e3);
+
+                // The same render through the orbit-statistics variant with
+                // every accumulator live, to record what the trap, average
+                // and distance-estimate colourings cost on top.
+                let mut heavy = Colouring::default();
+                heavy
+                    .outside
+                    .set_algorithm(crate::colouring::ColouringAlgorithm::TriangleInequality);
+                heavy
+                    .inside
+                    .set_algorithm(crate::colouring::ColouringAlgorithm::OrbitTrap);
+                let mut extra = Colouring::default();
+                extra
+                    .outside
+                    .set_algorithm(crate::colouring::ColouringAlgorithm::Stripes);
+                extra
+                    .inside
+                    .set_algorithm(crate::colouring::ColouringAlgorithm::DistanceEstimate);
+                // Needs flags are the union of both sides; merge by taking
+                // the outside of `heavy` and inside of `extra` plus traps.
+                let mut all = heavy.clone();
+                all.inside = extra.inside;
+                gpu.set_colouring(0, &heavy, -10.0);
+                let _ = gpu.render(
+                    0,
+                    uniforms,
+                    reference.as_ref().map(|d| d.reference.as_slice()),
+                );
+                let start = std::time::Instant::now();
+                let _ = gpu.render(
+                    0,
+                    uniforms,
+                    reference.as_ref().map(|d| d.reference.as_slice()),
+                );
+                let with_stats = start.elapsed();
+                eprintln!(
+                    "{family:?} {label} + orbit stats (TIA/trap): {:.1} ms",
+                    with_stats.as_secs_f64() * 1e3
+                );
+                gpu.set_colouring(0, &all, -10.0);
+                let _ = gpu.render(
+                    0,
+                    uniforms,
+                    reference.as_ref().map(|d| d.reference.as_slice()),
+                );
+                let start = std::time::Instant::now();
+                let _ = gpu.render(
+                    0,
+                    uniforms,
+                    reference.as_ref().map(|d| d.reference.as_slice()),
+                );
+                eprintln!(
+                    "{family:?} {label} + orbit stats (TIA/DE): {:.1} ms",
+                    start.elapsed().as_secs_f64() * 1e3
+                );
+                gpu.set_colouring(0, &Colouring::default(), -10.0);
             }
         }
         // CPU reference orbit costs.
@@ -2100,10 +2502,8 @@ mod tests {
             4.0,
             family.shader_flag(),
             0,
-            0.0,
             true,
             false,
-            true,
             PrecisionMode::F32,
             parameters.uniform_words(false),
         );
@@ -2185,10 +2585,8 @@ mod tests {
                 4.0,
                 family.shader_flag(),
                 0,
-                0.0,
                 true,
                 false,
-                true,
                 PrecisionMode::DoubleSingle,
                 parameters.uniform_words(false),
             )
@@ -2310,10 +2708,8 @@ mod tests {
                     4.0,
                     family.shader_flag(),
                     0,
-                    0.0,
                     true,
                     false,
-                    true,
                     PrecisionMode::DoubleSingle,
                     parameters.uniform_words(false),
                 );
@@ -2338,10 +2734,8 @@ mod tests {
                     4.0,
                     family.shader_flag(),
                     0,
-                    0.0,
                     true,
                     false,
-                    true,
                     PrecisionMode::DoubleSingle,
                     parameters.uniform_words(false),
                 )

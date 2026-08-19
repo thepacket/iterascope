@@ -72,10 +72,11 @@ absolute-value variants follow the Kalles Fraktaler family; the opposite sign
 of an imaginary part produces the mirror image in the conjugate parameter, not
 a different set. Buffalo uses the componentwise absolute value of `z²`. The
 Manowar map has complex Jacobian determinant `−1`, so its bounded set has no
-attracting interior; it is rendered for its escape-time level sets. Magnet and
-Nova orbits are coloured by convergence time (Nova additionally by the
-argument of the attracting point); the Lyapunov plane is coloured by the sign
-and size of the exponent, warm for stable and cool for chaotic forcing.
+attracting interior; it is rendered for its escape-time level sets. Magnet,
+Nova and Newton orbits finish by converging, so their default colouring is the
+argument of the limit (the basin) darkened by convergence time; the Lyapunov
+plane is coloured by the sign and size of the exponent, the stable regions
+through the gradient and the chaotic ones in darkening blues.
 
 The **Deep zoom** column lists the precision paths available past plain
 `f32`: every listed family switches to GPU perturbation around a CPU
@@ -127,10 +128,17 @@ from it.
   `10^5000×`, with visible intermediate renders and Start/Stop controls
 - Keyboard arrows and four on-screen buttons for deterministic fine panning by
   one tenth of the displayed range (Shift + arrows: one hundredth)
-- Adjustable iteration limit up to 50,000, bailout, palette phase and smooth colouring
-- Optional interior shading of bounded orbits by the minimum modulus they
-  reach (an orbit trap at the origin), exposing basin structure without
-  claiming that a dark pixel is proven interior
+- Adjustable iteration limit up to 50,000 and escape radius up to `1e10`
+- A colour stage in the Ultra Fractal mould: one cyclic gradient per image
+  (control points, RGB or HSL blending, cubic smoothing, rotation, presets,
+  random generation, `.ugr` and Fractint `.map` import, `.ugr` export) and
+  independent outside/inside colouring algorithms — (smooth) iteration count,
+  decomposition by argument, triangle-inequality average, stripe average,
+  exterior distance estimate and orbit traps (point, cross, circle, square,
+  lines) — each with density, offset, transfer curve and iteration shading.
+  Every algorithm works through the perturbation paths at any depth; the
+  distance estimate is evaluated in logarithms so it stays exact at `1e65×`
+  and beyond
 - Optional scale-aware coordinate grid
 - Live magnification plus navigation, rendered-coordinate, rounding-delta and
   pixel-scale readouts
@@ -161,6 +169,37 @@ controls. Each fine-pan step moves exactly one tenth of the currently
 displayed horizontal or vertical range; holding Shift with the arrow keys
 moves one hundredth.
 
+### Colouring
+
+The **Colouring** section holds one gradient and two colouring algorithms, as
+in Ultra Fractal: **Outside** colours orbits that escaped or converged,
+**Inside** colours orbits that reached the iteration limit. Each algorithm
+reduces the orbit to a value — the smoothed iteration count, the argument of
+the final `z` (continuous or in sectors; two sectors is binary decomposition),
+the triangle-inequality or stripe average over the orbit, the exterior
+distance estimate in pixels, or the closest approach to an orbit trap — and
+maps it to a gradient position through a transfer curve, a density and an
+offset. The averages interpolate their final term by the family's own
+smoothing so they stay continuous across iteration bands; the distance
+estimate follows the orbit's derivative in scaled arithmetic and is evaluated
+in logarithms, so it is exact at any depth for the quadratic, Multibrot and
+lambda families. Large escape radii (up to `1e10`, under **Computation**) give
+the averages their smoothest results.
+
+Click the gradient bar to open the editor: drag the markers to move control
+points, double-click the bar to add one, pick the colour and position of the
+selected point, choose RGB or HSL blending, cubic smoothing, rotation, and
+reverse or redistribute the points. The editor offers presets, a random
+generator, Ultra Fractal `.ugr` and Fractint `.map` import (paste the text or
+drop the file) and `.ugr` export.
+
+The accumulators behind orbit traps, the averages and the distance estimate
+live inside every iteration loop, including the perturbation paths. They are
+compiled into a second shader variant that is only used while one of those
+algorithms is selected, so the default configuration renders exactly as fast
+as before the colour stage existed — the deep-zoom engine is not the price of
+the artistic features.
+
 The **Critical orbit** section computes
 
 \[
@@ -183,12 +222,13 @@ p(z) = z^3 - 1, \qquad
 N(z) = z - \frac{z^3 - 1}{3z^2}.
 \]
 
-The left pane colours each starting value by the root to which it converges.
-Brightness encodes convergence speed. Clicking the overview selects `z₀` and
-opens a linked region in the right pane, where convergence time is emphasized
-to expose sensitive basin boundaries. Image colours use a continuous estimate
-of where the residual crossed the convergence threshold, avoiding false bands
-from whole iteration counts. The CPU `f64` diagnostic independently reports
+By default the left pane colours each starting value by the argument of the
+root to which it converges (the **Decomposition** colouring), with brightness
+encoding convergence speed; switch the outside colouring to **Iteration
+count** to emphasize convergence time and expose sensitive basin boundaries.
+Clicking the overview selects `z₀` and opens a linked region in the right
+pane. Convergence time is a continuous estimate of where the residual crossed
+the convergence threshold, avoiding false bands from whole iteration counts. The CPU `f64` diagnostic independently reports
 the exact integer iteration count alongside the selected orbit's root,
 residual, last Newton step and final complex value; `z₀ = 0` is explicitly
 identified as a derivative singularity.
@@ -218,9 +258,9 @@ Default parameters for the dynamical planes were chosen just inside the
 boundary of each family's connectedness locus, so the default Julia sets are
 thin and filamentary rather than filled discs; the presets offer a few
 alternatives, and clicking anywhere in the parameter plane selects another.
-Bounded orbits are shaded by the smallest modulus they reach (**Display →
-Interior shading**), which reveals the basins of attracting cycles; switch it
-off to recover the uniform dark interior.
+Bounded orbits take the **Inside** colouring, a dark solid by default; an
+inside **Orbit trap** (point at the origin) reveals the basins of attracting
+cycles.
 
 Precision handling is deliberately explicit. Once the `f32` coordinate grid
 becomes coarser than a pixel, every family renders by GPU perturbation
@@ -322,7 +362,7 @@ progressive Julia target. CPU work scales with reference precision and
 iteration count rather than pixel count. Automatic reference rebasing and
 formal glitch validation remain in development.
 
-At extreme depth, a uniformly dark view (or, with interior shading enabled, a
+At extreme depth, a uniformly dark view (or, with an inside orbit trap, a
 smoothly shaded one) is not yet proof that the sampled region is
 mathematically interior. Progressive zoom retains a finite selected
 centre, which can eventually fall entirely to one side of a boundary, and the
@@ -391,13 +431,26 @@ cargo test
 cargo check --target wasm32-unknown-unknown
 ```
 
+The ignored `gpu_*` tests in `src/render/mod.rs` run on the real GPU and
+write PPM renders to `$ITERASCOPE_RENDER_DIR`: a gallery of every family, the
+perturbation-versus-double-single-versus-CPU comparison, deep-zoom structure
+at `1e30×`, preview-blit and pan consistency, a gallery of every colouring
+algorithm at the default view and around an `f64` reference at `1e12×`, and a
+timing probe that also records the cost of the orbit-statistics variant:
+
+```sh
+ITERASCOPE_RENDER_DIR=out cargo test --release gpu_ -- --ignored --nocapture
+```
+
 ## Experiment documents
 
 Open **Document → Export / Import JSON** to capture the complete reproducible
-experiment state. The versioned document (format version 4) records the
+experiment state. The versioned document (format version 5) records the
 active family, both plane centres and scales, the selected parameter or
 starting value, the family parameters the active family uses, computation
-limits, and display settings, including critical-orbit overlay visibility. Runtime
+limits, the gradient and colouring algorithms, and display settings, including
+critical-orbit overlay visibility. Documents from earlier versions load with the
+default colouring (their palette phase becomes the outside offset). Runtime
 diagnostics, selected inspector step and frame timing are deliberately not
 stored. Copy the JSON to export it; paste another IteraScope document into the
 editor and choose **Load JSON** to import it. Imports are validated before any
@@ -414,6 +467,10 @@ live state is changed.
 5. Orbit probes for the non-quadratic escape-time families, and
    arbitrary-precision exponential/trigonometric reference orbits so the
    transcendental families can join the deep-zoom path
+6. Towards generative fractal art: zoom-path animation with image-sequence
+   export, then layers with merge modes and masks over the single composited
+   image; orbit-trap options that skip the shared leading iterations of deep
+   orbits; derivatives for the remaining families' distance estimates
 
 ## Project status
 
