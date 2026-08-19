@@ -251,6 +251,10 @@ pub struct App {
     /// The Ultra Fractal-style switch picker: a parameter-plane window with
     /// a live Julia preview for choosing `c` while composing a single image.
     switch_picker_open: bool,
+    /// The left (instrument) and right (studio) control panes; each
+    /// collapses to a slim strip independently.
+    left_panel_open: bool,
+    right_panel_open: bool,
     /// Rasterised gradients shared with the render callbacks; rebuilt when
     /// the visible layers' gradients differ from `gradient_table_source`.
     gradient_table: Arc<GradientTable>,
@@ -268,6 +272,8 @@ pub struct App {
     export_directory: String,
     #[cfg(not(target_arch = "wasm32"))]
     export: Option<ExportJob>,
+    #[cfg(not(target_arch = "wasm32"))]
+    still: Option<StillJob>,
     #[cfg(not(target_arch = "wasm32"))]
     export_generation: u64,
     export_message: Option<(String, bool)>,
@@ -331,6 +337,8 @@ impl App {
             layers: LayerStack::default(),
             single_image: true,
             switch_picker_open: false,
+            left_panel_open: true,
+            right_panel_open: true,
             gradient_table: Arc::new(GradientTable::new(0, &LayerStack::default())),
             gradient_table_source: vec![Gradient::default()],
             gradient_editor_open: false,
@@ -346,6 +354,8 @@ impl App {
             export_directory: default_export_directory(),
             #[cfg(not(target_arch = "wasm32"))]
             export: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            still: None,
             #[cfg(not(target_arch = "wasm32"))]
             export_generation: 0,
             export_message: None,
@@ -375,8 +385,12 @@ impl App {
         })
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+    /// The left pane: the scientific instrument — family, document,
+    /// parameters, computation, navigation and diagnostics.
+    fn instrument_controls(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("iterascope.scroll.instrument")
+            .show(ui, |ui| {
             section(ui, "Experiment", |ui| {
                 let previous_family = self.family;
                 egui::ComboBox::from_id_salt("iterascope.family")
@@ -883,15 +897,6 @@ impl App {
                 }
             });
 
-            section(ui, "Layers", |ui| self.layer_list(ui));
-
-            section(ui, "Colouring", |ui| self.colouring_controls(ui));
-
-            #[cfg(not(target_arch = "wasm32"))]
-            section(ui, "Still image", |ui| self.still_controls(ui));
-
-            section(ui, "Animation", |ui| self.animation_controls(ui));
-
             section(ui, "Navigation", |ui| {
                 let parameter_dynamical = self.family.linkage() == Linkage::ParameterDynamical;
                 let (left, right) = self.pane_labels();
@@ -968,6 +973,22 @@ impl App {
     }
 
     /// Short names of the two panes for the current instrument.
+    /// The right pane: the studio — layers, colouring and export.
+    fn studio_controls(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("iterascope.scroll.studio")
+            .show(ui, |ui| {
+                section(ui, "Layers", |ui| self.layer_list(ui));
+
+                section(ui, "Colouring", |ui| self.colouring_controls(ui));
+
+                #[cfg(not(target_arch = "wasm32"))]
+                section(ui, "Still image", |ui| self.still_controls(ui));
+
+                section(ui, "Animation", |ui| self.animation_controls(ui));
+            });
+    }
+
     fn pane_labels(&self) -> (&'static str, &'static str) {
         match (self.family.linkage(), self.family.is_quadratic()) {
             (Linkage::ParameterDynamical, true) => ("Parameter", "Julia"),
@@ -2308,7 +2329,7 @@ impl App {
     fn still_controls(&mut self, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new(
-                "Render the active pane's current view as a PNG with supersampled anti-aliasing.",
+                "Render the active pane's current view as a PNG with supersampled anti-aliasing; sizes past 8192 render as tiles around one reference orbit.",
             )
             .small()
             .color(MUTED),
@@ -2316,13 +2337,13 @@ impl App {
         ui.horizontal(|ui| {
             ui.add(
                 egui::DragValue::new(&mut self.still_width)
-                    .range(16..=animation::MAX_DIMENSION)
+                    .range(16..=animation::MAX_STILL_DIMENSION)
                     .speed(16),
             );
             ui.label("×");
             ui.add(
                 egui::DragValue::new(&mut self.still_height)
-                    .range(16..=animation::MAX_DIMENSION)
+                    .range(16..=animation::MAX_STILL_DIMENSION)
                     .speed(16),
             );
             egui::ComboBox::from_id_salt("iterascope.still.supersample")
@@ -2337,13 +2358,23 @@ impl App {
                         );
                     }
                 });
-            if ui
-                .add_enabled(self.export.is_none(), egui::Button::new("Render still"))
-                .clicked()
-            {
-                self.render_still();
-            }
         });
+        if let Some(job) = &self.still {
+            let total = job.tile_count();
+            ui.add(
+                egui::ProgressBar::new(job.next_tile as f32 / total as f32)
+                    .text(format!("tile {}/{total}", job.next_tile)),
+            );
+            if ui.button("Cancel").clicked() {
+                self.still = None;
+                self.export_message = Some(("Still render cancelled".to_owned(), true));
+            }
+        } else if ui
+            .add_enabled(self.export.is_none(), egui::Button::new("Render still"))
+            .clicked()
+        {
+            self.start_still();
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2544,21 +2575,19 @@ impl App {
         })
     }
 
-    /// Renders the current view as a still PNG with supersampled
-    /// anti-aliasing: the frame renders at `supersample`× the requested
-    /// size and is box-filtered down in linear light.
+    /// Starts a still render of the current view: the frame renders at
+    /// `supersample`× the requested size — in tiles when the supersampled
+    /// frame exceeds the 8192-pixel texture limit — and is box-filtered
+    /// down in linear light.
     #[cfg(not(target_arch = "wasm32"))]
-    fn render_still(&mut self) {
-        self.export_message = None;
-        let width = (self.still_width & !1).clamp(16, animation::MAX_DIMENSION);
-        let height = (self.still_height & !1).clamp(16, animation::MAX_DIMENSION);
-        let mut supersample = self.still_supersample.clamp(1, 3);
-        while supersample > 1
-            && (width * supersample > animation::MAX_DIMENSION
-                || height * supersample > animation::MAX_DIMENSION)
-        {
-            supersample -= 1;
+    fn start_still(&mut self) {
+        if self.still.is_some() {
+            return;
         }
+        self.export_message = None;
+        let width = (self.still_width & !1).clamp(16, animation::MAX_STILL_DIMENSION);
+        let height = (self.still_height & !1).clamp(16, animation::MAX_STILL_DIMENSION);
+        let supersample = self.still_supersample.clamp(1, 3);
         let pane = self.active_pane;
         let magnification = self.magnification_log10(pane);
         let scene = match self.freeze_scene(pane) {
@@ -2568,20 +2597,6 @@ impl App {
                 return;
             }
         };
-        let started = Instant::now();
-        let rendered = match scene.render_frame(
-            &self.render_state,
-            magnification,
-            (width * supersample, height * supersample),
-            0.0,
-        ) {
-            Ok(rendered) => rendered,
-            Err(error) => {
-                self.export_message = Some((error, true));
-                return;
-            }
-        };
-        let rgba = downsample_srgb(&rendered, width * supersample, supersample);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
@@ -2592,18 +2607,81 @@ impl App {
             return;
         }
         let path = directory.join(format!("still-{}-{stamp}.png", self.family.document_id()));
-        if let Err(error) = write_png(&path, width, height, &rgba) {
-            self.export_message = Some((format!("cannot write {path:?}: {error}"), true));
+        // Tiles are laid out in final pixels so downsampling blocks never
+        // straddle a tile edge; each supersampled tile fits the texture.
+        let max_tile = animation::MAX_DIMENSION / supersample;
+        self.still = Some(StillJob {
+            scene,
+            magnification,
+            width,
+            height,
+            supersample,
+            columns: animation::tile_spans(width, max_tile),
+            rows: animation::tile_spans(height, max_tile),
+            next_tile: 0,
+            image: vec![0; width as usize * height as usize * 4],
+            path,
+            started: Instant::now(),
+        });
+    }
+
+    /// Renders one still tile per UI update.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn advance_still(&mut self, ctx: &egui::Context) {
+        let render_state = self.render_state.clone();
+        let Some(job) = &mut self.still else {
             return;
+        };
+        let tile = job.next_tile;
+        let column = tile % job.columns.len();
+        let row = tile / job.columns.len();
+        let (column_offset, tile_width) = job.columns[column];
+        let (row_offset, tile_height) = job.rows[row];
+        let supersample = job.supersample;
+        let rendered = match job.scene.render_region(
+            &render_state,
+            job.magnification,
+            (job.width * supersample, job.height * supersample),
+            (column_offset * supersample, row_offset * supersample),
+            (tile_width * supersample, tile_height * supersample),
+            0.0,
+        ) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                self.still = None;
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
+        let tile_rgba = downsample_srgb(&rendered, tile_width * supersample, supersample);
+        for y in 0..tile_height as usize {
+            let source = y * tile_width as usize * 4..(y + 1) * tile_width as usize * 4;
+            let target =
+                ((row_offset as usize + y) * job.width as usize + column_offset as usize) * 4;
+            job.image[target..target + tile_width as usize * 4].copy_from_slice(&tile_rgba[source]);
         }
-        self.export_message = Some((
-            format!(
-                "Wrote {} ({width}×{height}, {supersample}×{supersample} anti-aliasing) in {:.1} s",
-                path.display(),
-                started.elapsed().as_secs_f64()
-            ),
-            false,
-        ));
+
+        job.next_tile += 1;
+        if job.next_tile >= job.tile_count() {
+            let job = self.still.take().unwrap();
+            if let Err(error) = write_png(&job.path, job.width, job.height, &job.image) {
+                self.export_message = Some((format!("cannot write {:?}: {error}", job.path), true));
+                return;
+            }
+            self.export_message = Some((
+                format!(
+                    "Wrote {path} ({width}×{height}, {ss}×{ss} anti-aliasing, {tiles} tiles) in {seconds:.1} s",
+                    path = job.path.display(),
+                    width = job.width,
+                    height = job.height,
+                    ss = job.supersample,
+                    tiles = job.tile_count(),
+                    seconds = job.started.elapsed().as_secs_f64(),
+                ),
+                false,
+            ));
+        }
+        ctx.request_repaint();
     }
 
     /// Renders one export frame per UI update so the interface stays
@@ -3730,14 +3808,41 @@ impl eframe::App for App {
                 });
             });
 
+        let left_open = self.left_panel_open;
         egui::Panel::left("iterascope.controls")
-            .exact_size(PANEL_WIDTH)
-            .frame(
-                egui::Frame::new()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(12, 10)),
-            )
-            .show(ui, |ui| self.controls(ui));
+            .exact_size(if left_open {
+                PANEL_WIDTH
+            } else {
+                COLLAPSED_PANEL_WIDTH
+            })
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(if left_open {
+                egui::Margin::symmetric(12, 10)
+            } else {
+                egui::Margin::symmetric(2, 10)
+            }))
+            .show(ui, |ui| {
+                if panel_header(ui, "INSTRUMENT", true, &mut self.left_panel_open) {
+                    self.instrument_controls(ui);
+                }
+            });
+
+        let right_open = self.right_panel_open;
+        egui::Panel::right("iterascope.studio")
+            .exact_size(if right_open {
+                PANEL_WIDTH
+            } else {
+                COLLAPSED_PANEL_WIDTH
+            })
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(if right_open {
+                egui::Margin::symmetric(12, 10)
+            } else {
+                egui::Margin::symmetric(2, 10)
+            }))
+            .show(ui, |ui| {
+                if panel_header(ui, "STUDIO", false, &mut self.right_panel_open) {
+                    self.studio_controls(ui);
+                }
+            });
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG))
@@ -3756,6 +3861,8 @@ impl eframe::App for App {
         self.switch_picker(ui.ctx());
         #[cfg(not(target_arch = "wasm32"))]
         self.advance_export(ui.ctx());
+        #[cfg(not(target_arch = "wasm32"))]
+        self.advance_still(ui.ctx());
 
         let elapsed = (Instant::now() - update_start).as_secs_f32() * 1000.0;
         self.ui_update_ms = if self.ui_update_ms == 0.0 {
@@ -3817,8 +3924,25 @@ impl FrozenScene {
         size: (u32, u32),
         sweep: f32,
     ) -> Result<Vec<u8>, String> {
+        self.render_region(render_state, magnification, size, (0, 0), size, sweep)
+    }
+
+    /// Renders one rectangular region of a frame — the whole frame is the
+    /// trivial region. Tiles render around the same reference orbit as the
+    /// frame (the frame centre moves to the region's `reference_offset`),
+    /// so tiling is exact at any magnification.
+    #[allow(clippy::too_many_arguments)]
+    fn render_region(
+        &self,
+        render_state: &eframe::egui_wgpu::RenderState,
+        magnification: f64,
+        full_size: (u32, u32),
+        origin: (u32, u32),
+        region_size: (u32, u32),
+        sweep: f32,
+    ) -> Result<Vec<u8>, String> {
         let handoff_log = ARBITRARY_HANDOFF_ZOOM.log10();
-        let (scale_mantissa, scale_exponent) = animation::frame_scale(magnification);
+        let region = animation::region_view(magnification, full_size, origin, region_size);
         let reference = if magnification > handoff_log {
             self.ap_reference
                 .as_ref()
@@ -3834,9 +3958,12 @@ impl FrozenScene {
                 })
         };
         let mut uniforms = Uniforms::new(
-            self.centre,
-            animation::frame_half_height_f64(magnification),
-            size.0 as f32 / size.1 as f32,
+            [
+                self.centre[0] + region.centre_shift[0],
+                self.centre[1] + region.centre_shift[1],
+            ],
+            region.half_height_f64,
+            region.aspect,
             self.julia_c,
             self.iterations,
             self.bailout,
@@ -3853,11 +3980,11 @@ impl FrozenScene {
         );
         if let Some((_, points, ds_fallback)) = reference {
             uniforms = uniforms.enable_perturbation(
-                scale_mantissa,
-                scale_exponent,
+                region.scale_mantissa,
+                region.scale_exponent,
                 points.len(),
                 ds_fallback,
-                [0.0; 2],
+                region.reference_offset,
             );
         }
         let mut layers = self.layers.clone();
@@ -3867,8 +3994,10 @@ impl FrozenScene {
                 layer.colouring.inside.offset += sweep;
             }
         }
-        let colouring_uniforms =
-            ColouringUniforms::new(&layers, animation::frame_pixel_log(magnification, size.1));
+        let colouring_uniforms = ColouringUniforms::new(
+            &layers,
+            animation::frame_pixel_log(magnification, full_size.1),
+        );
         let renderer = render_state.renderer.read();
         let pipeline = renderer
             .callback_resources
@@ -3881,8 +4010,35 @@ impl FrozenScene {
             &colouring_uniforms,
             &self.gradient,
             reference.map(|(generation, points, _)| (generation, points)),
-            size,
+            region_size,
         ))
+    }
+}
+
+/// A still render in progress: tiles of the supersampled frame render one
+/// per UI update, are box-filtered down in linear light, and land in the
+/// final image buffer.
+#[cfg(not(target_arch = "wasm32"))]
+struct StillJob {
+    scene: FrozenScene,
+    magnification: f64,
+    width: u32,
+    height: u32,
+    supersample: u32,
+    /// (offset, size) spans of the final image, per axis.
+    columns: Vec<(u32, u32)>,
+    rows: Vec<(u32, u32)>,
+    next_tile: usize,
+    /// Final-resolution RGBA, filled tile by tile.
+    image: Vec<u8>,
+    path: std::path::PathBuf,
+    started: Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl StillJob {
+    fn tile_count(&self) -> usize {
+        self.columns.len() * self.rows.len()
     }
 }
 
@@ -4200,6 +4356,50 @@ fn configure_style(ctx: &egui::Context) {
             font.size = (font.size * 1.12).round();
         }
     });
+}
+
+const COLLAPSED_PANEL_WIDTH: f32 = 22.0;
+
+/// Header row of a side pane: the title and a chevron that collapses the
+/// pane to a slim strip. Returns whether the pane's contents should render.
+fn panel_header(ui: &mut egui::Ui, title: &str, left: bool, open: &mut bool) -> bool {
+    if *open {
+        ui.horizontal(|ui| {
+            let chevron = if left { "◀" } else { "▶" };
+            let collapse = |ui: &mut egui::Ui, open: &mut bool| {
+                if ui
+                    .add(egui::Button::new(chevron).small().frame(false))
+                    .on_hover_text(format!("Collapse the {} pane", title.to_lowercase()))
+                    .clicked()
+                {
+                    *open = false;
+                }
+            };
+            if !left {
+                collapse(ui, open);
+            }
+            ui.label(egui::RichText::new(title).small().strong().color(MUTED));
+            if left {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    collapse(ui, open);
+                });
+            }
+        });
+        ui.add_space(2.0);
+        *open
+    } else {
+        let chevron = if left { "▶" } else { "◀" };
+        ui.vertical_centered(|ui| {
+            if ui
+                .add(egui::Button::new(chevron).small().frame(false))
+                .on_hover_text(format!("Expand the {} pane", title.to_lowercase()))
+                .clicked()
+            {
+                *open = true;
+            }
+        });
+        false
+    }
 }
 
 fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {

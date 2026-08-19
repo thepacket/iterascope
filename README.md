@@ -152,8 +152,13 @@ from it.
   crosshair, scroll zoom and a live Julia thumbnail of the hovered
   parameter; clicking sets `c` and the composited image follows immediately
 - Still-image export (native app): the current view rendered to PNG at up
-  to 8192×8192 with 2×2 or 3×3 supersampled anti-aliasing, box-filtered in
-  linear light
+  to 16384×16384 with 2×2 or 3×3 supersampled anti-aliasing box-filtered in
+  linear light; sizes whose supersampled frame exceeds the 8192-pixel
+  texture limit render as tiles around the same reference orbit, seamless
+  at any magnification
+- Two independently collapsible control panes: the left **Instrument** pane
+  (family, document, parameters, computation, navigation, diagnostics) and
+  the right **Studio** pane (layers, colouring, still and animation export)
 - Optional scale-aware coordinate grid
 - Zoom-path animation: a dive to the current centre between two magnification
   exponents at constant or eased logarithmic speed, with an optional gradient
@@ -193,11 +198,23 @@ moves one hundredth.
 ### Animation
 
 The **Still image** section renders the active pane's current view to a PNG
-at a chosen resolution with supersampled anti-aliasing: the frame is rendered
-at two or three times the requested size and box-filtered down in linear
-light, so gradient edges keep their brightness. It uses the same frozen-scene
-machinery as the animation exporter — one reference orbit at the current
-centre, valid at the full depth of the view.
+at a chosen resolution (up to 16384×16384) with supersampled anti-aliasing:
+the frame is rendered at two or three times the requested size and
+box-filtered down in linear light, so gradient edges keep their brightness.
+When the supersampled frame exceeds the GPU's 8192-pixel texture limit it is
+rendered as tiles, one per interface update with a progress bar. Tiles render
+around the same reference orbit as the whole frame — the frame centre simply
+becomes an off-centre reference — so the perturbation deltas are
+algebraically identical to the whole frame's and tiling is exact at any
+magnification, with no seams. It uses the same frozen-scene machinery as the
+animation exporter: one reference orbit at the current centre, valid at the
+full depth of the view.
+
+The controls are split across two independently collapsible panes: the left
+**Instrument** pane holds the scientific state (family, document, parameters,
+computation, navigation and diagnostics), the right **Studio** pane the
+artistic state (layers, colouring, still and animation export). The chevron
+in each pane's header collapses it to a slim strip.
 
 The **Animation** section renders the classic deep-zoom video: a dive to the
 active pane's centre, from a start to an end magnification exponent (defaults:
@@ -541,11 +558,10 @@ live state is changed.
    arbitrary-precision exponential/trigonometric reference orbits so the
    transcendental families can join the deep-zoom path
 6. Towards generative fractal art: per-layer formulas, locations and masks
-   (layers, the switch picker, anti-aliased stills and the single-image
+   (layers, the switch picker, anti-aliased tiled stills and the single-image
    default landed); keyframed centre drift and per-parameter animation
-   curves; tiled rendering past the 8192-pixel texture limit; orbit-trap
-   options that skip the shared leading iterations of deep orbits;
-   derivatives for the remaining families' distance estimates
+   curves; orbit-trap options that skip the shared leading iterations of
+   deep orbits; derivatives for the remaining families' distance estimates
 
 ## Project status
 

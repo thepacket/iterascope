@@ -14,6 +14,9 @@
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_DIMENSION: u32 = 8_192;
+/// Largest still-image dimension; images beyond `MAX_DIMENSION` render as
+/// tiles around the same reference orbit.
+pub(crate) const MAX_STILL_DIMENSION: u32 = 16_384;
 pub(crate) const MAX_FRAMES: usize = 100_000;
 
 /// The user-editable animation settings; the exporter freezes a copy when
@@ -153,6 +156,76 @@ pub(crate) fn frame_pixel_log(magnification_log10: f64, frame_height: u32) -> f3
         + (2.0 / frame_height.max(1) as f64).ln()) as f32
 }
 
+/// The view of one rectangular region of a frame, expressed so the region
+/// renders around the *same* reference orbit as the whole frame: the scale
+/// shrinks by the region's share of the frame height, and the reference —
+/// the frame centre — moves to `reference_offset` in the region's local
+/// units. This keeps tiling exact at any magnification: the perturbation
+/// deltas are algebraically identical to the whole frame's, while the `f64`
+/// centre shift only serves the shallow non-perturbation paths (it
+/// underflows harmlessly at depth, where those paths are unused).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RegionView {
+    /// Region centre offset from the frame centre, world units (`f64` range
+    /// permitting; zero beyond it).
+    pub(crate) centre_shift: [f64; 2],
+    pub(crate) half_height_f64: f64,
+    pub(crate) scale_mantissa: f32,
+    pub(crate) scale_exponent: i32,
+    pub(crate) aspect: f32,
+    /// Frame centre relative to the region centre, in region-local units
+    /// (x and y in units of the region half-height).
+    pub(crate) reference_offset: [f32; 2],
+}
+
+pub(crate) fn region_view(
+    magnification_log10: f64,
+    full_size: (u32, u32),
+    origin: (u32, u32),
+    region_size: (u32, u32),
+) -> RegionView {
+    let (full_width, full_height) = (full_size.0.max(1) as f64, full_size.1.max(1) as f64);
+    let (region_width, region_height) = (region_size.0.max(1) as f64, region_size.1.max(1) as f64);
+    let frame_aspect = full_width / full_height;
+    // Region centre in frame-local units (x spans ±aspect, y up, +1 at the
+    // top row of pixels).
+    let centre_x = ((origin.0 as f64 + region_width * 0.5) / full_width * 2.0 - 1.0) * frame_aspect;
+    let centre_y = 1.0 - (origin.1 as f64 + region_height * 0.5) / full_height * 2.0;
+    // Region half-height as a share of the frame half-height.
+    let share = region_height / full_height;
+
+    let half_full = frame_half_height_f64(magnification_log10);
+    let (full_mantissa, full_exponent) = frame_scale(magnification_log10);
+    // scale_region = scale_full × share, renormalised into [1, 2).
+    let scaled = full_mantissa as f64 * share;
+    let shift = scaled.log2().floor() as i32;
+    RegionView {
+        centre_shift: [centre_x * half_full, centre_y * half_full],
+        half_height_f64: half_full * share,
+        scale_mantissa: (scaled / 2f64.powi(shift)) as f32,
+        scale_exponent: full_exponent + shift,
+        aspect: (region_width / region_height) as f32,
+        reference_offset: [(-centre_x / share) as f32, (-centre_y / share) as f32],
+    }
+}
+
+/// Splits `extent` pixels into the fewest tiles of at most `max_tile`,
+/// as evenly as possible: (offset, size) pairs covering the extent exactly.
+pub(crate) fn tile_spans(extent: u32, max_tile: u32) -> Vec<(u32, u32)> {
+    let max_tile = max_tile.max(1);
+    let count = extent.div_ceil(max_tile).max(1);
+    let base = extent / count;
+    let remainder = extent % count;
+    let mut spans = Vec::with_capacity(count as usize);
+    let mut offset = 0;
+    for index in 0..count {
+        let size = base + u32::from(index < remainder);
+        spans.push((offset, size));
+        offset += size;
+    }
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +301,80 @@ mod tests {
         assert_eq!(frame_half_height_f64(4000.0), 0.0);
         assert!(frame_half_height_f64(10.0) > 0.0);
         assert!(frame_pixel_log(4000.0, 1080).is_finite());
+    }
+
+    #[test]
+    fn region_view_of_the_whole_frame_is_the_frame() {
+        let region = region_view(12.0, (1920, 1080), (0, 0), (1920, 1080));
+        let (mantissa, exponent) = frame_scale(12.0);
+        assert_eq!(region.scale_mantissa, mantissa);
+        assert_eq!(region.scale_exponent, exponent);
+        assert_eq!(region.reference_offset, [0.0, 0.0]);
+        assert_eq!(region.centre_shift, [0.0, 0.0]);
+        assert!((region.aspect - 1920.0 / 1080.0).abs() < 1e-6);
+        assert_eq!(region.half_height_f64, frame_half_height_f64(12.0));
+    }
+
+    #[test]
+    fn region_views_reconstruct_the_frame_pixel_grid() {
+        // A pixel's world position computed through any region containing it
+        // must match the position computed through the whole frame.
+        let m = 6.0;
+        let full = (640u32, 480u32);
+        let half = frame_half_height_f64(m);
+        let aspect = full.0 as f64 / full.1 as f64;
+        let world_of = |px: f64, py: f64| -> [f64; 2] {
+            let lx = (px / full.0 as f64 * 2.0 - 1.0) * aspect;
+            let ly = 1.0 - py / full.1 as f64 * 2.0;
+            [lx * half, ly * half]
+        };
+        for (origin, size) in [
+            ((0u32, 0u32), (320u32, 240u32)),
+            ((320, 0), (320, 240)),
+            ((0, 240), (320, 240)),
+            ((320, 240), (320, 240)),
+            ((160, 120), (321, 199)),
+        ] {
+            let region = region_view(m, full, origin, size);
+            let scale = region.scale_mantissa as f64 * 2f64.powi(region.scale_exponent);
+            for (px, py) in [(0.3, 0.7), (0.9, 0.1)] {
+                // The sample point in region-local units.
+                let sample_x = origin.0 as f64 + px * size.0 as f64;
+                let sample_y = origin.1 as f64 + py * size.1 as f64;
+                let lx = (px * 2.0 - 1.0) * region.aspect as f64;
+                let ly = 1.0 - py * 2.0;
+                // World = frame centre + (local − reference_offset) × scale,
+                // exactly the shader's perturbation delta.
+                let world = [
+                    (lx - region.reference_offset[0] as f64) * scale,
+                    (ly - region.reference_offset[1] as f64) * scale,
+                ];
+                let expected = world_of(sample_x, sample_y);
+                for axis in 0..2 {
+                    assert!(
+                        (world[axis] - expected[axis]).abs() < half * 1e-6,
+                        "{origin:?} {size:?} axis {axis}: {} vs {}",
+                        world[axis],
+                        expected[axis]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tile_spans_cover_exactly_with_the_fewest_even_tiles() {
+        assert_eq!(tile_spans(8192, 8192), vec![(0, 8192)]);
+        assert_eq!(tile_spans(10000, 8192), vec![(0, 5000), (5000, 5000)]);
+        let spans = tile_spans(16384, 2730);
+        assert_eq!(spans.len(), 7);
+        assert_eq!(spans.iter().map(|(_, size)| size).sum::<u32>(), 16384);
+        assert_eq!(
+            spans.last().map(|(offset, size)| offset + size),
+            Some(16384)
+        );
+        assert!(spans.iter().all(|(_, size)| *size <= 2730));
+        assert_eq!(tile_spans(5, 2), vec![(0, 2), (2, 2), (4, 1)]);
     }
 
     #[test]

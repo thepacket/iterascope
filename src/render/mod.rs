@@ -898,14 +898,15 @@ impl FractalPipeline {
         let padded = target.readback.slice(..).get_mapped_range().to_vec();
         target.readback.unmap();
 
-        // The fullscreen triangle maps uv.y = 0 to the bottom of the
-        // viewport; return rows top-first and strip the copy padding.
+        // Texture row 0 is the top of the viewport (clip y = +1), which the
+        // fullscreen triangle maps to uv.y = 1 and the fragment shader to
+        // positive imaginary values — the buffer is already top-first, so
+        // only the copy padding needs stripping.
         let tight_row = (size.0 * 4) as usize;
         let mut rgba = Vec::with_capacity(tight_row * size.1 as usize);
         for row in padded
             .chunks(target.padded_bytes_per_row as usize)
             .take(size.1 as usize)
-            .rev()
         {
             rgba.extend_from_slice(&row[..tight_row]);
         }
@@ -1436,10 +1437,10 @@ mod tests {
             receiver.recv().unwrap().unwrap();
             let pixels = self.readback.slice(..).get_mapped_range().to_vec();
             self.readback.unmap();
-            // The quad maps uv.y = 0 to the bottom of the viewport; return
-            // rows top-first so images are upright.
+            // Texture row 0 is the top of the viewport (+Im); rows are
+            // already top-first.
             let mut rgb = Vec::with_capacity((self.width * self.height * 3) as usize);
-            for row in pixels.chunks(bytes_per_row as usize).rev() {
+            for row in pixels.chunks(bytes_per_row as usize) {
                 for pixel in row.chunks(4) {
                     rgb.extend_from_slice(&pixel[..3]);
                 }
@@ -1544,7 +1545,7 @@ mod tests {
             let pixels = self.readback.slice(..).get_mapped_range().to_vec();
             self.readback.unmap();
             let mut rgb = Vec::with_capacity((self.width * self.height * 3) as usize);
-            for row in pixels.chunks(bytes_per_row as usize).rev() {
+            for row in pixels.chunks(bytes_per_row as usize) {
                 for pixel in row.chunks(4) {
                     rgb.extend_from_slice(&pixel[..3]);
                 }
@@ -2224,6 +2225,270 @@ mod tests {
         assert!(distinct.len() > 200);
         if let Some(directory) = &directory {
             gpu.write_ppm(&format!("{directory}/layers-eight.ppm"), &full);
+        }
+    }
+
+    /// Exported buffers are top-first with positive imaginary values up, and
+    /// a `region_view` of a quadrant reproduces the crop of the whole frame.
+    /// This pins the orientation convention: the readback must not flip rows
+    /// (texture row 0 is already the top of the viewport). Run with
+    /// `cargo test --release gpu_export_orientation_and_regions -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gpu_export_orientation_and_regions() {
+        use crate::animation::region_view;
+        use crate::family::{FamilyParameters, FractalFamily};
+        let gpu = GpuHarness::new(64, 64);
+        let parameters = FamilyParameters::default();
+        let family = FractalFamily::Quadratic;
+        let full = (512u32, 352u32);
+        let layers = LayerStack::default();
+        let gradient = GradientTable::new(41, &layers);
+        let centre = [-0.6f64, 0.0];
+        let half = 1.45f64;
+        let render = |centre: [f64; 2], half: f64, aspect: f32, size: (u32, u32)| -> Vec<u8> {
+            let uniforms = Uniforms::new(
+                centre,
+                half,
+                aspect,
+                [0.0; 2],
+                512,
+                4.0,
+                family.shader_flag(),
+                0,
+                true,
+                false,
+                PrecisionMode::F32,
+                parameters.uniform_words(false),
+            );
+            gpu.pipeline.render_export(
+                &gpu.device,
+                &gpu.queue,
+                &uniforms,
+                &ColouringUniforms::new(&layers, -5.0),
+                &gradient,
+                None,
+                size,
+            )
+        };
+        let whole = render(centre, half, full.0 as f32 / full.1 as f32, full);
+        // Crop the top-right quadrant of the whole.
+        let (tw, th) = (256usize, 176usize);
+        let mut crop = Vec::new();
+        for y in 0..th {
+            let base = (y * full.0 as usize + 256) * 4;
+            crop.extend_from_slice(&whole[base..base + tw * 4]);
+        }
+        // Manual quadrant uniforms.
+        let manual = render(
+            [centre[0] + 1.0545234, centre[1] + 0.725],
+            0.725,
+            256.0 / 176.0,
+            (256, 176),
+        );
+        // region_view quadrant.
+        let region = region_view(0.0, full, (256, 0), (256, 176));
+        eprintln!("region = {region:?}");
+        let via_region = render(
+            [
+                centre[0] + region.centre_shift[0],
+                centre[1] + region.centre_shift[1],
+            ],
+            region.half_height_f64,
+            region.aspect,
+            (256, 176),
+        );
+        let diff = |a: &[u8], b: &[u8], label: &str| {
+            let differing = a
+                .chunks(4)
+                .zip(b.chunks(4))
+                .filter(|(x, y)| x.iter().zip(y.iter()).any(|(p, q)| p.abs_diff(*q) > 2))
+                .count();
+            eprintln!(
+                "{label}: {:.2}% differ",
+                100.0 * differing as f64 / (a.len() / 4) as f64
+            );
+        };
+        diff(&crop, &manual, "crop vs manual");
+        diff(&crop, &via_region, "crop vs region_view");
+        diff(&manual, &via_region, "manual vs region_view");
+
+        // Empirical convention check: which crop does which shift match?
+        let crop_at = |x0: usize, y0: usize| -> Vec<u8> {
+            let mut out = Vec::new();
+            for y in 0..th {
+                let base = ((y0 + y) * full.0 as usize + x0) * 4;
+                out.extend_from_slice(&whole[base..base + tw * 4]);
+            }
+            out
+        };
+        let count_close = |a: &[u8], b: &[u8]| -> f64 {
+            let same = a
+                .chunks(4)
+                .zip(b.chunks(4))
+                .filter(|(x, y)| x.iter().zip(y.iter()).all(|(p, q)| p.abs_diff(*q) <= 2))
+                .count();
+            100.0 * same as f64 / (a.len() / 4) as f64
+        };
+        let mut matched = Vec::new();
+        for (sx, sy) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+            let tile = render(
+                [centre[0] + sx * 1.0545454, centre[1] + sy * 0.725],
+                0.725,
+                256.0 / 176.0,
+                (256, 176),
+            );
+            for (x0, y0, name) in [
+                (0usize, 0usize, "TL"),
+                (256, 0, "TR"),
+                (0, 176, "BL"),
+                (256, 176, "BR"),
+            ] {
+                let close = count_close(&crop_at(x0, y0), &tile);
+                if close > 50.0 {
+                    eprintln!("shift ({sx:+},{sy:+}) matches crop {name}: {close:.1}% close");
+                    matched.push(((sx as i8, sy as i8), name));
+                }
+            }
+        }
+        // +x,+y must be the top-right crop: rows top-first, +Im up.
+        assert!(matched.contains(&((1, 1), "TR")), "{matched:?}");
+        assert!(matched.contains(&((-1, -1), "BL")), "{matched:?}");
+    }
+
+    /// Tiled rendering: a frame assembled from 2×2 regions rendered around
+    /// the same reference orbit must match the frame rendered whole — at a
+    /// shallow f32 view and at 1e30 through the arbitrary-precision
+    /// perturbation path — up to the last-bit rounding of per-tile local
+    /// coordinates. Run with
+    /// `ITERASCOPE_RENDER_DIR=out cargo test --release gpu_tiled_render_matches_whole -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gpu_tiled_render_matches_whole() {
+        use crate::animation::region_view;
+        use crate::arbitrary::{DeepComplex, DeepReal, DeepState, DeepView, ReferenceOrbit};
+        use crate::family::{FamilyParameters, FractalFamily};
+
+        let directory = std::env::var("ITERASCOPE_RENDER_DIR").ok();
+        let gpu = GpuHarness::new(64, 64);
+        let parameters = FamilyParameters::default();
+        let family = FractalFamily::Quadratic;
+        let iterations = 2_048u32;
+        let full = (512u32, 352u32);
+        let layers = LayerStack::default();
+        let gradient = GradientTable::new(31, &layers);
+        let zoom_exponent = 30u32;
+        let precision_exponent = zoom_exponent + 40;
+        let c_f64 = family.default_parameter();
+        let c = DeepComplex::from_f64(c_f64, precision_exponent).unwrap();
+        let (fixed_point, _) = [[0.6, 0.4], [-0.5, 0.7], [1.1, -0.3]]
+            .iter()
+            .filter_map(|start| {
+                repelling_fixed_point(family, &parameters, &c, *start, precision_exponent)
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("a repelling fixed point");
+        let view = DeepView {
+            centre: fixed_point.clone(),
+            half_height: DeepReal::parse(&format!("1.45e-{zoom_exponent}"), precision_exponent)
+                .unwrap(),
+            zoom_exponent: precision_exponent,
+            magnification_log10: zoom_exponent as f64,
+        };
+        let initial = DeepState::initial(family, &view.centre, true, &c).unwrap();
+        let orbit = ReferenceOrbit::family(family, &parameters, initial, iterations, 4.0).unwrap();
+        let ap = DeepRenderData::from_points(32, 1.0, 0, &orbit.points, false).reference;
+        let deep_centre = view.centre_preview();
+
+        // (magnification, julia?, label): a shallow parameter-plane view on
+        // the plain f32 path and the deep Julia view on the AP path.
+        for (magnification, julia, label) in [(0.0f64, false, "shallow"), (30.0, true, "deep")] {
+            let render_region = |origin: (u32, u32), size: (u32, u32)| -> Vec<u8> {
+                let region = region_view(magnification, full, origin, size);
+                let centre = if julia { deep_centre } else { [-0.6, 0.0] };
+                let mut uniforms = Uniforms::new(
+                    [
+                        centre[0] + region.centre_shift[0],
+                        centre[1] + region.centre_shift[1],
+                    ],
+                    region.half_height_f64,
+                    region.aspect,
+                    c_f64,
+                    iterations,
+                    4.0,
+                    family.shader_flag(),
+                    usize::from(julia),
+                    true,
+                    false,
+                    if julia {
+                        PrecisionMode::DoubleSingle
+                    } else {
+                        PrecisionMode::F32
+                    },
+                    parameters.uniform_words(julia),
+                );
+                let mut reference = None;
+                if julia {
+                    uniforms = uniforms.enable_perturbation(
+                        region.scale_mantissa,
+                        region.scale_exponent,
+                        ap.len(),
+                        false,
+                        region.reference_offset,
+                    );
+                    reference = Some((32u64, ap.as_slice()));
+                }
+                gpu.pipeline.render_export(
+                    &gpu.device,
+                    &gpu.queue,
+                    &uniforms,
+                    &ColouringUniforms::new(&layers, -5.0),
+                    &gradient,
+                    reference,
+                    size,
+                )
+            };
+
+            let whole = render_region((0, 0), full);
+            let mut assembled = vec![0u8; whole.len()];
+            for (row_offset, tile_height) in crate::animation::tile_spans(full.1, 200) {
+                for (column_offset, tile_width) in crate::animation::tile_spans(full.0, 300) {
+                    let tile =
+                        render_region((column_offset, row_offset), (tile_width, tile_height));
+                    for y in 0..tile_height as usize {
+                        let source = y * tile_width as usize * 4..(y + 1) * tile_width as usize * 4;
+                        let target = ((row_offset as usize + y) * full.0 as usize
+                            + column_offset as usize)
+                            * 4;
+                        assembled[target..target + tile_width as usize * 4]
+                            .copy_from_slice(&tile[source]);
+                    }
+                }
+            }
+            let differing = whole
+                .chunks(4)
+                .zip(assembled.chunks(4))
+                .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 2))
+                .count();
+            let fraction = differing as f64 / (whole.len() / 4) as f64;
+            eprintln!(
+                "{label}: {:.3}% of pixels differ between whole and tiled",
+                100.0 * fraction
+            );
+            if let Some(directory) = &directory {
+                std::fs::create_dir_all(directory).unwrap();
+                for (name, rgba) in [("whole", &whole), ("tiled", &assembled)] {
+                    let rgb: Vec<u8> = rgba.chunks(4).flat_map(|p| p[..3].to_vec()).collect();
+                    let mut ppm = format!("P6\n{} {}\n255\n", full.0, full.1).into_bytes();
+                    ppm.extend_from_slice(&rgb);
+                    std::fs::write(format!("{directory}/tiling-{label}-{name}.ppm"), ppm).unwrap();
+                }
+            }
+            assert!(
+                fraction < 0.01,
+                "{label}: tiled render differs from whole on {:.2}% of pixels",
+                100.0 * fraction
+            );
         }
     }
 
