@@ -42,6 +42,7 @@ env_logger = "0.11.11"
 [dev-dependencies]
 # Deliberately pinned to the Naga release used by wgpu 29.
 naga = { version = "29.0.4", features = ["wgsl-in"] }
+pollster = "0.4.0"
 
 [profile.release]
 opt-level = 3

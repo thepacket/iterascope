@@ -2,13 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::MAX_ITERATIONS;
 use crate::arbitrary::MAX_DECIMAL_ZOOM_EXPONENT;
+use crate::family::{FamilyParameters, FractalFamily, Linkage};
 
 pub(crate) const FORMAT_ID: &str = "iterascope-experiment";
-pub(crate) const FORMAT_VERSION: u32 = 3;
-pub(crate) const QUADRATIC_FAMILY_ID: &str = "quadratic";
-pub(crate) const NEWTON_FAMILY_ID: &str = "newton-cubic";
+pub(crate) const FORMAT_VERSION: u32 = 4;
+#[cfg(test)]
+const QUADRATIC_FAMILY_ID: &str = FractalFamily::Quadratic.document_id();
+#[cfg(test)]
+const NEWTON_FAMILY_ID: &str = FractalFamily::NewtonCubic.document_id();
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +23,12 @@ pub(crate) struct ExperimentDocument {
     pub(crate) parameter_c: ComplexDocument,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) newton_initial_z: Option<ComplexDocument>,
+    /// Selected point of non-Newton overview/detail instruments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) initial_z: Option<ComplexDocument>,
+    /// Family-specific numerical settings; absent for families without any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) family_parameters: Option<FamilyParametersDocument>,
     pub(crate) computation: ComputationDocument,
     pub(crate) display: DisplayDocument,
     #[serde(
@@ -35,6 +43,81 @@ pub(crate) struct ExperimentDocument {
     pub(crate) deep_dynamical_plane: Option<DeepPlaneDocument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) deep_parameter_c: Option<DeepComplexDocument>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FamilyParametersDocument {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) degree: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) nova_relaxation: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lyapunov_sequence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mandelbox_scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mandelbox_min_radius: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mandelbox_fixed_radius: Option<f64>,
+}
+
+impl FamilyParametersDocument {
+    /// Records only the settings the family actually uses, so documents stay
+    /// minimal and reproducible.
+    pub(crate) fn for_family(family: FractalFamily, parameters: &FamilyParameters) -> Option<Self> {
+        if !family.has_family_parameters() {
+            return None;
+        }
+        Some(Self {
+            degree: family.uses_degree().then_some(parameters.degree),
+            nova_relaxation: family
+                .uses_relaxation()
+                .then_some(parameters.nova_relaxation),
+            lyapunov_sequence: family
+                .uses_lyapunov_sequence()
+                .then(|| parameters.lyapunov_sequence.clone()),
+            mandelbox_scale: family
+                .uses_mandelbox()
+                .then_some(parameters.mandelbox_scale),
+            mandelbox_min_radius: family
+                .uses_mandelbox()
+                .then_some(parameters.mandelbox_min_radius),
+            mandelbox_fixed_radius: family
+                .uses_mandelbox()
+                .then_some(parameters.mandelbox_fixed_radius),
+        })
+    }
+
+    /// Applies the recorded settings on top of the current parameters.
+    pub(crate) fn apply_to(&self, parameters: &mut FamilyParameters) {
+        if let Some(value) = self.degree {
+            parameters.degree = value;
+        }
+        if let Some(value) = self.nova_relaxation {
+            parameters.nova_relaxation = value;
+        }
+        if let Some(value) = &self.lyapunov_sequence {
+            parameters.lyapunov_sequence = value.clone();
+        }
+        if let Some(value) = self.mandelbox_scale {
+            parameters.mandelbox_scale = value;
+        }
+        if let Some(value) = self.mandelbox_min_radius {
+            parameters.mandelbox_min_radius = value;
+        }
+        if let Some(value) = self.mandelbox_fixed_radius {
+            parameters.mandelbox_fixed_radius = value;
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let mut parameters = FamilyParameters::default();
+        self.apply_to(&mut parameters);
+        parameters
+            .validate()
+            .map_err(|error| format!("family_parameters: {error}"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -81,6 +164,9 @@ pub(crate) struct DisplayDocument {
     pub(crate) palette_phase: f32,
     #[serde(default = "default_true")]
     pub(crate) critical_orbit_overlay: bool,
+    /// Shade bounded orbits by their minimum modulus (format version 4).
+    #[serde(default = "default_true")]
+    pub(crate) interior_shading: bool,
 }
 
 const fn default_true() -> bool {
@@ -112,25 +198,20 @@ impl ExperimentDocument {
                 self.version, FORMAT_VERSION,
             ));
         }
-        if self.family != QUADRATIC_FAMILY_ID && self.family != NEWTON_FAMILY_ID {
+        let Some(family) = FractalFamily::from_document_id(&self.family) else {
             return Err(format!("unsupported fractal family {:?}", self.family));
-        }
+        };
         validate_plane("parameter_plane", self.parameter_plane)?;
         validate_plane("dynamical_plane", self.dynamical_plane)?;
         validate_complex("parameter_c", self.parameter_c)?;
         if let Some(value) = self.newton_initial_z {
             validate_complex("newton_initial_z", value)?;
         }
-        let minimum_iterations = if self.family == NEWTON_FAMILY_ID {
-            8
-        } else {
-            32
-        };
-        let maximum_iterations = if self.family == NEWTON_FAMILY_ID {
-            2_048
-        } else {
-            MAX_ITERATIONS
-        };
+        if let Some(value) = self.initial_z {
+            validate_complex("initial_z", value)?;
+        }
+        let minimum_iterations = family.min_iterations();
+        let maximum_iterations = family.max_iterations();
         if !(minimum_iterations..=maximum_iterations).contains(&self.computation.iterations) {
             return Err(format!(
                 "iterations must be between {minimum_iterations} and {maximum_iterations}"
@@ -151,19 +232,38 @@ impl ExperimentDocument {
                 "progressive_julia_zoom_target_exponent must be between 0 and {MAX_DECIMAL_ZOOM_EXPONENT}"
             ));
         }
-        if self.family == NEWTON_FAMILY_ID
+        if !family.supports_deep_zoom()
             && (self.progressive_julia_zoom_target_exponent != 0
                 || self.deep_parameter_plane.is_some()
                 || self.deep_dynamical_plane.is_some()
                 || self.deep_parameter_c.is_some())
         {
-            return Err("deep quadratic state is not valid for Newton experiments".to_owned());
+            return Err(format!(
+                "deep arbitrary-precision state is not valid for {} experiments",
+                family.name()
+            ));
         }
-        if self.family == NEWTON_FAMILY_ID && self.newton_initial_z.is_none() {
+        if family.is_newton() && self.newton_initial_z.is_none() {
             return Err("Newton experiments require newton_initial_z".to_owned());
         }
-        if self.family == QUADRATIC_FAMILY_ID && self.newton_initial_z.is_some() {
+        if !family.is_newton() && self.newton_initial_z.is_some() {
             return Err("newton_initial_z is only valid for Newton experiments".to_owned());
+        }
+        let uses_initial_z = !family.is_newton() && family.linkage() == Linkage::OverviewDetail;
+        if uses_initial_z && self.initial_z.is_none() {
+            return Err(format!("{} experiments require initial_z", family.name()));
+        }
+        if !uses_initial_z && self.initial_z.is_some() {
+            return Err("initial_z is only valid for overview/detail experiments".to_owned());
+        }
+        if let Some(parameters) = &self.family_parameters {
+            if !family.has_family_parameters() {
+                return Err(format!(
+                    "family_parameters are not valid for {} experiments",
+                    family.name()
+                ));
+            }
+            parameters.validate()?;
         }
         if let Some(plane) = &self.deep_parameter_plane {
             validate_deep_plane("deep_parameter_plane", plane)?;
@@ -189,6 +289,16 @@ impl ExperimentDocument {
         }
         if self.version < 3 && self.newton_initial_z.is_some() {
             return Err("Newton state requires document version 3".to_owned());
+        }
+        if self.version < 4
+            && (!(family.is_quadratic() || family.is_newton())
+                || self.initial_z.is_some()
+                || self.family_parameters.is_some())
+        {
+            return Err(format!(
+                "{} experiments require document version 4",
+                family.name()
+            ));
         }
         Ok(())
     }
@@ -225,6 +335,7 @@ fn validate_complex(name: &str, value: ComplexDocument) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MAX_ITERATIONS;
 
     fn example() -> ExperimentDocument {
         ExperimentDocument {
@@ -247,6 +358,8 @@ mod tests {
                 im: 0.131_825_904_205_33,
             },
             newton_initial_z: None,
+            initial_z: None,
+            family_parameters: None,
             computation: ComputationDocument {
                 iterations: 2048,
                 bailout: 4.0,
@@ -256,6 +369,7 @@ mod tests {
                 coordinate_grid: false,
                 palette_phase: 0.25,
                 critical_orbit_overlay: true,
+                interior_shading: true,
             },
             progressive_julia_zoom_target_exponent: 0,
             deep_parameter_plane: None,
@@ -341,9 +455,91 @@ mod tests {
         let json = document.to_pretty_json().unwrap();
         assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
 
+        // Newton now supports deep zoom through the Nova perturbation path, so
+        // its documents may carry deep state; a family without a reference
+        // orbit may not.
         document.progressive_julia_zoom_target_exponent = 100;
+        assert!(ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).is_ok());
+        document.family = FractalFamily::Collatz.document_id().to_owned();
+        document.newton_initial_z = None;
+        document.initial_z = Some(ComplexDocument { re: 0.5, im: 0.5 });
         let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
-        assert!(error.contains("not valid for Newton"));
+        assert!(error.contains("not valid for Collatz"));
+    }
+
+    #[test]
+    fn escape_time_families_round_trip_with_their_parameters() {
+        let mut document = example();
+        document.family = FractalFamily::Nova.document_id().to_owned();
+        document.family_parameters = Some(FamilyParametersDocument {
+            degree: Some(4),
+            nova_relaxation: Some(1.5),
+            lyapunov_sequence: None,
+            mandelbox_scale: None,
+            mandelbox_min_radius: None,
+            mandelbox_fixed_radius: None,
+        });
+        let json = document.to_pretty_json().unwrap();
+        assert!(json.contains("\"nova\""));
+        assert!(!json.contains("mandelbox_scale"));
+        assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
+
+        // Out-of-range parameters are rejected before any state changes.
+        document.family_parameters.as_mut().unwrap().degree = Some(12);
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("degree"));
+
+        // Families without parameters reject stray parameter blocks.
+        document.family = FractalFamily::BurningShip.document_id().to_owned();
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("family_parameters"));
+        document.family_parameters = None;
+        assert!(ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).is_ok());
+
+        // Deep state is accepted by perturbation-capable families only.
+        document.progressive_julia_zoom_target_exponent = 50;
+        assert!(ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).is_ok());
+        document.family = FractalFamily::Sine.document_id().to_owned();
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("deep arbitrary-precision state"));
+    }
+
+    #[test]
+    fn overview_detail_families_record_the_selected_point() {
+        let mut document = example();
+        document.family = FractalFamily::Lyapunov.document_id().to_owned();
+        document.family_parameters = Some(FamilyParametersDocument {
+            degree: None,
+            nova_relaxation: None,
+            lyapunov_sequence: Some("BBBBBBAAAAAA".to_owned()),
+            mandelbox_scale: None,
+            mandelbox_min_radius: None,
+            mandelbox_fixed_radius: None,
+        });
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("initial_z"));
+        document.initial_z = Some(ComplexDocument { re: 3.2, im: 3.6 });
+        let json = document.to_pretty_json().unwrap();
+        assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
+
+        document
+            .family_parameters
+            .as_mut()
+            .unwrap()
+            .lyapunov_sequence = Some("ABC".to_owned());
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("lyapunov_sequence"));
+    }
+
+    #[test]
+    fn new_families_require_document_version_four() {
+        let mut document = example();
+        document.family = FractalFamily::Tricorn.document_id().to_owned();
+        document.version = 3;
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("version 4"));
+        document.version = 4;
+        assert!(ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).is_ok());
     }
 
     #[test]

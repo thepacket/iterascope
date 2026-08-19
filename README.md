@@ -10,42 +10,112 @@ Note: I am considering moving this new born project toward something like Ultra 
 something artistic, not "scientific".
 
 IteraScope is a GPU-first scientific laboratory for exploring iterated maps.
-It currently provides two linked instruments: a parameter/dynamical-plane
-viewer for the quadratic family
+Its reference instrument links the parameter and dynamical planes of the
+quadratic family
 
 \[
 f_c(z) = z^2 + c,
 \]
 
-and a Newton-basin/convergence viewer for
-
-\[
-p(z) = z^3 - 1.
-\]
+with an arbitrary-precision deep-zoom path. Around it sits a catalogue of
+twenty-five further escape-time, convergence-time and root-finding
+instruments, from the Burning Ship and Magnet maps to the Lyapunov plane of
+the forced logistic map, all rendered by the same WGSL shader and all backed by
+a CPU `f64` reference implementation of the same recurrence.
 
 The same Rust application runs natively and in a WebGPU-capable browser. egui
-and the fractal renderer share one `wgpu` device; the escape-time calculation
-and Newton iterations run entirely in WGSL. CPU calculations are reserved for
-pointwise diagnostics, precision validation and arbitrary-precision reference
-orbits rather than full-frame pixel rendering.
+and the fractal renderer share one `wgpu` device; every per-pixel iteration
+runs entirely in WGSL. CPU calculations are reserved for pointwise
+diagnostics, precision validation and arbitrary-precision reference orbits
+rather than full-frame pixel rendering.
 
 ## Scientific instruments
 
-| Instrument | Left pane | Right pane | Selected value |
-| --- | --- | --- | --- |
-| Quadratic | Mandelbrot parameter plane | Julia dynamical plane | Parameter `c` |
-| Newton cubic | Root-basin overview | Convergence and boundary-sensitivity detail | Initial value `z₀` |
+Two instrument layouts exist. **Parameter/dynamical** instruments colour the
+left pane by the fate of a critical (or otherwise distinguished) orbit for
+each parameter `c`, and the right pane by the fate of every starting value
+`z₀` under the selected parameter; clicking the left pane selects `c`.
+**Overview/detail** instruments show the same plane in both panes; clicking
+the overview selects a point and opens a linked, magnified detail region.
 
-Both instruments link a global classification view to a local diagnostic view.
-They are intended for reproducible investigation: the selected value,
-viewports, numerical settings and display state can be exported together as a
-versioned experiment document.
+| Family | Recurrence | Layout | Start of the left-pane orbit | Terminates on | Deep zoom |
+| --- | --- | --- | --- | --- | --- |
+| Quadratic | `z ← z² + c` | parameter/dynamical | `z₀ = 0` | `\|z\| > bailout` | DS, AP perturbation |
+| Newton cubic | `z ← z − (z³−1)/(3z²)` | overview/detail | pixel | residual `< 10⁻⁶` | f64 + AP perturbation |
+| Multibrot | `z ← zᵈ + c`, `2 ≤ d ≤ 8` | parameter/dynamical | `z₀ = 0` | bailout | f64 + AP perturbation |
+| Tricorn | `z ← z̄² + c` | parameter/dynamical | `z₀ = 0` | bailout | f64 + AP perturbation |
+| Perpendicular Mandelbrot | `(x² − y², −2\|x\|y) + c` | parameter/dynamical | `z₀ = 0` | bailout | f64 + AP perturbation |
+| Burning Ship | `(x² − y², 2\|xy\|) + c` | parameter/dynamical | `z₀ = 0` | bailout | f64 + AP perturbation |
+| Perpendicular Burning Ship | `(x² − y², −2x\|y\|) + c` | parameter/dynamical | `z₀ = 0` | bailout | f64 + AP perturbation |
+| Celtic | `(\|x² − y²\|, 2xy) + c` | parameter/dynamical | `z₀ = 0` | bailout | f64 + AP perturbation |
+| Perpendicular Celtic | `(\|x² − y²\|, −2\|x\|y) + c` | parameter/dynamical | `z₀ = 0` | bailout | f64 + AP perturbation |
+| Buffalo | `(\|x² − y²\|, 2\|xy\|) + c` | parameter/dynamical | `z₀ = 0` | bailout | f64 + AP perturbation |
+| Perpendicular Buffalo | `(\|x² − y²\|, −2x\|y\|) + c` | parameter/dynamical | `z₀ = 0` | bailout | f64 + AP perturbation |
+| Lambda (logistic) | `z ← λ z (1 − z)` | parameter/dynamical | `z₀ = ½` | bailout | f64 + AP perturbation |
+| Phoenix | `zₙ₊₁ = zₙ² + Re c + (Im c) zₙ₋₁` | parameter/dynamical | `z₀ = z₋₁ = 0` | bailout | f64 + AP perturbation |
+| Manowar | `zₙ₊₁ = zₙ² + zₙ₋₁ + c` | parameter/dynamical | `z₀ = z₋₁ = c` | bailout | f64 + AP perturbation |
+| Spider | `z ← z² + c`, `c ← c/2 + z` | parameter/dynamical | `z₀ = 0` | bailout | f64 + AP perturbation |
+| Magnet I | `z ← ((z² + c − 1)/(2z + c − 2))²` | parameter/dynamical | `z₀ = 0` | bailout or `\|z − 1\| < 10⁻⁴` | f64 + AP perturbation |
+| Magnet II | `z ← ((z³ + 3(c−1)z + (c−1)(c−2)) / (3z² + 3(c−2)z + (c−1)(c−2) + 1))²` | parameter/dynamical | `z₀ = 0` | bailout or `\|z − 1\| < 10⁻⁴` | f64 + AP perturbation |
+| Exponential | `z ← c eᶻ` | parameter/dynamical | `z₀ = 0` | `Re z > 50` | f32 only |
+| Sine | `z ← c sin z` | parameter/dynamical | `z₀ = π/2` | `\|Im z\| > 50` | f32 only |
+| Cosine | `z ← c cos z` | parameter/dynamical | `z₀ = 0` | `\|Im z\| > 50` | f32 only |
+| Collatz | `z ← ¼(2 + 7z − (2 + 5z) cos πz)` | overview/detail | pixel | `\|Im z\| > 20` or `\|z\| > 10⁶` | f32 only |
+| Lyapunov (Markus) | `xₙ₊₁ = rₙ xₙ(1 − xₙ)`, `rₙ ∈ {a, b}` by sequence | overview/detail | `x₀ = ½` | Lyapunov exponent after `n` iterations | f32 only |
+| Nova | `z ← z − R (zᵖ − 1)/(p zᵖ⁻¹) + c` | parameter/dynamical | `z₀ = 1` | `\|Δz\| < 10⁻⁵` or `\|z\| > 10⁶` | f64 + AP perturbation |
+| Barnsley 1 | `z ← (z ∓ 1) c` by sign of `Re z` | parameter/dynamical | `z₀ = c` | bailout | f64 + AP perturbation |
+| Barnsley 2 | `z ← (z ∓ 1) c` by sign of `Im(zc)` | parameter/dynamical | `z₀ = c` | bailout | f64 + AP perturbation |
+| Mandelbox (2D) | `v ← s · ballfold(boxfold(v)) + c` | parameter/dynamical | `v₀ = 0` | `\|v\| > 4 × bailout` | f64 + AP perturbation |
+
+`x` and `y` denote `Re z` and `Im z`. The sign conventions of the
+absolute-value variants follow the Kalles Fraktaler family; the opposite sign
+of an imaginary part produces the mirror image in the conjugate parameter, not
+a different set. Buffalo uses the componentwise absolute value of `z²`. The
+Manowar map has complex Jacobian determinant `−1`, so its bounded set has no
+attracting interior; it is rendered for its escape-time level sets. Magnet and
+Nova orbits are coloured by convergence time (Nova additionally by the
+argument of the attracting point); the Lyapunov plane is coloured by the sign
+and size of the exponent, warm for stable and cool for chaotic forcing.
+
+The **Deep zoom** column lists the precision paths available past plain
+`f32`: the quadratic instrument uses compensated double-single (`DS`, about
+48 bits, validated by its orbit probes) up to the `1.14e14×` handoff; every
+other listed family switches directly to GPU perturbation around a CPU
+reference orbit — `f64` below the handoff, arbitrary precision beyond it —
+which carries it to the same `10^5000×` navigation ceiling. The
+transcendental families and the Lyapunov plane stop at `f32`: their reference
+orbits would need arbitrary-precision exponentials and trigonometry, which the
+decimal arithmetic layer does not yet provide.
+
+Every instrument links a global classification view to a local diagnostic
+view and exports the selected value, viewports, family parameters, numerical
+settings and display state together as a versioned experiment document. The
+control panel always shows a CPU `f64` diagnostic for the selected point
+computed from the reference implementation in `src/family.rs`, which is the
+definition of record for each recurrence; the shader branches are transcribed
+from it.
 
 ## What works today
 
 - Linked Mandelbrot parameter plane and Julia dynamical plane
 - Newton basin instrument for `z³ - 1`, with three-root classification and a
   linked convergence-detail pane
+- Twenty-four further escape-time and convergence-time families (Multibrot,
+  eight absolute-value variants, Lambda, Phoenix, Manowar, Spider, Magnet I/II,
+  exponential, sine, cosine, Collatz, Lyapunov, Nova, Barnsley 1/2 and the 2D
+  Mandelbox) with per-family parameters, presets and a CPU `f64` orbit
+  diagnostic for the selected point
+- Deep zoom (arbitrary-precision navigation plus GPU perturbation) for every
+  family except the transcendental ones and the Lyapunov plane
+- Headless GPU tests that render every family through the real pipeline
+  (`gpu_family_gallery`), compare the perturbation path against the
+  double-single path and a CPU `f64` raster at `10⁶×`
+  (`gpu_perturbation_matches_double_single`), render seven families at `10³⁰×`
+  around arbitrary-precision repelling fixed points
+  (`gpu_deep_zoom_resolves_structure`), and check that compensated
+  arithmetic survives the shader compiler (`gpu_double_single_self_test`);
+  all are `#[ignore]`d and run with
+  `ITERASCOPE_RENDER_DIR=out cargo test --release <name> -- --ignored`
 - Pointwise Newton diagnostics reporting the attracting root, iteration count,
   polynomial residual, final value, last step and derivative singularities
 - Click-to-centre 2× zoom; parameter-plane clicks also select the Julia parameter
@@ -57,6 +127,9 @@ versioned experiment document.
 - Keyboard arrows and four on-screen buttons for deterministic fine panning by
   one tenth of the displayed range
 - Adjustable iteration limit up to 50,000, bailout, palette phase and smooth colouring
+- Optional interior shading of bounded orbits by the minimum modulus they
+  reach (an orbit trap at the origin), exposing basin structure without
+  claiming that a dark pixel is proven interior
 - Optional scale-aware coordinate grid
 - Live magnification plus navigation, rendered-coordinate, rounding-delta and
   pixel-scale readouts
@@ -123,6 +196,57 @@ compensated arithmetic so magnified basin boundaries do not collapse onto an
 `f32` coordinate grid. The arbitrary-precision perturbation path remains
 specific to the quadratic family.
 
+### Other escape-time families
+
+Choose any other family from the Experiment drop-down. Parameter/dynamical
+instruments behave like the quadratic one: click the left pane to choose the
+parameter, adjust it numerically or through presets, and read the **Critical
+orbit** diagnostic, which iterates the same recurrence on the CPU in `f64`
+and reports whether the orbit escapes, converges, becomes non-finite or stays
+bounded through the iteration limit. Overview/detail instruments (Newton,
+Collatz, Lyapunov) select a starting point instead. Families with parameters
+expose them in **Family parameters**: the Multibrot and Nova degree, the Nova
+relaxation `R`, the Lyapunov forcing sequence over `{A, B}` (up to 32
+symbols, with the first quarter of the iterations discarded as a transient)
+and the Mandelbox scale, minimum radius and fixed radius.
+
+Default parameters for the dynamical planes were chosen just inside the
+boundary of each family's connectedness locus, so the default Julia sets are
+thin and filamentary rather than filled discs; the presets offer a few
+alternatives, and clicking anywhere in the parameter plane selects another.
+Bounded orbits are shaded by the smallest modulus they reach (**Display →
+Interior shading**), which reveals the basins of attracting cycles; switch it
+off to recover the uniform dark interior.
+
+Precision handling is deliberately explicit. Once the `f32` coordinate grid
+becomes coarser than a pixel, the non-quadratic families render by GPU
+perturbation around a reference orbit of the view centre: below the
+`1.14e14×` handoff the reference is computed on the CPU in `f64`
+(`F64 PERT`), beyond it in arbitrary precision (`AP PERT`). In both cases
+the navigation layer keeps exact coordinates, the CPU builds the reference
+with `family::reference_orbit_f64` or `arbitrary::deep_step` (exact
+transcriptions of the `f64` definition, checked by test), and the shader
+iterates an exact delta recurrence for that family in scaled
+mantissa/exponent arithmetic —
+binomial expansions for `zᵈ`, the `diffabs` identity for every absolute-value
+variant, exact rational differences for the Magnet and Nova maps, branch-aware
+differences for the Barnsley and Mandelbox folds. Newton's basins reuse the
+Nova recurrence. The transcendental, Collatz and Lyapunov families render in
+`f32` only and show `F32 LIMIT` once the pixel grid collapses.
+
+A note on compensated (double-single) arithmetic on the GPU: Metal compiles
+WGSL with fast math, and its reassociation silently reduced every compensated
+sum back to `f32` (the GPU self-test in `render/mod.rs` reproduces this). The
+DS primitives now route each rounded intermediate through one of four opaque
+`1.0` uniforms so no two adjacent terms share a factor the optimizer can pull
+out, and the self-test verifies addition, multiplication, division and the
+view transform on the real device. Because that protection is only as good
+as the compiler's behaviour at each inlined call site, the generic families
+no longer depend on it for image coherence: their remaining DS path (used
+only when a reference orbit ends early at the handoff) is a centred
+recurrence like the quadratic one — a shared centre orbit plus exact
+per-pixel deltas with rebasing — rather than a plain per-pixel DS orbit.
+
 ### On-demand rendering and timing
 
 IteraScope renders on demand. An unchanged view does not continuously consume
@@ -154,7 +278,8 @@ smoothness alone.
 The current stable raster path hands off at the experimentally confirmed
 `1.14e14×` boundary. IteraScope now has pure-Rust arbitrary-precision decimal
 coordinates, a zoom-dependent precision policy and arbitrary-precision
-quadratic reference orbits sized for the `1e1000×` acceptance target. At the
+reference orbits for every perturbation-capable family, sized for the
+`1e1000×` acceptance target. At the
 handoff, those cached reference orbits now drive an exponent-scaled GPU
 perturbation path; an early-ending reference falls back per fragment to the
 stable DS renderer at the handoff. Beyond it, the pane centre, scale, click
@@ -165,8 +290,9 @@ progressive Julia target. CPU work scales with reference precision and
 iteration count rather than pixel count. Automatic reference rebasing and
 formal glitch validation remain in development.
 
-At extreme depth, a uniformly black view is not yet proof that the sampled
-region is mathematically interior. Progressive zoom retains a finite selected
+At extreme depth, a uniformly dark view (or, with interior shading enabled, a
+smoothly shaded one) is not yet proof that the sampled region is
+mathematically interior. Progressive zoom retains a finite selected
 centre, which can eventually fall entirely to one side of a boundary, and the
 current perturbation path does not yet implement automatic rebasing or glitch
 detection. Increasing the iteration limit also rebuilds the arbitrary-
@@ -236,10 +362,10 @@ cargo check --target wasm32-unknown-unknown
 ## Experiment documents
 
 Open **Document → Export / Import JSON** to capture the complete reproducible
-experiment state. The versioned document records the active family, both
-plane centres and scales, the selected parameter or Newton starting value,
-computation limits, and
-display settings, including critical-orbit overlay visibility. Runtime
+experiment state. The versioned document (format version 4) records the
+active family, both plane centres and scales, the selected parameter or
+starting value, the family parameters the active family uses, computation
+limits, and display settings, including critical-orbit overlay visibility. Runtime
 diagnostics, selected inspector step and frame timing are deliberately not
 stored. Copy the JSON to export it; paste another IteraScope document into the
 editor and choose **Load JSON** to import it. Imports are validated before any
@@ -253,6 +379,9 @@ live state is changed.
    counts
 4. Parameterized Newton polynomials and rational maps with critical-point
    analysis
+5. Orbit probes for the non-quadratic escape-time families, and
+   arbitrary-precision exponential/trigonometric reference orbits so the
+   transcendental families can join the deep-zoom path
 
 ## Project status
 
