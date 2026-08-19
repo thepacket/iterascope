@@ -1856,7 +1856,9 @@ fn derivative_step(
         }
         default: {}
     }
-    var next = scaled_mul_plain(derivative, multiplier);
+    // Renormalise every step: the product alone would overflow the f32
+    // mantissa within a hundred iterations of a repelling orbit.
+    var next = scaled_normalize(scaled_mul_plain(derivative, multiplier));
     if (!dynamical) {
         next = scaled_add(next, ScaledComplex(offset, 0));
     }

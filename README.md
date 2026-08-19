@@ -137,8 +137,8 @@ from it.
   exterior distance estimate and orbit traps (point, cross, circle, square,
   lines) — each with density, offset, transfer curve and iteration shading.
   Every algorithm works through the perturbation paths at any depth; the
-  distance estimate is evaluated in logarithms so it stays exact at `1e65×`
-  and beyond
+  distance estimate is evaluated in logarithms and verified at `1e4000×`
+  (Ultra Fractal 5's limit; IteraScope navigates to `1e5000×`)
 - Optional scale-aware coordinate grid
 - Live magnification plus navigation, rendered-coordinate, rounding-delta and
   pixel-scale readouts
@@ -435,8 +435,10 @@ The ignored `gpu_*` tests in `src/render/mod.rs` run on the real GPU and
 write PPM renders to `$ITERASCOPE_RENDER_DIR`: a gallery of every family, the
 perturbation-versus-double-single-versus-CPU comparison, deep-zoom structure
 at `1e30×`, preview-blit and pan consistency, a gallery of every colouring
-algorithm at the default view and around an `f64` reference at `1e12×`, and a
-timing probe that also records the cost of the orbit-statistics variant:
+algorithm at the default view and around an `f64` reference at `1e12×`, the
+iteration, distance, stripe and triangle colourings around an
+arbitrary-precision reference at `1e4000×`, and a timing probe that also
+records the cost of the orbit-statistics variant:
 
 ```sh
 ITERASCOPE_RENDER_DIR=out cargo test --release gpu_ -- --ignored --nocapture

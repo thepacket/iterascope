@@ -1653,6 +1653,144 @@ mod tests {
         }
     }
 
+    /// Renders the quadratic Julia plane at 1e4000× (Ultra Fractal 5's
+    /// limit) around an arbitrary-precision reference at a repelling fixed
+    /// point, through the iteration, distance-estimate, stripe and
+    /// triangle-inequality colourings, and checks each stays varied and free
+    /// of NaN (black) output. Ignored: needs a GPU and a long AP orbit. Run
+    /// with `ITERASCOPE_RENDER_DIR=out cargo test --release gpu_colouring_at_uf_limit -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gpu_colouring_at_uf_limit() {
+        use crate::arbitrary::{DeepComplex, DeepReal, DeepState, DeepView, ReferenceOrbit};
+        use crate::colouring::ColouringAlgorithm;
+        use crate::family::{FamilyParameters, FractalFamily};
+
+        let directory = std::env::var("ITERASCOPE_RENDER_DIR").ok();
+        let gpu = GpuHarness::new(384, 256);
+        let parameters = FamilyParameters::default();
+        let family = FractalFamily::Quadratic;
+        let zoom_exponent = 4000u32;
+        let precision_exponent = zoom_exponent + 40;
+        // Structure around a repelling fixed point appears after
+        // log(1e4000)/log(multiplier) iterations.
+        let iterations = 24_000u32;
+        let c_f64 = family.default_parameter();
+        let c = DeepComplex::from_f64(c_f64, precision_exponent).unwrap();
+        let mut best: Option<(DeepComplex, f64)> = None;
+        for start in [
+            [0.6, 0.4],
+            [-0.5, 0.7],
+            [1.1, -0.3],
+            [-1.2, 0.1],
+            [0.2, -0.9],
+        ] {
+            if let Some((point, multiplier)) =
+                repelling_fixed_point(family, &parameters, &c, start, precision_exponent)
+                && best
+                    .as_ref()
+                    .is_none_or(|(_, best_multiplier)| multiplier > *best_multiplier)
+            {
+                best = Some((point, multiplier));
+            }
+        }
+        let (mut centre, multiplier) = best.expect("a repelling fixed point");
+        // The generic helper converges to roughly 1e-85; refine with the
+        // quadratic's exact Newton step (z² + c − z) / (2z − 1), which doubles
+        // the correct digits each time.
+        let one = centre.real_like(1.0);
+        let two = centre.real_like(2.0);
+        // A fixed count: an f64 projection of the step cannot tell 1e-400
+        // from zero, so there is nothing cheap to test for convergence.
+        for _ in 0..20 {
+            let g = centre.mul(&centre).add(&c).sub(&centre);
+            let derivative = two.mul(&centre).sub(&one);
+            centre = centre.sub(&g.div(&derivative));
+        }
+        let residual = centre.mul(&centre).add(&c).sub(&centre).to_f64_pair();
+        eprintln!("fixed point residual (f64 projection) {residual:?}");
+        let expected_structure_at =
+            (zoom_exponent as f64 * std::f64::consts::LN_10) / multiplier.ln();
+        eprintln!(
+            "fixed point multiplier {multiplier:.3}; structure expected after ~{expected_structure_at:.0} iterations"
+        );
+        let view = DeepView {
+            centre: centre.clone(),
+            half_height: DeepReal::parse(&format!("1.45e-{zoom_exponent}"), precision_exponent)
+                .unwrap(),
+            zoom_exponent: precision_exponent,
+            magnification_log10: zoom_exponent as f64,
+        };
+        let start = std::time::Instant::now();
+        let initial = DeepState::initial(family, &view.centre, true, &c).unwrap();
+        let orbit = ReferenceOrbit::family(family, &parameters, initial, iterations, 4.0).unwrap();
+        eprintln!(
+            "AP reference: {} points in {:.1} s",
+            orbit.points.len(),
+            start.elapsed().as_secs_f64()
+        );
+        let (mantissa, exponent) = view.half_height.scaled_f32();
+        let data = DeepRenderData::from_reference(1, mantissa, exponent, &orbit, false);
+        let uniforms = Uniforms::new(
+            view.centre_preview(),
+            view.half_height_preview(),
+            gpu.aspect(),
+            c_f64,
+            iterations,
+            4.0,
+            family.shader_flag(),
+            1,
+            true,
+            false,
+            PrecisionMode::DoubleSingle,
+            parameters.uniform_words(true),
+        )
+        .enable_perturbation(mantissa, exponent, data.reference.len(), false, [0.0; 2]);
+        // ln of one pixel's height at 1e4000: far outside f64 range as a
+        // value, finite as a logarithm.
+        let pixel_log = (std::f64::consts::LN_10 * (1.45_f64.log10() - zoom_exponent as f64)
+            + (2.0 / gpu.height as f64).ln()) as f32;
+        assert!(pixel_log.is_finite());
+
+        for (label, algorithm, density) in [
+            ("iteration", ColouringAlgorithm::Iteration, 0.035),
+            ("distance", ColouringAlgorithm::DistanceEstimate, 0.25),
+            ("stripes", ColouringAlgorithm::Stripes, 60.0),
+            ("triangle", ColouringAlgorithm::TriangleInequality, 60.0),
+        ] {
+            let mut colouring = Colouring::default();
+            colouring.outside.set_algorithm(algorithm);
+            colouring.outside.density = density;
+            gpu.set_colouring(1, &colouring, pixel_log);
+            let start = std::time::Instant::now();
+            let rgb = gpu.render(1, uniforms, Some(data.reference.as_slice()));
+            let elapsed = start.elapsed();
+            let distinct: std::collections::HashSet<&[u8]> = rgb.chunks(3).collect();
+            let black = rgb
+                .chunks(3)
+                .filter(|p| p[0] < 4 && p[1] < 4 && p[2] < 4)
+                .count();
+            eprintln!(
+                "{label} at 1e{zoom_exponent}: {} distinct colours, {:.1}% near-black, {:.1} ms",
+                distinct.len(),
+                100.0 * black as f64 / (rgb.len() / 3) as f64,
+                elapsed.as_secs_f64() * 1e3
+            );
+            if let Some(directory) = &directory {
+                std::fs::create_dir_all(directory).unwrap();
+                gpu.write_ppm(&format!("{directory}/uf-limit-{label}.ppm"), &rgb);
+            }
+            assert!(
+                distinct.len() >= 200,
+                "{label} collapsed at 1e{zoom_exponent}"
+            );
+            assert!(
+                black < rgb.len() / 3 / 2,
+                "{label} is mostly black at 1e{zoom_exponent}"
+            );
+        }
+    }
+
     /// Finds a point on the boundary between bounded and finished orbits by
     /// scanning a horizontal line through `centre` and bisecting in f64.
     fn boundary_point(
