@@ -40,7 +40,7 @@ the overview selects a point and opens a linked, magnified detail region.
 
 | Family | Recurrence | Layout | Start of the left-pane orbit | Terminates on | Deep zoom |
 | --- | --- | --- | --- | --- | --- |
-| Quadratic | `z ← z² + c` | parameter/dynamical | `z₀ = 0` | `\|z\| > bailout` | DS, AP perturbation |
+| Quadratic | `z ← z² + c` | parameter/dynamical | `z₀ = 0` | `\|z\| > bailout` | f64 + AP perturbation |
 | Newton cubic | `z ← z − (z³−1)/(3z²)` | overview/detail | pixel | residual `< 10⁻⁶` | f64 + AP perturbation |
 | Multibrot | `z ← zᵈ + c`, `2 ≤ d ≤ 8` | parameter/dynamical | `z₀ = 0` | bailout | f64 + AP perturbation |
 | Tricorn | `z ← z̄² + c` | parameter/dynamical | `z₀ = 0` | bailout | f64 + AP perturbation |
@@ -78,11 +78,11 @@ argument of the attracting point); the Lyapunov plane is coloured by the sign
 and size of the exponent, warm for stable and cool for chaotic forcing.
 
 The **Deep zoom** column lists the precision paths available past plain
-`f32`: the quadratic instrument uses compensated double-single (`DS`, about
-48 bits, validated by its orbit probes) up to the `1.14e14×` handoff; every
-other listed family switches directly to GPU perturbation around a CPU
-reference orbit — `f64` below the handoff, arbitrary precision beyond it —
-which carries it to the same `10^5000×` navigation ceiling. The
+`f32`: every listed family switches to GPU perturbation around a CPU
+reference orbit — `f64` below the `1.14e14×` handoff, arbitrary precision
+beyond it — up to the `10^5000×` navigation ceiling. The quadratic
+instrument additionally keeps its compensated double-single recurrence as a
+fallback and as the subject of its orbit probes. The
 transcendental families and the Lyapunov plane stop at `f32`: their reference
 orbits would need arbitrary-precision exponentials and trigonometry, which the
 decimal arithmetic layer does not yet provide.
@@ -223,10 +223,14 @@ Interior shading**), which reveals the basins of attracting cycles; switch it
 off to recover the uniform dark interior.
 
 Precision handling is deliberately explicit. Once the `f32` coordinate grid
-becomes coarser than a pixel, the non-quadratic families render by GPU
-perturbation around a reference orbit of the view centre: below the
-`1.14e14×` handoff the reference is computed on the CPU in `f64`
-(`F64 PERT`), beyond it in arbitrary precision (`AP PERT`). In both cases
+becomes coarser than a pixel, every family renders by GPU perturbation
+around a reference orbit: below the `1.14e14×` handoff the reference is
+computed on the CPU in `f64` (`F64 PERT`), beyond it in arbitrary precision
+(`AP PERT`). (The GPU double-single recurrence that previously carried the
+quadratic instrument through that range was found, on Metal, to lose
+structure well before the handoff — a flat image at `10^11×` where the
+`f64` reference resolves over a thousand distinct escape times — so it now
+serves only as a fallback; the CPU probes still characterise it.) In both cases
 the navigation layer keeps exact coordinates, the CPU builds the reference
 with `family::reference_orbit_f64` or `arbitrary::deep_step` (exact
 transcriptions of the `f64` definition, checked by test), and the shader
@@ -296,8 +300,9 @@ performance diagnostics.
 The interface reports the active arithmetic for each pane. Viewport navigation
 starts in CPU `f64` and moves to arbitrary-precision decimal coordinates for
 quadratic deep zoom. Rendering starts with fast GPU `f32` and switches
-automatically to GPU double-single when coordinate resolution is at risk or
-the lightweight orbit probe detects divergent escape behaviour. The
+automatically to perturbation around a CPU `f64` reference orbit when
+coordinate resolution is at risk or the lightweight orbit probe detects
+divergent escape behaviour. The
 `DS STABLE`, `DS RISK` and `DS LIMIT` labels describe agreement with sampled
 `f64` orbits and coordinate resolution—they are more meaningful than visual
 smoothness alone.

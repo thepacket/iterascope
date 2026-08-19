@@ -1970,7 +1970,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
         return vec4<f32>(colour, 1.0);
     }
-    if (family != FAMILY_QUADRATIC && !newton) {
+    // Every family except Newton takes the generic path; the quadratic keeps
+    // its own double-single and arbitrary-precision recurrences but joins
+    // the generic f32-delta perturbation below the handoff.
+    let quadratic_f64_reference = family == FAMILY_QUADRATIC && perturbation && u.deep.x < 1.5;
+    if (!newton && (family != FAMILY_QUADRATIC || quadratic_f64_reference)) {
         var result: GenericResult;
         var world = world_f32;
         if (perturbation && u.deep.x < 1.5) {

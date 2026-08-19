@@ -2143,4 +2143,244 @@ mod tests {
             "half-resolution preview is misaligned: {mean_difference}"
         );
     }
+
+    /// A pan must move the image by exactly the panned amount, whatever
+    /// reference point the frame happens to use. Renders a view, pans by a
+    /// whole number of pixels, renders again with a differently placed
+    /// reference (as the app's candidate search may do), and checks that the
+    /// second image is the first one shifted.
+    #[test]
+    #[ignore]
+    fn gpu_pan_moves_image_by_exactly_the_pan() {
+        use crate::family::{
+            FamilyParameters, FractalFamily, initial_state_with, reference_orbit_f64,
+        };
+        let gpu = GpuHarness::new(384, 256);
+        let parameters = FamilyParameters::default();
+        let family = FractalFamily::BurningShip;
+        let plane = family.default_parameter_view();
+        let half_height = plane.half_height * 1e-9;
+        let aspect = gpu.aspect();
+        let iterations = 256;
+        let render = |centre: [f64; 2], offset: [f32; 2], ds_fallback: bool| -> Vec<u8> {
+            let reference_point = [
+                centre[0] + offset[0] as f64 * half_height,
+                centre[1] + offset[1] as f64 * half_height,
+            ];
+            let orbit = reference_orbit_f64(
+                family,
+                &parameters,
+                initial_state_with(family, reference_point, false, family.default_parameter()),
+                iterations,
+                4.0,
+            );
+            let data =
+                DeepRenderData::from_f64_orbit(1, half_height, &orbit.points, ds_fallback, offset);
+            let uniforms = Uniforms::new(
+                centre,
+                half_height,
+                aspect,
+                family.default_parameter(),
+                iterations,
+                4.0,
+                family.shader_flag(),
+                0,
+                0.0,
+                true,
+                false,
+                true,
+                PrecisionMode::DoubleSingle,
+                parameters.uniform_words(false),
+            )
+            .enable_perturbation(
+                data.scale_mantissa,
+                data.scale_exponent,
+                data.reference.len(),
+                ds_fallback,
+                offset,
+            );
+            gpu.render(0, uniforms, Some(data.reference.as_slice()))
+        };
+        // Pixel size in world units (height maps to 2 * half_height).
+        let world_per_pixel = 2.0 * half_height / gpu.height as f64;
+        let shift_pixels = 7i64;
+        let centre_a = plane.centre;
+        let centre_b = [
+            centre_a[0] + shift_pixels as f64 * world_per_pixel,
+            centre_a[1],
+        ];
+        // The re-described case keeps the very same reference point for both
+        // views: the offset changes by exactly the pan (in local units).
+        let pan_local = shift_pixels as f32 * 2.0 / gpu.height as f32;
+        for (label, offset_a, offset_b, ds_fallback) in [
+            ("centred f32", [0.0f32; 2], [0.0f32; 2], true),
+            (
+                "same reference f32",
+                [0.3, 0.2],
+                [0.3 - pan_local, 0.2],
+                true,
+            ),
+            (
+                "same reference scaled",
+                [0.3, 0.2],
+                [0.3 - pan_local, 0.2],
+                false,
+            ),
+            (
+                "off-centre f32",
+                [0.8 * aspect, -0.4],
+                [-0.4 * aspect, 0.8],
+                true,
+            ),
+            (
+                "off-centre scaled",
+                [0.8 * aspect, -0.4],
+                [-0.4 * aspect, 0.8],
+                false,
+            ),
+        ] {
+            let a = render(centre_a, offset_a, ds_fallback);
+            let b = render(centre_b, offset_b, ds_fallback);
+            // b is the view moved right by `shift_pixels`: b[x] == a[x + shift].
+            let (w, h) = (gpu.width as i64, gpu.height as i64);
+            let mut differing = 0usize;
+            let mut compared = 0usize;
+            for y in 0..h {
+                for x in 0..(w - shift_pixels) {
+                    let ia = ((y * w + x + shift_pixels) * 3) as usize;
+                    let ib = ((y * w + x) * 3) as usize;
+                    let delta: i32 = (0..3)
+                        .map(|k| (a[ia + k] as i32 - b[ib + k] as i32).abs())
+                        .sum();
+                    if delta > 60 {
+                        differing += 1;
+                    }
+                    compared += 1;
+                }
+            }
+            let fraction = differing as f64 / compared as f64;
+            eprintln!("{label}: {:.2}% of shifted pixels differ", 100.0 * fraction);
+            assert!(
+                fraction < 0.05,
+                "{label}: pan did not translate the image ({:.2}% differ)",
+                100.0 * fraction
+            );
+        }
+    }
+
+    /// Pans the quadratic instrument by a whole number of pixels at 1e11 and
+    /// compares the shifted images for its double-single path and for an
+    /// f64-reference perturbation render of the same views.
+    #[test]
+    #[ignore]
+    fn gpu_quadratic_pan_consistency_at_deep_ds_zoom() {
+        use crate::family::{
+            FamilyParameters, FractalFamily, initial_state_with, reference_orbit_f64,
+        };
+        let gpu = GpuHarness::new(384, 256);
+        let parameters = FamilyParameters::default();
+        let family = FractalFamily::Quadratic;
+        let iterations = 512;
+        // A boundary point of the Mandelbrot set found by bisection, so the
+        // view has structure.
+        let plane = family.default_parameter_view();
+        let point = boundary_point(
+            family,
+            &parameters,
+            plane.centre,
+            plane.half_height,
+            false,
+            family.default_parameter(),
+            iterations,
+        )
+        .unwrap();
+        for zoom in [1e9f64, 1e11] {
+            let half_height = 1.45 / zoom;
+            let world_per_pixel = 2.0 * half_height / gpu.height as f64;
+            let shift_pixels = 5i64;
+            let centre_a = point;
+            let centre_b = [point[0] + shift_pixels as f64 * world_per_pixel, point[1]];
+            let render_ds = |centre: [f64; 2]| {
+                let uniforms = Uniforms::new(
+                    centre,
+                    half_height,
+                    gpu.aspect(),
+                    family.default_parameter(),
+                    iterations,
+                    4.0,
+                    family.shader_flag(),
+                    0,
+                    0.0,
+                    true,
+                    false,
+                    true,
+                    PrecisionMode::DoubleSingle,
+                    parameters.uniform_words(false),
+                );
+                gpu.render(0, uniforms, None)
+            };
+            let render_f64 = |centre: [f64; 2]| {
+                let orbit = reference_orbit_f64(
+                    family,
+                    &parameters,
+                    initial_state_with(family, centre, false, family.default_parameter()),
+                    iterations,
+                    4.0,
+                );
+                let data =
+                    DeepRenderData::from_f64_orbit(1, half_height, &orbit.points, true, [0.0; 2]);
+                let uniforms = Uniforms::new(
+                    centre,
+                    half_height,
+                    gpu.aspect(),
+                    family.default_parameter(),
+                    iterations,
+                    4.0,
+                    family.shader_flag(),
+                    0,
+                    0.0,
+                    true,
+                    false,
+                    true,
+                    PrecisionMode::DoubleSingle,
+                    parameters.uniform_words(false),
+                )
+                .enable_perturbation(
+                    data.scale_mantissa,
+                    data.scale_exponent,
+                    data.reference.len(),
+                    true,
+                    [0.0; 2],
+                );
+                gpu.render(0, uniforms, Some(data.reference.as_slice()))
+            };
+            for (label, a, b) in [
+                ("DS", render_ds(centre_a), render_ds(centre_b)),
+                ("f64 reference", render_f64(centre_a), render_f64(centre_b)),
+            ] {
+                let (w, h) = (gpu.width as i64, gpu.height as i64);
+                let mut differing = 0usize;
+                let mut compared = 0usize;
+                for y in 0..h {
+                    for x in 0..(w - shift_pixels) {
+                        let ia = ((y * w + x + shift_pixels) * 3) as usize;
+                        let ib = ((y * w + x) * 3) as usize;
+                        let delta: i32 = (0..3)
+                            .map(|k| (a[ia + k] as i32 - b[ib + k] as i32).abs())
+                            .sum();
+                        if delta > 60 {
+                            differing += 1;
+                        }
+                        compared += 1;
+                    }
+                }
+                let distinct: std::collections::HashSet<&[u8]> = a.chunks(3).collect();
+                eprintln!(
+                    "quadratic {label} at {zoom:e}: {:.2}% of shifted pixels differ ({} distinct colours)",
+                    100.0 * differing as f64 / compared as f64,
+                    distinct.len()
+                );
+            }
+        }
+    }
 }

@@ -1500,9 +1500,9 @@ impl App {
             None
         } else if deep_view.is_some() {
             self.deep_reference(pane, deep_view.as_ref(), !interacting)
-        } else if !self.family.is_quadratic() && precision == PrecisionMode::DoubleSingle {
-            // Below the handoff the generic families render by perturbation
-            // around an f64 reference orbit: exact reference fates, no GPU
+        } else if precision == PrecisionMode::DoubleSingle {
+            // Below the handoff every family renders by perturbation around
+            // an f64 reference orbit: exact reference fates, no GPU
             // compensated arithmetic on the critical path.
             self.f64_reference(pane, &view, aspect)
         } else {
