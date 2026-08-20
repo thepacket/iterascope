@@ -38,6 +38,11 @@ pub(crate) struct ZoomAnimation {
     pub(crate) gradient_sweep_turns: f32,
     /// Invoke ffmpeg on the finished sequence when it is installed.
     pub(crate) encode_video: bool,
+    /// Scale each frame's iteration budget with its magnification: the
+    /// budget the user set applies to the deepest frame, and shallower
+    /// frames — whose structure resolves in far fewer iterations — use
+    /// proportionally fewer, which speeds long dives up considerably.
+    pub(crate) scale_iterations: bool,
 }
 
 impl Default for ZoomAnimation {
@@ -52,6 +57,7 @@ impl Default for ZoomAnimation {
             ease: true,
             gradient_sweep_turns: 0.0,
             encode_video: true,
+            scale_iterations: true,
         }
     }
 }
@@ -93,10 +99,29 @@ impl ZoomAnimation {
     }
 
     /// The deepest magnification any frame reaches.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn max_magnification_log10(&self) -> f64 {
         self.start_magnification_log10
             .max(self.end_magnification_log10)
+    }
+
+    /// The iteration budget of `frame`. The budget the user set applies to
+    /// the deepest frame of the path; with iteration scaling on, shallower
+    /// frames interpolate linearly in log-magnification down to a floor —
+    /// escape times near a boundary grow roughly linearly with the zoom
+    /// exponent, so early frames of a deep dive need only a fraction of the
+    /// final budget.
+    pub(crate) fn frame_iterations(&self, user_iterations: u32, frame: usize) -> u32 {
+        if !self.scale_iterations {
+            return user_iterations;
+        }
+        let floor = user_iterations.min(256).max(32);
+        let deepest = self.max_magnification_log10();
+        if deepest <= 1e-9 {
+            return user_iterations;
+        }
+        let share = (self.magnification_log10_at(frame) / deepest).clamp(0.0, 1.0);
+        let budget = floor as f64 + (user_iterations as f64 - floor as f64) * share;
+        (budget.round() as u32).clamp(floor.min(user_iterations), user_iterations)
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -281,6 +306,31 @@ mod tests {
         assert!((animation.gradient_offset_at(frames - 1) - 0.5).abs() < 1e-6);
         let quarter = animation.gradient_offset_at(frames / 4);
         assert!((quarter - 0.125).abs() < 0.01);
+    }
+
+    #[test]
+    fn iteration_budget_hits_the_user_value_at_depth_and_the_floor_at_the_top() {
+        let animation = path(0.0, 300.0, false);
+        let frames = animation.frame_count();
+        assert_eq!(animation.frame_iterations(2_400, frames - 1), 2_400);
+        assert_eq!(animation.frame_iterations(2_400, 0), 256);
+        let mid = animation.frame_iterations(2_400, frames / 2);
+        assert!((1_200..=1_450).contains(&mid), "{mid}");
+        // Monotonic along a zoom-in.
+        let mut previous = 0;
+        for frame in 0..frames {
+            let budget = animation.frame_iterations(2_400, frame);
+            assert!(budget >= previous);
+            previous = budget;
+        }
+        // Disabled scaling and degenerate paths keep the full budget.
+        let mut fixed = path(0.0, 300.0, false);
+        fixed.scale_iterations = false;
+        assert_eq!(fixed.frame_iterations(2_400, 0), 2_400);
+        let flat = path(0.0, 0.0, false);
+        assert_eq!(flat.frame_iterations(2_400, 0), 2_400);
+        // Small budgets never scale below themselves.
+        assert_eq!(path(0.0, 100.0, false).frame_iterations(64, 0), 64);
     }
 
     #[test]

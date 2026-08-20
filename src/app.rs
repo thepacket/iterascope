@@ -1672,9 +1672,15 @@ impl App {
         // mildly, while a reference orbit is still being extended) so each
         // frame stays cheap and the view follows the input instead of
         // lurching after long frames. The settled frame renders in full.
+        // While an export runs, the live view also drops to reduced
+        // resolution so it does not compete with the export for the GPU.
+        #[cfg(not(target_arch = "wasm32"))]
+        let exporting = self.export.is_some() || self.still.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let exporting = self.web_job.is_some();
         let preview_scale = if interacting {
             PREVIEW_SCALE_INTERACTING
-        } else if building {
+        } else if building || exporting {
             PREVIEW_SCALE_BUILDING
         } else {
             1
@@ -2428,6 +2434,13 @@ impl App {
             }
         });
         ui.checkbox(&mut self.animation.ease, "Ease in and out");
+        ui.checkbox(
+            &mut self.animation.scale_iterations,
+            "Scale iterations with zoom",
+        )
+        .on_hover_text(
+            "The iteration budget applies to the deepest frame; shallower frames use proportionally fewer iterations, which speeds long dives up considerably.",
+        );
         ui.add(
             egui::Slider::new(&mut self.animation.gradient_sweep_turns, -4.0..=4.0)
                 .text("gradient sweep (turns)"),
@@ -2578,6 +2591,7 @@ impl App {
                     return;
                 }
                 let magnification = animation.magnification_log10_at(frame);
+                let iterations = animation.frame_iterations(scene.iterations, frame);
                 let rgba = match scene
                     .render_region_async(
                         &render_state,
@@ -2586,6 +2600,7 @@ impl App {
                         (0, 0),
                         (width, height),
                         animation.gradient_offset_at(frame),
+                        iterations,
                     )
                     .await
                 {
@@ -2616,7 +2631,11 @@ impl App {
                     return;
                 }
                 progress.lock().unwrap().done += 1;
-                ctx.request_repaint();
+                // Repainting the live view after every frame costs a full
+                // interactive render; every fourth is plenty for progress.
+                if frame % 4 == 0 {
+                    ctx.request_repaint();
+                }
             }
             let result = if let Some(encoder) = encoder {
                 match encoder.finish().await {
@@ -3021,6 +3040,7 @@ impl App {
                             (column_offset * supersample, row_offset * supersample),
                             (tile_width * supersample, tile_height * supersample),
                             0.0,
+                            scene.iterations,
                         )
                         .await
                     {
@@ -3149,6 +3169,7 @@ impl App {
         let (column_offset, tile_width) = job.columns[column];
         let (row_offset, tile_height) = job.rows[row];
         let supersample = job.supersample;
+        let iterations = job.scene.iterations;
         let rendered = match job.scene.render_region(
             &render_state,
             job.magnification,
@@ -3156,6 +3177,7 @@ impl App {
             (column_offset * supersample, row_offset * supersample),
             (tile_width * supersample, tile_height * supersample),
             0.0,
+            iterations,
         ) {
             Ok(rendered) => rendered,
             Err(error) => {
@@ -3207,11 +3229,13 @@ impl App {
         let frame = job.next_frame;
         let total = job.animation.frame_count();
         let magnification = job.animation.magnification_log10_at(frame);
+        let iterations = job.animation.frame_iterations(job.scene.iterations, frame);
         let rgba = match job.scene.render_frame(
             &render_state,
             magnification,
             (job.animation.width, job.animation.height),
             job.animation.gradient_offset_at(frame),
+            iterations,
         ) {
             Ok(rgba) => rgba,
             Err(error) => {
@@ -4449,8 +4473,17 @@ impl FrozenScene {
         magnification: f64,
         size: (u32, u32),
         sweep: f32,
+        iterations: u32,
     ) -> Result<Vec<u8>, String> {
-        self.render_region(render_state, magnification, size, (0, 0), size, sweep)
+        self.render_region(
+            render_state,
+            magnification,
+            size,
+            (0, 0),
+            size,
+            sweep,
+            iterations,
+        )
     }
 
     /// The uniforms, colouring block and reference upload of one region
@@ -4458,6 +4491,7 @@ impl FrozenScene {
     /// around the same reference orbit as the frame (the frame centre moves
     /// to the region's `reference_offset`), so tiling is exact at any
     /// magnification.
+    #[allow(clippy::too_many_arguments)]
     fn region_inputs(
         &self,
         magnification: f64,
@@ -4465,6 +4499,7 @@ impl FrozenScene {
         origin: (u32, u32),
         region_size: (u32, u32),
         sweep: f32,
+        iterations: u32,
     ) -> (
         Uniforms,
         ColouringUniforms,
@@ -4494,7 +4529,7 @@ impl FrozenScene {
             region.half_height_f64,
             region.aspect,
             self.julia_c,
-            self.iterations,
+            iterations.min(self.iterations),
             self.bailout,
             self.family.shader_flag(),
             usize::from(self.dynamical),
@@ -4546,9 +4581,16 @@ impl FrozenScene {
         origin: (u32, u32),
         region_size: (u32, u32),
         sweep: f32,
+        iterations: u32,
     ) -> Result<Vec<u8>, String> {
-        let (uniforms, colouring_uniforms, reference) =
-            self.region_inputs(magnification, full_size, origin, region_size, sweep);
+        let (uniforms, colouring_uniforms, reference) = self.region_inputs(
+            magnification,
+            full_size,
+            origin,
+            region_size,
+            sweep,
+            iterations,
+        );
         let renderer = render_state.renderer.read();
         let pipeline = renderer
             .callback_resources
@@ -4569,6 +4611,7 @@ impl FrozenScene {
     /// mapping with no renderer lock held (the UI thread needs it every
     /// frame), then collect.
     #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::too_many_arguments)]
     async fn render_region_async(
         &self,
         render_state: &eframe::egui_wgpu::RenderState,
@@ -4577,10 +4620,17 @@ impl FrozenScene {
         origin: (u32, u32),
         region_size: (u32, u32),
         sweep: f32,
+        iterations: u32,
     ) -> Result<Vec<u8>, String> {
         let receiver = {
-            let (uniforms, colouring_uniforms, reference) =
-                self.region_inputs(magnification, full_size, origin, region_size, sweep);
+            let (uniforms, colouring_uniforms, reference) = self.region_inputs(
+                magnification,
+                full_size,
+                origin,
+                region_size,
+                sweep,
+                iterations,
+            );
             let renderer = render_state.renderer.read();
             let pipeline = renderer
                 .callback_resources

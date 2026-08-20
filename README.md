@@ -239,7 +239,13 @@ frame is in; without WebCodecs it downloads the frames as a ZIP of PNGs.
 Because the centre is fixed, the arbitrary-precision reference orbit is
 computed once and re-described in scale for every frame; frames below the
 `1.14e14×` handoff use the same orbit projected to `f64`, and the switch
-between the paths is seamless.
+between the paths is seamless. **Scale iterations with zoom** (on by
+default) applies the configured iteration budget to the deepest frame and
+gives shallower frames proportionally fewer — escape times near a boundary
+grow roughly linearly with the zoom exponent, so the early frames of a deep
+dive render several times faster with no visible cost. While any export
+runs, the live view drops to reduced resolution so it does not compete with
+the export for the GPU.
 
 ### Layers
 

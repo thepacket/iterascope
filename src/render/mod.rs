@@ -2170,6 +2170,7 @@ mod tests {
             ease: false,
             gradient_sweep_turns: 0.25,
             encode_video: false,
+            scale_iterations: false,
         };
         assert_eq!(animation.frame_count(), 5);
         let handoff_log = crate::arbitrary::ARBITRARY_HANDOFF_ZOOM.log10();
