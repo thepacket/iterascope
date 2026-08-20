@@ -3768,46 +3768,48 @@ impl eframe::App for App {
                     ui.label(egui::RichText::new("ITERASCOPE").strong().color(TEXT));
                     ui.label(egui::RichText::new("Complex dynamics laboratory").color(MUTED));
                     ui.add_space(10.0);
+                    // View selector: either plane alone, full window, or
+                    // both linked panes side by side.
+                    let (left, right) = self.pane_labels();
                     if ui
-                        .selectable_label(!self.single_image, "Panes")
-                        .on_hover_text("Linked parameter and dynamical panes")
+                        .selectable_label(self.single_image && self.active_pane == 0, left)
+                        .on_hover_text("This plane alone, full window")
+                        .clicked()
+                    {
+                        self.single_image = true;
+                        self.active_pane = 0;
+                    }
+                    if ui
+                        .selectable_label(self.single_image && self.active_pane == 1, right)
+                        .on_hover_text("This plane alone, full window")
+                        .clicked()
+                    {
+                        self.single_image = true;
+                        self.active_pane = 1;
+                    }
+                    if ui
+                        .selectable_label(!self.single_image, "Both")
+                        .on_hover_text("The linked panes side by side")
                         .clicked()
                     {
                         self.single_image = false;
                     }
-                    if ui
-                        .selectable_label(self.single_image, "Image")
-                        .on_hover_text("One composited image (the active pane, full window)")
-                        .clicked()
+                    if self.family.linkage() == Linkage::ParameterDynamical
+                        && ui
+                            .selectable_label(self.switch_picker_open, "Pick c…")
+                            .on_hover_text(
+                                "Choose the Julia parameter from the parameter plane, with a live preview",
+                            )
+                            .clicked()
                     {
-                        self.single_image = true;
-                    }
-                    if self.single_image {
-                        let (left, right) = self.pane_labels();
-                        if ui.selectable_label(self.active_pane == 0, left).clicked() {
-                            self.active_pane = 0;
-                        }
-                        if ui.selectable_label(self.active_pane == 1, right).clicked() {
+                        // The picker draws through the parameter pane's GPU
+                        // resources, so it lives in the single Julia view.
+                        if self.switch_picker_open {
+                            self.switch_picker_open = false;
+                        } else {
+                            self.single_image = true;
                             self.active_pane = 1;
-                        }
-                        if self.family.linkage() == Linkage::ParameterDynamical {
-                            if self.active_pane == 1 {
-                                if ui
-                                    .selectable_label(self.switch_picker_open, "Pick c…")
-                                    .on_hover_text(
-                                        "Choose the Julia parameter from the parameter plane, with a live preview",
-                                    )
-                                    .clicked()
-                                {
-                                    self.switch_picker_open = !self.switch_picker_open;
-                                }
-                            } else if ui
-                                .button("Open Julia")
-                                .on_hover_text("Show the dynamical plane of the selected c")
-                                .clicked()
-                            {
-                                self.active_pane = 1;
-                            }
+                            self.switch_picker_open = true;
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

@@ -244,14 +244,13 @@ top — and reorder or hide layers freely; the **Colouring** section always
 edits the active layer. Layers currently share the image's location, family
 and iteration settings (per-layer formulas and locations are future work),
 which is what keeps the whole stack exact at any magnification: one
-reference orbit drives every layer. The **Image** toggle in the top bar
-swaps the two linked panes for the composited image alone, full-window — the
-default layout; **Panes** brings the linked scientific layout back. While the
-image shows the dynamical plane, **Pick c…** in the top bar opens the switch
-picker: the parameter plane with a crosshair, scroll zoom, a marker on the
-current `c` and a live Julia thumbnail of the hovered parameter — click to
-choose and the composited image follows immediately. From a parameter-plane
-image, **Open Julia** jumps to the dynamical plane of the selected `c`.
+reference orbit drives every layer. The view
+selector in the top bar chooses the view: **Parameter** or **Julia** alone,
+full-window (the default layout), or **Both** linked panes side by side.
+**Pick c…** opens the switch picker in the single Julia view: the parameter
+plane with a crosshair, scroll zoom, a marker on the current `c` and a live
+Julia thumbnail of the hovered parameter — click to choose and the composited
+image follows immediately.
 
 ### Colouring
 
