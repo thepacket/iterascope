@@ -144,7 +144,11 @@ from it.
   (Normal, Add, Multiply, Screen, Overlay, Darken, Lighten, Difference), and
   any layer can act as a mask: it paints nothing and its luminance (times
   its opacity) multiplies the opacity of the layer above it, so any
-  colouring algorithm can shape where another layer shows —
+  colouring algorithm can shape where another layer shows — and any layer
+  can detach into its own scene: its own formula, plane, parameter and
+  location, rendered as a separate pass through the same engine and
+  composited over the stack, exact through the `f64`-reference perturbation
+  range (to the `1.14e14×` handoff) —
   with a single-image workspace (the default layout) that gives the
   composited image the full window. Layers share the image's location and
   family, so one reference orbit serves the whole stack and the deep-zoom
@@ -261,6 +265,18 @@ a mask: it stops painting and its luminance, scaled by its opacity, controls
 the opacity of the layer above it — a stripe-average mask carving windows
 into a top layer, an orbit-trap mask haloing the set. Consecutive masks
 multiply.
+
+**Own formula and location** in the Colouring section detaches the active
+layer into its own scene: it captures the current view (family, plane,
+parameter, centre and zoom, clamped to `1.14e14×`) and from then on renders
+that scene regardless of where the image navigates — a Burning Ship backdrop
+behind a Mandelbrot dive, a Julia overlay masked into a parameter-plane
+image. Detached scenes are edited numerically (family, `c`, centre, zoom,
+iterations, bailout) or re-captured from the view, render as separate passes
+through the unchanged deep-zoom engine, and composite with the layer's usual
+opacity, merge mode and masks. In animations they hold their location while
+the shared-scene layers dive. A stack whose layers all share the image's
+scene keeps the single-pass compositor, byte-identical to before.
 
 Each layer also has a **skip first N iterations** control (shown when a
 trap, stripe or triangle-inequality algorithm is selected). At deep
@@ -553,7 +569,8 @@ crossing every precision path at a row-padded width, a layer-compositing test
 (a single-layer stack must reproduce the pre-layer renderer byte for byte,
 every merge mode must be distinct, white/black/gradient masks must behave,
 an eight-layer stack must survive, and skipping leading iterations must
-revive the orbit trap at depth),
+revive the orbit trap at depth), a GPU-versus-CPU compositor equivalence
+test over a stack mixing shared, mask and detached layers,
 and a timing probe that also records the cost of the orbit-statistics
 variant:
 
@@ -566,7 +583,7 @@ ITERASCOPE_RENDER_DIR=out cargo test --release gpu_ -- --ignored --nocapture
 **Document → Save…** writes the complete reproducible experiment state to a
 `.json` file — through the native file dialog, or as a download in the
 browser build — and **Open…** loads one back through the file picker on both
-targets. The versioned document (format version 6) records the
+targets. The versioned document (format version 7) records the
 active family, both plane centres and scales, the selected parameter or
 starting value, the family parameters the active family uses, computation
 limits, the layer stack with each layer's gradient and colouring algorithms,
@@ -588,9 +605,9 @@ stored. Opened documents are validated before any live state is changed.
 5. Orbit probes for the non-quadratic escape-time families, and
    arbitrary-precision exponential/trigonometric reference orbits so the
    transcendental families can join the deep-zoom path
-6. Towards generative fractal art: per-layer formulas and locations (layer
-   masks, iteration skipping, the switch picker, anti-aliased tiled stills
-   and the single-image default landed); keyframed centre drift and
+6. Towards generative fractal art: arbitrary-precision locations for
+   detached layer scenes (they currently stop at the `1.14e14×` handoff;
+   per-layer formulas and locations landed); keyframed centre drift and
    per-parameter animation curves; register-resident accumulators for the
    first statistics-bearing layer (the per-layer arrays cost the opt-in
    statistics variant roughly 2× today); derivatives for the remaining

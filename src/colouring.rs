@@ -17,6 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::family::FractalFamily;
+
 /// Entries in the rasterised gradient uploaded to the GPU.
 pub(crate) const LOOKUP_TABLE_LEN: usize = 1024;
 
@@ -1149,7 +1151,7 @@ impl MergeMode {
         }
     }
 
-    const fn code(self) -> u32 {
+    pub(crate) const fn code(self) -> u32 {
         match self {
             Self::Normal => 0,
             Self::Add => 1,
@@ -1163,10 +1165,99 @@ impl MergeMode {
     }
 }
 
+/// A layer's own scene: its formula, plane, parameter and location,
+/// independent of the image the stack belongs to. Detached scenes render as
+/// their own pass and are limited to the `f64`-reference perturbation range
+/// (magnification up to the ~1.14e14× handoff).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct LayerScene {
+    pub(crate) family: FractalFamily,
+    /// Iterate from z₀ = pixel (dynamical plane) rather than treating the
+    /// pixel as the parameter.
+    pub(crate) dynamical: bool,
+    /// The Julia parameter (dynamical plane) in the complex plane.
+    pub(crate) julia_c: [f64; 2],
+    pub(crate) centre: [f64; 2],
+    pub(crate) half_height: f64,
+    pub(crate) iterations: u32,
+    pub(crate) bailout: f32,
+    /// Family-specific settings, in the experiment document's shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) family_parameters: Option<crate::experiment::FamilyParametersDocument>,
+}
+
+impl Default for LayerScene {
+    fn default() -> Self {
+        let family = FractalFamily::Quadratic;
+        let view = family.default_dynamical_view();
+        Self {
+            family,
+            dynamical: true,
+            julia_c: family.default_parameter(),
+            centre: view.centre,
+            half_height: view.half_height,
+            iterations: 256,
+            bailout: 4.0,
+            family_parameters: None,
+        }
+    }
+}
+
+impl LayerScene {
+    /// The smallest half-height a detached scene may use: the `f64`
+    /// reference-orbit path is exact to the arbitrary-precision handoff.
+    pub(crate) const MIN_HALF_HEIGHT: f64 = 1.45 / crate::arbitrary::ARBITRARY_HANDOFF_ZOOM;
+
+    pub(crate) fn validate(&self, index: usize) -> Result<(), String> {
+        if !self.centre[0].is_finite()
+            || !self.centre[1].is_finite()
+            || !self.julia_c[0].is_finite()
+            || !self.julia_c[1].is_finite()
+        {
+            return Err(format!("layer {index}: scene coordinates must be finite"));
+        }
+        if !self.half_height.is_finite()
+            || !(Self::MIN_HALF_HEIGHT..=1e6).contains(&self.half_height)
+        {
+            return Err(format!(
+                "layer {index}: scene half_height must be between {:.3e} and 1e6 (detached layers stop at the arbitrary-precision handoff)",
+                Self::MIN_HALF_HEIGHT
+            ));
+        }
+        if !(1..=50_000).contains(&self.iterations) {
+            return Err(format!(
+                "layer {index}: scene iterations must be between 1 and 50000"
+            ));
+        }
+        if !self.bailout.is_finite() || !(2.0..=1e10).contains(&self.bailout) {
+            return Err(format!(
+                "layer {index}: scene bailout must be between 2 and 1e10"
+            ));
+        }
+        if let Some(parameters) = &self.family_parameters {
+            parameters
+                .validate()
+                .map_err(|error| format!("layer {index}: {error}"))?;
+        }
+        Ok(())
+    }
+
+    /// The runtime family parameters this scene describes.
+    pub(crate) fn parameters(&self) -> crate::family::FamilyParameters {
+        let mut parameters = crate::family::FamilyParameters::default();
+        if let Some(document) = &self.family_parameters {
+            document.apply_to(&mut parameters);
+        }
+        parameters
+    }
+}
+
 /// One layer of the composited image: a complete colour stage plus how it
-/// merges with the layers beneath. Layers share the image's location,
-/// family and iteration — the orbit is computed once per pixel and coloured
-/// once per layer.
+/// merges with the layers beneath. By default layers share the image's
+/// location, family and iteration — the orbit is computed once per pixel
+/// and coloured once per layer. A layer with its own [`LayerScene`] instead
+/// renders as a separate pass with its own formula and location.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Layer {
@@ -1182,6 +1273,9 @@ pub(crate) struct Layer {
     /// share hundreds of identical leading iterations, which flattens those
     /// colourings; skipping the shared prefix restores their variety.
     pub(crate) skip_iterations: u32,
+    /// This layer's own formula and location; `None` shares the image's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scene: Option<LayerScene>,
     pub(crate) colouring: Colouring,
 }
 
@@ -1194,6 +1288,7 @@ impl Default for Layer {
             merge_mode: MergeMode::Normal,
             mask: false,
             skip_iterations: 0,
+            scene: None,
             colouring: Colouring::default(),
         }
     }
@@ -1208,6 +1303,9 @@ impl Layer {
             return Err(format!(
                 "layer {index}: skip_iterations must be below 50000"
             ));
+        }
+        if let Some(scene) = &self.scene {
+            scene.validate(index)?;
         }
         self.colouring
             .validate()
@@ -1304,6 +1402,22 @@ impl LayerStack {
         entries
     }
 
+    /// The uniform block of one layer rendered alone (a detached-scene
+    /// pass): full opacity, Normal mode, no mask — merging happens in the
+    /// compositing pass afterwards. `gradient_base` is the layer's table
+    /// offset (in entries) inside the shared gradient buffer.
+    pub(crate) fn single_pass_words(
+        layer: &Layer,
+        pixel_log: f32,
+        gradient_base: usize,
+    ) -> [[f32; 4]; GPU_WORDS] {
+        let mut alone = LayerStack::single(layer.colouring.clone());
+        alone.layers[0].skip_iterations = layer.skip_iterations;
+        let mut words = alone.gpu_words(pixel_log);
+        words[0][3] = gradient_base as f32;
+        words
+    }
+
     /// The uniform block for the shader. `pixel_log` is the natural log of
     /// one pixel's height in world units (distance estimates are expressed
     /// in pixels). Only visible layers are uploaded; the bottom layer's
@@ -1344,6 +1458,8 @@ impl LayerStack {
             count = 1;
         }
         words[0] = [count as f32, pixel_log, LOOKUP_TABLE_LEN as f32, 0.0];
+        // words[0][3] stays 0: the shared-scene pass reads the gradient
+        // table from its start.
         words[NEEDS_WORD] = [
             needs[0] as u8 as f32,
             needs[1] as u8 as f32,

@@ -10,8 +10,8 @@ use crate::arbitrary::{
     ReferenceOrbitBuilder,
 };
 use crate::colouring::{
-    Colouring, ColouringAlgorithm, ColouringSide, Gradient, Interpolation, Layer, LayerStack,
-    MAX_LAYERS, MergeMode, Transfer, TrapShape, presets,
+    Colouring, ColouringAlgorithm, ColouringSide, Gradient, Interpolation, Layer, LayerScene,
+    LayerStack, MAX_LAYERS, MergeMode, Transfer, TrapShape, presets,
 };
 use crate::experiment::{
     ComplexDocument, ComputationDocument, DeepComplexDocument, DeepPlaneDocument, DisplayDocument,
@@ -31,7 +31,8 @@ use crate::precision::{
 };
 use crate::render::GpuReferencePoint;
 use crate::render::{
-    self, ColouringUniforms, DeepRenderData, FractalPipeline, GradientTable, Uniforms,
+    self, ColouringUniforms, DeepRenderData, FractalPipeline, GradientTable, LayerPass, Uniforms,
+    composite_cpu,
 };
 
 const PANEL_WIDTH: f32 = 286.0;
@@ -253,6 +254,9 @@ pub struct App {
     /// collapses to a slim strip independently.
     left_panel_open: bool,
     right_panel_open: bool,
+    /// Reference orbits of detached layer scenes, keyed by the scene they
+    /// were built for; small, evicted oldest-first.
+    detached_references: Vec<(LayerScene, Arc<DeepRenderData>)>,
     /// Rasterised gradients shared with the render callbacks; rebuilt when
     /// the visible layers' gradients differ from `gradient_table_source`.
     gradient_table: Arc<GradientTable>,
@@ -344,6 +348,7 @@ impl App {
             switch_picker_open: false,
             left_panel_open: true,
             right_panel_open: true,
+            detached_references: Vec::new(),
             gradient_table: Arc::new(GradientTable::new(0, &LayerStack::default())),
             gradient_table_source: vec![Gradient::default()],
             gradient_editor_open: false,
@@ -1757,6 +1762,15 @@ impl App {
             + (2.0 / (pixel_height_points * ui.ctx().pixels_per_point() as f64)).ln();
         let colouring_uniforms = ColouringUniforms::new(&self.layers, pixel_log as f32);
         let gradient = self.gradient_table();
+        let passes = self.layer_passes(
+            pane,
+            &shader_view,
+            aspect,
+            precision,
+            &deep,
+            pixel_log,
+            pixel_height_points * ui.ctx().pixels_per_point() as f64,
+        );
         ui.painter().add(render::callback(
             viewport,
             pane,
@@ -1764,6 +1778,7 @@ impl App {
             colouring_uniforms,
             gradient,
             deep,
+            passes,
             preview_scale,
             ui.ctx().pixels_per_point(),
         ));
@@ -1790,6 +1805,272 @@ impl App {
         } else if let Some(deep_view) = &deep_view {
             self.draw_deep_readout(ui, viewport, response.hover_pos(), deep_view);
         }
+    }
+
+    /// Detached layers switch to the f64-reference perturbation path past
+    /// this magnification; below it plain f32 is exact.
+    const DETACHED_PERTURBATION_ZOOM: f64 = 1e4;
+
+    /// A snapshot of the active pane as a detached layer scene.
+    fn captured_scene(&self) -> LayerScene {
+        let pane = self.active_pane.min(1);
+        let view = if pane == 0 {
+            self.parameter
+        } else {
+            self.dynamical
+        };
+        let (centre, half_height) = self.deep_views[pane]
+            .as_ref()
+            .map_or((view.centre, view.half_height), |deep| {
+                (deep.centre_preview(), deep.half_height_preview())
+            });
+        LayerScene {
+            family: self.family,
+            dynamical: self.pane_is_dynamical(pane),
+            julia_c: self.julia_c,
+            centre,
+            half_height: half_height.max(LayerScene::MIN_HALF_HEIGHT),
+            iterations: self.iterations,
+            bailout: self.bailout,
+            family_parameters: FamilyParametersDocument::for_family(
+                self.family,
+                &self.family_parameters,
+            ),
+        }
+    }
+
+    /// The active layer's own formula and location: detach it from the
+    /// image's scene, edit it, or re-attach it.
+    fn layer_scene_controls(&mut self, ui: &mut egui::Ui) {
+        let captured = self.captured_scene();
+        let layer = self.layers.active_layer_mut();
+        let mut detached = layer.scene.is_some();
+        if ui
+            .checkbox(&mut detached, "Own formula and location")
+            .on_hover_text(
+                "The layer renders its own family, parameter and view instead of the image's, exact to 1.14e14× magnification. Detaching captures the current view.",
+            )
+            .changed()
+        {
+            layer.scene = detached.then_some(captured.clone());
+        }
+        let Some(scene) = &mut layer.scene else {
+            return;
+        };
+        egui::CollapsingHeader::new(format!(
+            "Scene: {} ×{:.2e}",
+            scene.family.name(),
+            1.45 / scene.half_height
+        ))
+        .id_salt("iterascope.layer.scene")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::ComboBox::from_id_salt("iterascope.layer.scene.family")
+                .selected_text(scene.family.name())
+                .width(210.0)
+                .show_ui(ui, |ui| {
+                    for family in FractalFamily::ALL {
+                        ui.selectable_value(&mut scene.family, family, family.name());
+                    }
+                });
+            ui.checkbox(&mut scene.dynamical, "Dynamical plane (z₀ = pixel)");
+            if scene.dynamical {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("c").monospace().color(MUTED));
+                    ui.add(
+                        egui::DragValue::new(&mut scene.julia_c[0])
+                            .speed(0.001)
+                            .max_decimals(12),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut scene.julia_c[1])
+                            .speed(0.001)
+                            .max_decimals(12),
+                    );
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("centre").monospace().color(MUTED));
+                ui.add(
+                    egui::DragValue::new(&mut scene.centre[0])
+                        .speed(0.001)
+                        .max_decimals(14),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut scene.centre[1])
+                        .speed(0.001)
+                        .max_decimals(14),
+                );
+            });
+            let mut zoom_log10 = (1.45 / scene.half_height).log10();
+            if ui
+                .add(
+                    egui::Slider::new(&mut zoom_log10, 0.0..=14.0)
+                        .text("zoom 10^")
+                        .fixed_decimals(2),
+                )
+                .changed()
+            {
+                scene.half_height =
+                    (1.45 / 10f64.powf(zoom_log10)).max(LayerScene::MIN_HALF_HEIGHT);
+            }
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut scene.iterations)
+                        .range(1..=50_000)
+                        .speed(8)
+                        .prefix("iterations "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut scene.bailout)
+                        .range(2.0..=1e10)
+                        .speed(1)
+                        .prefix("bailout "),
+                );
+            });
+            if ui
+                .button("Capture current view")
+                .on_hover_text(
+                    "Copy the active pane's family, parameter and location into this layer's scene (clamped to 1.14e14×)",
+                )
+                .clicked()
+            {
+                *scene = captured;
+            }
+        });
+        ui.separator();
+    }
+
+    /// The multi-pass composition of this pane, or `None` when every
+    /// visible layer shares the image's scene (the single-pass path).
+    /// Shared layers re-render the pane's own scene per layer; detached
+    /// layers render their own family and location, exact through the
+    /// `f64`-reference perturbation range.
+    #[allow(clippy::too_many_arguments)]
+    fn layer_passes(
+        &mut self,
+        pane: usize,
+        shader_view: &PlaneView,
+        aspect: f32,
+        precision: PrecisionMode,
+        deep: &Option<Arc<DeepRenderData>>,
+        pixel_log: f64,
+        viewport_pixels_y: f64,
+    ) -> Option<Vec<LayerPass>> {
+        if !self.layers.visible().any(|layer| layer.scene.is_some()) {
+            return None;
+        }
+        let dynamical = self.pane_is_dynamical(pane);
+        let visible: Vec<Layer> = self.layers.visible().cloned().collect();
+        let mut passes = Vec::with_capacity(visible.len());
+        for (index, layer) in visible.iter().enumerate() {
+            let gradient_base = index * crate::colouring::LOOKUP_TABLE_LEN;
+            let (uniforms, reference, layer_pixel_log) = if let Some(scene) = &layer.scene {
+                let magnification = 1.45 / scene.half_height.max(f64::MIN_POSITIVE);
+                let reference = (magnification > Self::DETACHED_PERTURBATION_ZOOM)
+                    .then(|| self.detached_reference(scene));
+                let mut uniforms = Uniforms::new(
+                    scene.centre,
+                    scene.half_height,
+                    aspect,
+                    scene.julia_c,
+                    scene.iterations,
+                    scene.bailout,
+                    scene.family.shader_flag(),
+                    usize::from(scene.dynamical),
+                    layer.colouring.outside.smooth,
+                    false,
+                    if reference.is_some() {
+                        PrecisionMode::DoubleSingle
+                    } else {
+                        PrecisionMode::F32
+                    },
+                    scene.parameters().uniform_words(scene.dynamical),
+                );
+                if let Some(reference) = &reference {
+                    uniforms = uniforms.enable_perturbation(
+                        reference.scale_mantissa,
+                        reference.scale_exponent,
+                        reference.reference.len(),
+                        reference.ds_fallback,
+                        reference.reference_offset,
+                    );
+                }
+                let layer_pixel_log = (2.0 * scene.half_height / viewport_pixels_y.max(1.0)).ln();
+                (uniforms, reference, layer_pixel_log)
+            } else {
+                let mut uniforms = Uniforms::new(
+                    shader_view.centre,
+                    shader_view.half_height,
+                    aspect,
+                    self.julia_c,
+                    self.iterations,
+                    self.bailout,
+                    self.family.shader_flag(),
+                    pane,
+                    layer.colouring.outside.smooth,
+                    false,
+                    precision,
+                    self.family_parameters.uniform_words(dynamical),
+                );
+                if let Some(data) = deep {
+                    uniforms = uniforms.enable_perturbation(
+                        data.scale_mantissa,
+                        data.scale_exponent,
+                        data.reference.len(),
+                        data.ds_fallback,
+                        data.reference_offset,
+                    );
+                }
+                (uniforms, deep.clone(), pixel_log)
+            };
+            passes.push(LayerPass {
+                uniforms,
+                colouring: ColouringUniforms::for_layer(
+                    layer,
+                    layer_pixel_log as f32,
+                    gradient_base,
+                ),
+                reference,
+                merge_mode: layer.merge_mode.code(),
+                opacity: layer.opacity,
+                mask: layer.mask,
+            });
+        }
+        Some(passes)
+    }
+
+    /// The f64 reference orbit of a detached scene, cached by value.
+    fn detached_reference(&mut self, scene: &LayerScene) -> Arc<DeepRenderData> {
+        if let Some(position) = self
+            .detached_references
+            .iter()
+            .position(|(key, _)| key == scene)
+        {
+            return Arc::clone(&self.detached_references[position].1);
+        }
+        let parameters = scene.parameters();
+        let orbit = reference_orbit_f64(
+            scene.family,
+            &parameters,
+            initial_state_with(scene.family, scene.centre, scene.dynamical, scene.julia_c),
+            scene.iterations,
+            scene.bailout as f64,
+        );
+        self.deep_generation += 1;
+        let data = Arc::new(DeepRenderData::from_f64_orbit(
+            self.deep_generation,
+            scene.half_height,
+            &orbit.points,
+            true,
+            [0.0; 2],
+        ));
+        if self.detached_references.len() >= 8 {
+            self.detached_references.remove(0);
+        }
+        self.detached_references
+            .push((scene.clone(), Arc::clone(&data)));
+        data
     }
 
     /// The rasterised gradients for the render callbacks, rebuilt only when
@@ -1966,6 +2247,7 @@ impl App {
                 .color(CREAM),
             );
         }
+        self.layer_scene_controls(ui);
         // Gradient preview; click to open the editor.
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
@@ -2542,6 +2824,13 @@ impl App {
                 return;
             }
         };
+        let passes = match self.freeze_passes(pane) {
+            Ok(passes) => passes,
+            Err(error) => {
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
         if clamped {
             self.export_message = Some((
                 "Magnification clamped to the current view (zoom further first to go deeper)"
@@ -2570,6 +2859,9 @@ impl App {
             };
             let (width, height, fps) = (animation.width, animation.height, animation.fps);
             let total = animation.frame_count();
+            let mut static_cache: Vec<Option<Vec<u8>>> = passes
+                .as_ref()
+                .map_or_else(Vec::new, |passes| vec![None; passes.len()]);
             let mut encoder = None;
             let mut zip = None;
             if use_mp4 {
@@ -2591,24 +2883,82 @@ impl App {
                     return;
                 }
                 let magnification = animation.magnification_log10_at(frame);
-                let iterations = animation.frame_iterations(scene.iterations, frame);
-                let rgba = match scene
-                    .render_region_async(
-                        &render_state,
-                        magnification,
-                        (width, height),
-                        (0, 0),
-                        (width, height),
-                        animation.gradient_offset_at(frame),
-                        iterations,
-                    )
-                    .await
-                {
-                    Ok(rgba) => rgba,
-                    Err(error) => {
+                let sweep = animation.gradient_offset_at(frame);
+                let rgba = if let Some(passes) = &passes {
+                    let mut rendered = Vec::with_capacity(passes.len());
+                    let mut failure = None;
+                    for (index, pass) in passes.iter().enumerate() {
+                        let cacheable = !pass.animated && sweep == 0.0;
+                        if cacheable && let Some(cached) = &static_cache[index] {
+                            rendered.push((
+                                cached.clone(),
+                                pass.merge_mode,
+                                pass.opacity,
+                                pass.mask,
+                            ));
+                            continue;
+                        }
+                        let pass_magnification = if pass.animated {
+                            magnification
+                        } else {
+                            pass.fixed_magnification
+                        };
+                        let pass_iterations = if pass.animated {
+                            animation.frame_iterations(pass.scene.iterations, frame)
+                        } else {
+                            pass.scene.iterations
+                        };
+                        match pass
+                            .scene
+                            .render_region_async(
+                                &render_state,
+                                pass_magnification,
+                                (width, height),
+                                (0, 0),
+                                (width, height),
+                                sweep,
+                                pass_iterations,
+                            )
+                            .await
+                        {
+                            Ok(image) => {
+                                if cacheable {
+                                    static_cache[index] = Some(image.clone());
+                                }
+                                rendered.push((image, pass.merge_mode, pass.opacity, pass.mask));
+                            }
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(error) = failure {
                         finish(Err(error));
                         ctx.request_repaint();
                         return;
+                    }
+                    composite_cpu(&rendered)
+                } else {
+                    let iterations = animation.frame_iterations(scene.iterations, frame);
+                    match scene
+                        .render_region_async(
+                            &render_state,
+                            magnification,
+                            (width, height),
+                            (0, 0),
+                            (width, height),
+                            sweep,
+                            iterations,
+                        )
+                        .await
+                    {
+                        Ok(rgba) => rgba,
+                        Err(error) => {
+                            finish(Err(error));
+                            ctx.request_repaint();
+                            return;
+                        }
                     }
                 };
                 let encoded = if let Some(encoder) = &encoder {
@@ -2848,9 +3198,21 @@ impl App {
             return;
         }
 
+        let passes = match self.freeze_passes(pane) {
+            Ok(passes) => passes,
+            Err(error) => {
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
+        let static_cache = passes
+            .as_ref()
+            .map_or_else(Vec::new, |passes| vec![None; passes.len()]);
         self.export = Some(ExportJob {
             animation,
             scene,
+            passes,
+            static_cache,
             directory,
             next_frame: 0,
             started: Instant::now(),
@@ -2940,7 +3302,77 @@ impl App {
             gradient: Arc::new(GradientTable::new(base + 3, &self.layers)),
             ap_reference,
             f64_reference,
+            single_pass: None,
         })
+    }
+
+    /// Freezes a multi-pass composition: one scene per visible layer, or
+    /// `None` when every visible layer shares the image's scene (the
+    /// single-pass export path applies). Detached scenes carry their own
+    /// `f64` reference and a fixed magnification.
+    fn freeze_passes(&mut self, pane: usize) -> Result<Option<Vec<FrozenPass>>, String> {
+        if !self.layers.visible().any(|layer| layer.scene.is_some()) {
+            return Ok(None);
+        }
+        let shared = self.freeze_scene(pane)?;
+        let visible: Vec<Layer> = self.layers.visible().cloned().collect();
+        let mut passes = Vec::with_capacity(visible.len());
+        for (index, layer) in visible.into_iter().enumerate() {
+            let gradient_base = index * crate::colouring::LOOKUP_TABLE_LEN;
+            let pass = if let Some(scene) = layer.scene.clone() {
+                let magnification = 1.45 / scene.half_height.max(f64::MIN_POSITIVE);
+                let reference = (magnification > Self::DETACHED_PERTURBATION_ZOOM)
+                    .then(|| self.detached_reference(&scene));
+                FrozenPass {
+                    merge_mode: layer.merge_mode.code(),
+                    opacity: layer.opacity,
+                    mask: layer.mask,
+                    animated: false,
+                    fixed_magnification: magnification.log10(),
+                    scene: FrozenScene {
+                        family: scene.family,
+                        dynamical: scene.dynamical,
+                        family_words: scene.parameters().uniform_words(scene.dynamical),
+                        iterations: scene.iterations,
+                        bailout: scene.bailout,
+                        julia_c: scene.julia_c,
+                        centre: scene.centre,
+                        layers: self.layers.clone(),
+                        gradient: Arc::clone(&shared.gradient),
+                        ap_reference: None,
+                        f64_reference: reference
+                            .map(|data| (data.generation, Arc::clone(&data.reference))),
+                        single_pass: Some((layer, gradient_base)),
+                    },
+                }
+            } else {
+                let mut scene = FrozenScene {
+                    family: shared.family,
+                    dynamical: shared.dynamical,
+                    family_words: shared.family_words,
+                    iterations: shared.iterations,
+                    bailout: shared.bailout,
+                    julia_c: shared.julia_c,
+                    centre: shared.centre,
+                    layers: self.layers.clone(),
+                    gradient: Arc::clone(&shared.gradient),
+                    ap_reference: shared.ap_reference.clone(),
+                    f64_reference: shared.f64_reference.clone(),
+                    single_pass: None,
+                };
+                scene.single_pass = Some((layer.clone(), gradient_base));
+                FrozenPass {
+                    merge_mode: layer.merge_mode.code(),
+                    opacity: layer.opacity,
+                    mask: layer.mask,
+                    animated: true,
+                    fixed_magnification: 0.0,
+                    scene,
+                }
+            };
+            passes.push(pass);
+        }
+        Ok(Some(passes))
     }
 
     /// Starts a still render of the current view: the frame renders at
@@ -2978,8 +3410,16 @@ impl App {
         // Tiles are laid out in final pixels so downsampling blocks never
         // straddle a tile edge; each supersampled tile fits the texture.
         let max_tile = animation::MAX_DIMENSION / supersample;
+        let passes = match self.freeze_passes(pane) {
+            Ok(passes) => passes,
+            Err(error) => {
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
         self.still = Some(StillJob {
             scene,
+            passes,
             magnification,
             width,
             height,
@@ -3013,6 +3453,13 @@ impl App {
                 return;
             }
         };
+        let passes = match self.freeze_passes(pane) {
+            Ok(passes) => passes,
+            Err(error) => {
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
         let max_tile = animation::MAX_DIMENSION / supersample;
         let columns = animation::tile_spans(width, max_tile);
         let rows = animation::tile_spans(height, max_tile);
@@ -3032,25 +3479,69 @@ impl App {
                     if progress.lock().unwrap().cancel {
                         break 'tiles;
                     }
-                    let rendered = match scene
-                        .render_region_async(
-                            &render_state,
-                            magnification,
-                            (width * supersample, height * supersample),
-                            (column_offset * supersample, row_offset * supersample),
-                            (tile_width * supersample, tile_height * supersample),
-                            0.0,
-                            scene.iterations,
-                        )
-                        .await
-                    {
-                        Ok(rendered) => rendered,
-                        Err(error) => {
+                    let full = (width * supersample, height * supersample);
+                    let origin = (column_offset * supersample, row_offset * supersample);
+                    let region = (tile_width * supersample, tile_height * supersample);
+                    let rendered = if let Some(passes) = &passes {
+                        let mut rendered = Vec::with_capacity(passes.len());
+                        let mut failure = None;
+                        for pass in passes {
+                            let pass_magnification = if pass.animated {
+                                magnification
+                            } else {
+                                pass.fixed_magnification
+                            };
+                            match pass
+                                .scene
+                                .render_region_async(
+                                    &render_state,
+                                    pass_magnification,
+                                    full,
+                                    origin,
+                                    region,
+                                    0.0,
+                                    pass.scene.iterations,
+                                )
+                                .await
+                            {
+                                Ok(image) => {
+                                    rendered.push((image, pass.merge_mode, pass.opacity, pass.mask))
+                                }
+                                Err(error) => {
+                                    failure = Some(error);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(error) = failure {
                             let mut progress = progress.lock().unwrap();
                             progress.message = Some((error, true));
                             progress.finished = true;
                             ctx.request_repaint();
                             return;
+                        }
+                        composite_cpu(&rendered)
+                    } else {
+                        match scene
+                            .render_region_async(
+                                &render_state,
+                                magnification,
+                                full,
+                                origin,
+                                region,
+                                0.0,
+                                scene.iterations,
+                            )
+                            .await
+                        {
+                            Ok(rendered) => rendered,
+                            Err(error) => {
+                                let mut progress = progress.lock().unwrap();
+                                progress.message = Some((error, true));
+                                progress.finished = true;
+                                ctx.request_repaint();
+                                return;
+                            }
                         }
                     };
                     let tile = downsample_srgb(&rendered, tile_width * supersample, supersample);
@@ -3169,21 +3660,56 @@ impl App {
         let (column_offset, tile_width) = job.columns[column];
         let (row_offset, tile_height) = job.rows[row];
         let supersample = job.supersample;
-        let iterations = job.scene.iterations;
-        let rendered = match job.scene.render_region(
-            &render_state,
-            job.magnification,
-            (job.width * supersample, job.height * supersample),
-            (column_offset * supersample, row_offset * supersample),
-            (tile_width * supersample, tile_height * supersample),
-            0.0,
-            iterations,
-        ) {
-            Ok(rendered) => rendered,
-            Err(error) => {
+        let full = (job.width * supersample, job.height * supersample);
+        let origin = (column_offset * supersample, row_offset * supersample);
+        let region = (tile_width * supersample, tile_height * supersample);
+        let rendered = if let Some(passes) = &job.passes {
+            let mut rendered = Vec::with_capacity(passes.len());
+            let mut failure = None;
+            for pass in passes {
+                let pass_magnification = if pass.animated {
+                    job.magnification
+                } else {
+                    pass.fixed_magnification
+                };
+                match pass.scene.render_region(
+                    &render_state,
+                    pass_magnification,
+                    full,
+                    origin,
+                    region,
+                    0.0,
+                    pass.scene.iterations,
+                ) {
+                    Ok(image) => rendered.push((image, pass.merge_mode, pass.opacity, pass.mask)),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = failure {
                 self.still = None;
                 self.export_message = Some((error, true));
                 return;
+            }
+            composite_cpu(&rendered)
+        } else {
+            match job.scene.render_region(
+                &render_state,
+                job.magnification,
+                full,
+                origin,
+                region,
+                0.0,
+                job.scene.iterations,
+            ) {
+                Ok(rendered) => rendered,
+                Err(error) => {
+                    self.still = None;
+                    self.export_message = Some((error, true));
+                    return;
+                }
             }
         };
         let tile_rgba = downsample_srgb(&rendered, tile_width * supersample, supersample);
@@ -3229,19 +3755,64 @@ impl App {
         let frame = job.next_frame;
         let total = job.animation.frame_count();
         let magnification = job.animation.magnification_log10_at(frame);
-        let iterations = job.animation.frame_iterations(job.scene.iterations, frame);
-        let rgba = match job.scene.render_frame(
-            &render_state,
-            magnification,
-            (job.animation.width, job.animation.height),
-            job.animation.gradient_offset_at(frame),
-            iterations,
-        ) {
-            Ok(rgba) => rgba,
-            Err(error) => {
+        let sweep = job.animation.gradient_offset_at(frame);
+        let size = (job.animation.width, job.animation.height);
+        let rgba = if let Some(passes) = &job.passes {
+            let mut rendered = Vec::with_capacity(passes.len());
+            let mut failure = None;
+            for (index, pass) in passes.iter().enumerate() {
+                let cacheable = !pass.animated && sweep == 0.0;
+                if cacheable && let Some(cached) = &job.static_cache[index] {
+                    rendered.push((cached.clone(), pass.merge_mode, pass.opacity, pass.mask));
+                    continue;
+                }
+                let pass_magnification = if pass.animated {
+                    magnification
+                } else {
+                    pass.fixed_magnification
+                };
+                let pass_iterations = if pass.animated {
+                    job.animation.frame_iterations(pass.scene.iterations, frame)
+                } else {
+                    pass.scene.iterations
+                };
+                match pass.scene.render_frame(
+                    &render_state,
+                    pass_magnification,
+                    size,
+                    sweep,
+                    pass_iterations,
+                ) {
+                    Ok(image) => {
+                        if cacheable {
+                            job.static_cache[index] = Some(image.clone());
+                        }
+                        rendered.push((image, pass.merge_mode, pass.opacity, pass.mask));
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = failure {
                 self.export = None;
                 self.export_message = Some((error, true));
                 return;
+            }
+            composite_cpu(&rendered)
+        } else {
+            let iterations = job.animation.frame_iterations(job.scene.iterations, frame);
+            match job
+                .scene
+                .render_frame(&render_state, magnification, size, sweep, iterations)
+            {
+                Ok(rgba) => rgba,
+                Err(error) => {
+                    self.export = None;
+                    self.export_message = Some((error, true));
+                    return;
+                }
             }
         };
 
@@ -3336,6 +3907,7 @@ impl App {
                     colouring_uniforms,
                     Arc::clone(&gradient),
                     None,
+                    None,
                     1,
                     ctx.pixels_per_point(),
                 ));
@@ -3429,6 +4001,7 @@ impl App {
                     preview_uniforms,
                     ColouringUniforms::new(&self.layers, preview_pixel_log),
                     gradient,
+                    None,
                     None,
                     1,
                     ctx.pixels_per_point(),
@@ -4433,6 +5006,12 @@ impl eframe::App for App {
 struct ExportJob {
     animation: ZoomAnimation,
     scene: FrozenScene,
+    /// Per-layer scenes when the stack holds detached layers; frames are
+    /// then rendered per layer and composited on the CPU.
+    passes: Option<Vec<FrozenPass>>,
+    /// Cached renders of non-animated (detached) passes, valid while no
+    /// gradient sweep changes their colours.
+    static_cache: Vec<Option<Vec<u8>>>,
     directory: std::path::PathBuf,
     next_frame: usize,
     started: Instant,
@@ -4458,6 +5037,24 @@ struct FrozenScene {
     ap_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
     /// The same orbit projected to `f64` for frames below the handoff.
     f64_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
+    /// When set, this scene renders exactly one layer of a multi-pass
+    /// composition — full opacity, Normal mode, its gradient at the given
+    /// base offset — and the compositor merges the results.
+    single_pass: Option<(Layer, usize)>,
+}
+
+/// One frozen layer of a multi-pass export: a scene rendering one layer,
+/// plus how the CPU compositor merges it.
+struct FrozenPass {
+    scene: FrozenScene,
+    merge_mode: u32,
+    opacity: f32,
+    mask: bool,
+    /// Shared-scene passes follow the zoom animation; detached scenes hold
+    /// their own fixed magnification.
+    animated: bool,
+    /// log10 magnification of a non-animated (detached) scene.
+    fixed_magnification: f64,
 }
 
 impl FrozenScene {
@@ -4551,17 +5148,22 @@ impl FrozenScene {
                 region.reference_offset,
             );
         }
-        let mut layers = self.layers.clone();
-        if sweep != 0.0 {
-            for layer in &mut layers.layers {
-                layer.colouring.outside.offset += sweep;
-                layer.colouring.inside.offset += sweep;
+        let pixel_log = animation::frame_pixel_log(magnification, full_size.1);
+        let colouring_uniforms = if let Some((layer, base)) = &self.single_pass {
+            let mut layer = layer.clone();
+            layer.colouring.outside.offset += sweep;
+            layer.colouring.inside.offset += sweep;
+            ColouringUniforms::for_layer(&layer, pixel_log, *base)
+        } else {
+            let mut layers = self.layers.clone();
+            if sweep != 0.0 {
+                for layer in &mut layers.layers {
+                    layer.colouring.outside.offset += sweep;
+                    layer.colouring.inside.offset += sweep;
+                }
             }
-        }
-        let colouring_uniforms = ColouringUniforms::new(
-            &layers,
-            animation::frame_pixel_log(magnification, full_size.1),
-        );
+            ColouringUniforms::new(&layers, pixel_log)
+        };
         (
             uniforms,
             colouring_uniforms,
@@ -4679,6 +5281,7 @@ struct WebJobProgress {
 #[cfg(not(target_arch = "wasm32"))]
 struct StillJob {
     scene: FrozenScene,
+    passes: Option<Vec<FrozenPass>>,
     magnification: f64,
     width: u32,
     height: u32,

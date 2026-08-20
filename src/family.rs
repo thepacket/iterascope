@@ -1373,3 +1373,17 @@ mod tests {
         assert!(parameters.validate().is_err());
     }
 }
+
+impl serde::Serialize for FractalFamily {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.document_id())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FractalFamily {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let id = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_document_id(&id)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown fractal family {id:?}")))
+    }
+}

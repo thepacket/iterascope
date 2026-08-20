@@ -290,6 +290,18 @@ impl ColouringUniforms {
         }
     }
 
+    /// The block of one layer rendered alone in a multi-pass composition:
+    /// full opacity, Normal mode; merging happens in the compositor.
+    pub(crate) fn for_layer(
+        layer: &crate::colouring::Layer,
+        pixel_log: f32,
+        gradient_base: usize,
+    ) -> Self {
+        Self {
+            words: crate::colouring::LayerStack::single_pass_words(layer, pixel_log, gradient_base),
+        }
+    }
+
     /// Whether a selected algorithm needs the per-iteration accumulators,
     /// i.e. the orbit-statistics shader variant.
     pub(crate) fn needs_orbit_stats(&self) -> bool {
@@ -423,6 +435,46 @@ impl DeepRenderData {
     }
 }
 
+/// One layer of a multi-pass composition: a full scene render (its own
+/// uniforms and reference orbit) plus how the compositor merges it.
+pub(crate) struct LayerPass {
+    pub(crate) uniforms: Uniforms,
+    pub(crate) colouring: ColouringUniforms,
+    pub(crate) reference: Option<Arc<DeepRenderData>>,
+    pub(crate) merge_mode: u32,
+    pub(crate) opacity: f32,
+    pub(crate) mask: bool,
+}
+
+/// GPU resources of one layer slot in the multi-pass path.
+struct LayerSlot {
+    buffer: wgpu::Buffer,
+    colouring_buffer: wgpu::Buffer,
+    reference_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    reference_generation: Option<u64>,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+/// Per-pane state of the multi-pass compositor, sized on demand.
+#[derive(Default)]
+struct Compositor {
+    size: (u32, u32),
+    layers: Vec<LayerSlot>,
+    /// Ping-pong colour accumulators and mask accumulators, plus a 1×1
+    /// white texture standing in for "no mask".
+    compose: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    masks: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    white: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// One small uniform buffer per compositing step.
+    step_params: Vec<wgpu::Buffer>,
+    /// Which compose texture holds the finished image.
+    final_index: usize,
+    /// Blit binding of the finished image, rebuilt by `run_layer_passes`.
+    final_bind_group: Option<wgpu::BindGroup>,
+}
+
 /// Reduced-resolution target used while input is active.
 struct PreviewTarget {
     _texture: wgpu::Texture,
@@ -442,6 +494,7 @@ struct PaneResources {
     /// Whether the uploaded colouring needs the orbit-statistics pipeline.
     orbit_stats: Mutex<bool>,
     preview: Mutex<Option<PreviewTarget>>,
+    compositor: Mutex<Compositor>,
 }
 
 pub struct FractalPipeline {
@@ -454,6 +507,11 @@ pub struct FractalPipeline {
     /// readback format must not depend on the window surface.
     export_pipeline: wgpu::RenderPipeline,
     export_stats_pipeline: wgpu::RenderPipeline,
+    /// Merges one layer texture over the accumulated composition.
+    compose_pipeline: wgpu::RenderPipeline,
+    compose_layout: wgpu::BindGroupLayout,
+    /// The fractal bind-group layout, kept to build layer slots on demand.
+    fractal_layout: wgpu::BindGroupLayout,
     /// Draws a preview texture onto the pane.
     blit_pipeline: wgpu::RenderPipeline,
     blit_layout: wgpu::BindGroupLayout,
@@ -471,6 +529,146 @@ struct ExportTarget {
     size: (u32, u32),
     padded_bytes_per_row: u32,
 }
+
+/// Composites per-layer RGBA renders exactly as the GPU compositor does:
+/// the first painted layer over black, merge modes and opacities above it,
+/// mask layers multiplying their luminance into the opacity of the next
+/// painted layer. Inputs and output are RGBA rows, top first.
+pub(crate) fn composite_cpu(passes: &[(Vec<u8>, u32, f32, bool)]) -> Vec<u8> {
+    let Some(first) = passes.first() else {
+        return Vec::new();
+    };
+    let pixels = first.0.len() / 4;
+    let mut accumulator = vec![0.0f32; pixels * 3];
+    let mut pending_mask = vec![1.0f32; pixels];
+    let mut painted = false;
+    let merge = |dst: f32, src: f32, mode: u32| -> f32 {
+        match mode {
+            1 => (dst + src).min(1.0),
+            2 => dst * src,
+            3 => 1.0 - (1.0 - dst) * (1.0 - src),
+            4 => {
+                if dst < 0.5 {
+                    2.0 * dst * src
+                } else {
+                    1.0 - 2.0 * (1.0 - dst) * (1.0 - src)
+                }
+            }
+            5 => dst.min(src),
+            6 => dst.max(src),
+            7 => (dst - src).abs(),
+            _ => src,
+        }
+    };
+    for (rgba, mode, opacity, mask) in passes {
+        let opacity = opacity.clamp(0.0, 1.0);
+        if *mask {
+            for pixel in 0..pixels {
+                let r = rgba[pixel * 4] as f32 / 255.0;
+                let g = rgba[pixel * 4 + 1] as f32 / 255.0;
+                let b = rgba[pixel * 4 + 2] as f32 / 255.0;
+                let luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
+                pending_mask[pixel] *= 1.0 + (luminance - 1.0) * opacity;
+            }
+            continue;
+        }
+        for pixel in 0..pixels {
+            let effective = opacity * pending_mask[pixel];
+            for channel in 0..3 {
+                let src = rgba[pixel * 4 + channel] as f32 / 255.0;
+                let dst = accumulator[pixel * 3 + channel];
+                accumulator[pixel * 3 + channel] = if painted {
+                    dst + (merge(dst, src, *mode) - dst) * effective
+                } else {
+                    src * effective
+                };
+            }
+        }
+        pending_mask.fill(1.0);
+        painted = true;
+    }
+    let mut out = Vec::with_capacity(pixels * 4);
+    for pixel in 0..pixels {
+        for channel in 0..3 {
+            out.push((accumulator[pixel * 3 + channel].clamp(0.0, 1.0) * 255.0).round() as u8);
+        }
+        out.push(255);
+    }
+    out
+}
+
+/// One compositing step over fullscreen triangles. `params.x` is the merge
+/// mode (matching `MergeMode::code`), `params.y` the opacity, `params.z` is
+/// 1 for the first painted layer (composites over black, mode ignored) and
+/// `params.w` selects the operation: 0 blends a colour layer (`acc`,
+/// `layer`, `mask`), 1 multiplies a mask layer's luminance into the mask
+/// accumulator (`acc` = previous mask product).
+const COMPOSE_SHADER: &str = r#"
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@group(0) @binding(0) var acc_texture: texture_2d<f32>;
+@group(0) @binding(1) var layer_texture: texture_2d<f32>;
+@group(0) @binding(2) var mask_texture: texture_2d<f32>;
+@group(0) @binding(3) var compose_sampler: sampler;
+@group(0) @binding(4) var<uniform> params: vec4<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
+    var corners = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0),
+    );
+    let corner = corners[vertex_index];
+    var out: VertexOut;
+    out.position = vec4<f32>(corner, 0.0, 1.0);
+    out.uv = vec2<f32>(corner.x * 0.5 + 0.5, 0.5 - corner.y * 0.5);
+    return out;
+}
+
+fn merge(dst: vec3<f32>, src: vec3<f32>, mode: u32) -> vec3<f32> {
+    switch mode {
+        case 1u: { return min(dst + src, vec3<f32>(1.0)); }
+        case 2u: { return dst * src; }
+        case 3u: { return vec3<f32>(1.0) - (vec3<f32>(1.0) - dst) * (vec3<f32>(1.0) - src); }
+        case 4u: {
+            return select(
+                vec3<f32>(1.0) - 2.0 * (vec3<f32>(1.0) - dst) * (vec3<f32>(1.0) - src),
+                2.0 * dst * src,
+                dst < vec3<f32>(0.5),
+            );
+        }
+        case 5u: { return min(dst, src); }
+        case 6u: { return max(dst, src); }
+        case 7u: { return abs(dst - src); }
+        default: { return src; }
+    }
+}
+
+@fragment
+fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    let acc = textureSample(acc_texture, compose_sampler, in.uv).rgb;
+    let layer = textureSample(layer_texture, compose_sampler, in.uv).rgb;
+    let opacity = clamp(params.y, 0.0, 1.0);
+    if (params.w > 0.5) {
+        // Mask step: multiply the layer's luminance into the mask product.
+        let luminance = clamp(dot(layer, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+        return vec4<f32>(acc * mix(vec3<f32>(1.0), vec3<f32>(luminance), opacity), 1.0);
+    }
+    let mask = textureSample(mask_texture, compose_sampler, in.uv).r;
+    let effective = opacity * mask;
+    if (params.z > 0.5) {
+        // The first painted layer composites over black; its mode is
+        // ignored, matching the single-pass compositor.
+        return vec4<f32>(layer * effective, 1.0);
+    }
+    let blended = merge(acc, layer, u32(params.x + 0.5));
+    return vec4<f32>(mix(acc, blended, effective), 1.0);
+}
+"#;
 
 /// Fullscreen-triangle blit of a sampled texture; used to present preview
 /// renders made at reduced resolution while input is active.
@@ -670,6 +868,93 @@ impl FractalPipeline {
             multiview_mask: None,
             cache: None,
         });
+        let compose_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("iterascope.compose.shader"),
+            source: wgpu::ShaderSource::Wgsl(COMPOSE_SHADER.into()),
+        });
+        let compose_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("iterascope.compose.bind-group-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(16),
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let compose_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("iterascope.compose.pipeline-layout"),
+                bind_group_layouts: &[Some(&compose_layout)],
+                immediate_size: 0,
+            });
+        let compose_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("iterascope.compose.pipeline"),
+            layout: Some(&compose_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &compose_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &compose_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("iterascope.blit.sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -761,6 +1046,7 @@ impl FractalPipeline {
                 gradient_generation: Mutex::new(None),
                 orbit_stats: Mutex::new(false),
                 preview: Mutex::new(None),
+                compositor: Mutex::new(Compositor::default()),
             }
         });
 
@@ -769,6 +1055,9 @@ impl FractalPipeline {
             stats_pipeline,
             export_pipeline,
             export_stats_pipeline,
+            compose_pipeline,
+            compose_layout,
+            fractal_layout: bind_group_layout,
             blit_pipeline,
             blit_layout,
             sampler,
@@ -776,6 +1065,377 @@ impl FractalPipeline {
             panes,
             export_target: Mutex::new(None),
         }
+    }
+
+    /// Ensures the pane's compositor holds `layer_count` layer slots at
+    /// `size`, plus the compose/mask ping-pong textures.
+    #[allow(clippy::too_many_arguments)]
+    fn compositor_resources(
+        &self,
+        device: &wgpu::Device,
+        pane: usize,
+        size: (u32, u32),
+        layer_count: usize,
+    ) {
+        let mut compositor = self.panes[pane].compositor.lock().unwrap();
+        let make_texture = |label: &str| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.target_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            (texture, view)
+        };
+        if compositor.size != size {
+            compositor.size = size;
+            compositor.layers.clear();
+            compositor.compose.clear();
+            compositor.masks.clear();
+        }
+        while compositor.compose.len() < 2 {
+            let (texture, view) = make_texture("iterascope.compose");
+            compositor.compose.push((texture, view));
+        }
+        while compositor.masks.len() < 2 {
+            let (texture, view) = make_texture("iterascope.compose.mask");
+            compositor.masks.push((texture, view));
+        }
+        if compositor.white.is_none() {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("iterascope.compose.white"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.target_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            compositor.white = Some((texture, view));
+        }
+        while compositor.layers.len() < layer_count {
+            let index = compositor.layers.len();
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iterascope.layer.uniform"),
+                size: std::mem::size_of::<Uniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let colouring_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iterascope.layer.colouring"),
+                size: std::mem::size_of::<ColouringUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let reference_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iterascope.layer.reference"),
+                size: (MAX_ITERATIONS as u64 + 1) * std::mem::size_of::<GpuReferencePoint>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iterascope.layer.bind-group"),
+                layout: &self.fractal_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: reference_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: colouring_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.panes[pane].gradient_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let (texture, view) = make_texture("iterascope.layer.target");
+            let _ = index;
+            compositor.layers.push(LayerSlot {
+                buffer,
+                colouring_buffer,
+                reference_buffer,
+                bind_group,
+                reference_generation: None,
+                texture,
+                view,
+            });
+        }
+        // One params buffer per possible step: layer renders plus a final
+        // safety margin.
+        while compositor.step_params.len() < layer_count + 1 {
+            compositor
+                .step_params
+                .push(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("iterascope.compose.params"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+        }
+    }
+
+    /// Renders and composites `passes` for a pane; the finished image is
+    /// left in a compositor texture for `composited_view` to blit.
+    fn run_layer_passes(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        pane: usize,
+        passes: &[LayerPass],
+        size: (u32, u32),
+    ) {
+        self.compositor_resources(device, pane, size, passes.len());
+        let mut compositor = self.panes[pane].compositor.lock().unwrap();
+
+        // Upload per-layer state and render each layer into its texture.
+        for (index, pass) in passes.iter().enumerate() {
+            let slot = &mut compositor.layers[index];
+            queue.write_buffer(&slot.buffer, 0, bytemuck::bytes_of(&pass.uniforms));
+            queue.write_buffer(
+                &slot.colouring_buffer,
+                0,
+                bytemuck::bytes_of(&pass.colouring),
+            );
+            if let Some(reference) = &pass.reference
+                && slot.reference_generation != Some(reference.generation)
+            {
+                queue.write_buffer(
+                    &slot.reference_buffer,
+                    0,
+                    bytemuck::cast_slice(reference.reference.as_slice()),
+                );
+                slot.reference_generation = Some(reference.generation);
+            }
+        }
+        for (index, pass) in passes.iter().enumerate() {
+            let slot = &compositor.layers[index];
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iterascope.layer.pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &slot.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if pass.colouring.needs_orbit_stats() {
+                render_pass.set_pipeline(&self.stats_pipeline);
+            } else {
+                render_pass.set_pipeline(&self.pipeline);
+            }
+            render_pass.set_bind_group(0, &slot.bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
+
+        // Composite: colour layers blend over the accumulator; mask layers
+        // multiply into the mask accumulator consumed by the next colour
+        // layer. Every step also clears its target first via LoadOp::Clear.
+        let mut step = 0usize;
+        let mut acc = 0usize; // compose[acc] holds the current image
+        let mut mask_acc: Option<usize> = None;
+        let mut painted = false;
+        let white = compositor.white.as_ref().unwrap().1.clone();
+        // Clear the initial accumulator and the white texture.
+        for view in [&compositor.compose[acc].1.clone(), &white] {
+            let colour = if std::ptr::eq(view, &white) {
+                wgpu::Color::WHITE
+            } else {
+                wgpu::Color::BLACK
+            };
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iterascope.compose.clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(colour),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        for (index, pass) in passes.iter().enumerate() {
+            let params_buffer = &compositor.step_params[step];
+            step += 1;
+            if pass.mask {
+                // pending' = pending × mix(1, luminance, opacity)
+                let source = mask_acc.map(|index| compositor.masks[index].1.clone());
+                let target_index = mask_acc.map_or(0, |index| 1 - index);
+                queue.write_buffer(
+                    params_buffer,
+                    0,
+                    bytemuck::bytes_of(&[0.0f32, pass.opacity, 0.0, 1.0]),
+                );
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("iterascope.compose.mask.bind"),
+                    layout: &self.compose_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(
+                                source.as_ref().unwrap_or(&white),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(
+                                &compositor.layers[index].view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&white),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: params_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("iterascope.compose.mask"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &compositor.masks[target_index].1,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                render_pass.set_pipeline(&self.compose_pipeline);
+                render_pass.set_bind_group(0, &bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+                mask_acc = Some(target_index);
+                continue;
+            }
+            queue.write_buffer(
+                params_buffer,
+                0,
+                bytemuck::bytes_of(&[
+                    pass.merge_mode as f32,
+                    pass.opacity,
+                    if painted { 0.0 } else { 1.0 },
+                    0.0,
+                ]),
+            );
+            let mask_view = mask_acc.map(|index| compositor.masks[index].1.clone());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iterascope.compose.bind"),
+                layout: &self.compose_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&compositor.compose[acc].1),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(
+                            &compositor.layers[index].view,
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            mask_view.as_ref().unwrap_or(&white),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let target = 1 - acc;
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iterascope.compose.step"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &compositor.compose[target].1,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            render_pass.set_pipeline(&self.compose_pipeline);
+            render_pass.set_bind_group(0, &bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+            acc = target;
+            mask_acc = None;
+            painted = true;
+        }
+        compositor.final_index = acc;
+        compositor.final_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("iterascope.compose.final"),
+            layout: &self.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&compositor.compose[acc].1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        }));
     }
 
     /// Renders one export frame at `size` and returns tightly packed RGBA
@@ -1049,6 +1709,9 @@ struct FractalCallback {
     colouring: ColouringUniforms,
     gradient: Arc<GradientTable>,
     deep: Option<Arc<DeepRenderData>>,
+    /// When present, the pane composites these per-layer renders instead of
+    /// the single shared-scene pass.
+    passes: Option<Vec<LayerPass>>,
     /// Preview reduction factor: 1 renders directly at full resolution;
     /// larger values render into a texture of 1/factor the size and blit it.
     preview_scale: u32,
@@ -1093,6 +1756,15 @@ impl CallbackTrait for FractalCallback {
                     *uploaded = Some(deep.generation);
                 }
             }
+            if let Some(passes) = &self.passes {
+                let size = if self.preview_scale > 1 {
+                    self.preview_size()
+                } else {
+                    self.pixel_size
+                };
+                renderer.run_layer_passes(device, queue, encoder, self.pane, passes, size);
+                return Vec::new();
+            }
             if self.preview_scale > 1 {
                 // Render the fractal at reduced resolution now; `paint` only
                 // has to blit the result into the pane.
@@ -1133,6 +1805,15 @@ impl CallbackTrait for FractalCallback {
         let Some(renderer) = resources.get::<FractalPipeline>() else {
             return;
         };
+        if self.passes.is_some() {
+            let compositor = renderer.panes[self.pane].compositor.lock().unwrap();
+            if let Some(bind_group) = &compositor.final_bind_group {
+                render_pass.set_pipeline(&renderer.blit_pipeline);
+                render_pass.set_bind_group(0, bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            }
+            return;
+        }
         if self.preview_scale > 1 {
             let slot = renderer.panes[self.pane].preview.lock().unwrap();
             if let Some(target) = slot.as_ref() {
@@ -1156,6 +1837,7 @@ pub(crate) fn callback(
     colouring: ColouringUniforms,
     gradient: Arc<GradientTable>,
     deep: Option<Arc<DeepRenderData>>,
+    passes: Option<Vec<LayerPass>>,
     preview_scale: u32,
     pixels_per_point: f32,
 ) -> egui::PaintCallback {
@@ -1171,6 +1853,7 @@ pub(crate) fn callback(
             colouring,
             gradient,
             deep,
+            passes,
             preview_scale: preview_scale.max(1),
             pixel_size,
         },
@@ -2686,6 +3369,189 @@ mod tests {
                 "{label}: tiled render differs from whole on {:.2}% of pixels",
                 100.0 * fraction
             );
+        }
+    }
+
+    /// The GPU multi-pass compositor must agree with the CPU compositor on
+    /// a stack mixing a shared-scene layer, a mask and a detached layer of
+    /// another family at another location. Each layer is also rendered
+    /// individually through the export path to feed the CPU reference. Run
+    /// with `cargo test --release gpu_detached_layer_composite -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gpu_detached_layer_composite() {
+        use crate::colouring::{ColouringAlgorithm, Gradient, Layer, LayerStack, MergeMode};
+        use crate::family::{FamilyParameters, FractalFamily};
+
+        let gpu = GpuHarness::new(320, 240);
+        let size = (320u32, 240u32);
+        let parameters = FamilyParameters::default();
+
+        // Bottom: the shared quadratic parameter plane. Middle: a mask from
+        // the iteration count. Top: a detached Burning Ship elsewhere.
+        let mut bottom = Layer::default();
+        bottom.colouring.gradient = Gradient::random(3);
+        let mut mask = Layer {
+            mask: true,
+            opacity: 0.8,
+            ..Layer::default()
+        };
+        mask.colouring
+            .outside
+            .set_algorithm(ColouringAlgorithm::Iteration);
+        let mut top = Layer {
+            merge_mode: MergeMode::Screen,
+            opacity: 0.7,
+            ..Layer::default()
+        };
+        top.colouring.gradient = Gradient::random(9);
+        let stack_layers = [bottom, mask, top];
+        let stack = LayerStack::from_layers(stack_layers.to_vec());
+        let gradient = GradientTable::new(71, &stack);
+
+        let quadratic_view = FractalFamily::Quadratic.default_parameter_view();
+        let ship_view = crate::family::PlaneDefault {
+            centre: [-0.5, -0.5],
+            half_height: 1.2,
+        };
+        let uniforms_for = |family: FractalFamily, view: &crate::family::PlaneDefault| {
+            Uniforms::new(
+                view.centre,
+                view.half_height,
+                gpu.aspect(),
+                family.default_parameter(),
+                256,
+                4.0,
+                family.shader_flag(),
+                0,
+                true,
+                false,
+                PrecisionMode::F32,
+                parameters.uniform_words(false),
+            )
+        };
+        let scenes = [
+            (FractalFamily::Quadratic, &quadratic_view),
+            (FractalFamily::Quadratic, &quadratic_view),
+            (FractalFamily::BurningShip, &ship_view),
+        ];
+
+        // CPU reference: render each layer alone, composite on the CPU.
+        let mut individually = Vec::new();
+        for (index, layer) in stack_layers.iter().enumerate() {
+            let (family, view) = &scenes[index];
+            let rgba = gpu.pipeline.render_export(
+                &gpu.device,
+                &gpu.queue,
+                &uniforms_for(*family, view),
+                &ColouringUniforms::for_layer(
+                    layer,
+                    -5.0,
+                    index * crate::colouring::LOOKUP_TABLE_LEN,
+                ),
+                &gradient,
+                None,
+                size,
+            );
+            individually.push((rgba, layer.merge_mode.code(), layer.opacity, layer.mask));
+        }
+        let cpu = composite_cpu(&individually);
+
+        // GPU compositor over the same passes.
+        let passes: Vec<LayerPass> = stack_layers
+            .iter()
+            .enumerate()
+            .map(|(index, layer)| {
+                let (family, view) = &scenes[index];
+                LayerPass {
+                    uniforms: uniforms_for(*family, view),
+                    colouring: ColouringUniforms::for_layer(
+                        layer,
+                        -5.0,
+                        index * crate::colouring::LOOKUP_TABLE_LEN,
+                    ),
+                    reference: None,
+                    merge_mode: layer.merge_mode.code(),
+                    opacity: layer.opacity,
+                    mask: layer.mask,
+                }
+            })
+            .collect();
+        // The multi-pass path reads the pane's shared gradient buffer.
+        gpu.set_layers(0, &stack, -5.0);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        gpu.pipeline
+            .run_layer_passes(&gpu.device, &gpu.queue, &mut encoder, 0, &passes, size);
+        // Copy the composited image out.
+        {
+            let compositor = gpu.pipeline.panes[0].compositor.lock().unwrap();
+            let final_texture = &compositor.compose[compositor.final_index].0;
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: final_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &gpu.readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(size.0 * 4),
+                        rows_per_image: Some(size.1),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        gpu.queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        gpu.readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        receiver.recv().unwrap().unwrap();
+        let composed = gpu.readback.slice(..).get_mapped_range().to_vec();
+        gpu.readback.unmap();
+
+        let differing = cpu
+            .chunks(4)
+            .zip(composed.chunks(4))
+            .filter(|(a, b)| {
+                a[..3]
+                    .iter()
+                    .zip(b[..3].iter())
+                    .any(|(x, y)| x.abs_diff(*y) > 2)
+            })
+            .count();
+        let fraction = differing as f64 / (size.0 * size.1) as f64;
+        eprintln!(
+            "GPU vs CPU compositor: {:.3}% of pixels differ",
+            100.0 * fraction
+        );
+        assert!(
+            fraction < 0.005,
+            "GPU compositor disagrees with the CPU compositor on {:.2}% of pixels",
+            100.0 * fraction
+        );
+        // Sanity: the composition is not degenerate.
+        let distinct: std::collections::HashSet<&[u8]> = composed.chunks(4).collect();
+        eprintln!("composite: {} distinct colours", distinct.len());
+        assert!(distinct.len() > 200);
+        if let Ok(directory) = std::env::var("ITERASCOPE_RENDER_DIR") {
+            std::fs::create_dir_all(&directory).unwrap();
+            let rgb: Vec<u8> = composed.chunks(4).flat_map(|p| p[..3].to_vec()).collect();
+            let mut ppm = format!("P6\n{} {}\n255\n", size.0, size.1).into_bytes();
+            ppm.extend_from_slice(&rgb);
+            std::fs::write(format!("{directory}/detached-composite.ppm"), ppm).unwrap();
         }
     }
 

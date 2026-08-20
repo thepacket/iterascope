@@ -7,7 +7,7 @@ use crate::colouring::{Colouring, Layer, MAX_LAYERS};
 use crate::family::{FamilyParameters, FractalFamily, Linkage};
 
 pub(crate) const FORMAT_ID: &str = "iterascope-experiment";
-pub(crate) const FORMAT_VERSION: u32 = 6;
+pub(crate) const FORMAT_VERSION: u32 = 7;
 /// Largest escape radius a document may ask for. Large radii give the
 /// triangle-inequality and stripe colourings their smoothest results.
 pub(crate) const MAX_BAILOUT: f32 = 1e10;
@@ -123,7 +123,7 @@ impl FamilyParametersDocument {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         let mut parameters = FamilyParameters::default();
         self.apply_to(&mut parameters);
         parameters
@@ -260,6 +260,9 @@ impl ExperimentDocument {
             }
             if self.version < 6 {
                 return Err("layers require document version 6".to_owned());
+            }
+            if self.version < 7 && layers.iter().any(|layer| layer.scene.is_some()) {
+                return Err("per-layer scenes require document version 7".to_owned());
             }
             if self.colouring.is_some() {
                 return Err("a document records either layers or colouring, not both".to_owned());
@@ -511,6 +514,40 @@ mod tests {
         }]);
         let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
         assert!(error.contains("opacity"), "{error}");
+    }
+
+    #[test]
+    fn detached_layer_scenes_round_trip_and_require_version_seven() {
+        use crate::colouring::LayerScene;
+        let mut document = example();
+        let mut layer = Layer {
+            name: "Backdrop".to_owned(),
+            ..Layer::default()
+        };
+        layer.scene = Some(LayerScene {
+            family: crate::family::FractalFamily::BurningShip,
+            dynamical: false,
+            centre: [-0.5, -0.5],
+            half_height: 1.0,
+            iterations: 400,
+            ..LayerScene::default()
+        });
+        document.layers = Some(vec![Layer::default(), layer]);
+        let json = document.to_pretty_json().unwrap();
+        assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
+
+        document.version = 6;
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("version 7"), "{error}");
+
+        document.version = 7;
+        document.layers.as_mut().unwrap()[1]
+            .scene
+            .as_mut()
+            .unwrap()
+            .half_height = 1e-20;
+        let error = ExperimentDocument::from_json(&document.to_pretty_json().unwrap()).unwrap_err();
+        assert!(error.contains("half_height"), "{error}");
     }
 
     #[test]

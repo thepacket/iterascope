@@ -115,7 +115,9 @@ struct LayerColouring {
 
 struct ColouringUniforms {
     // x = visible layer count, y = ln(pixel height in world units),
-    // z = gradient table entries per layer.
+    // z = gradient table entries per layer, w = gradient table base offset
+    // in entries (used by detached-scene passes, whose single layer sits
+    // somewhere inside the shared table).
     header: vec4<f32>,
     // Union over layers of the accumulators needed: x = orbit trap,
     // y = triangle inequality, z = stripes, w = derivative.
@@ -1982,7 +1984,7 @@ fn observe(
 
 fn gradient_colour(position: f32, layer: u32) -> vec3<f32> {
     let n = max(u32(colouring.header.z + 0.5), 1u);
-    let offset = layer * n;
+    let offset = u32(colouring.header.w + 0.5) + layer * n;
     let scaled = fract(position) * f32(n);
     let base = floor(scaled);
     let i0 = min(u32(base), n - 1u);
