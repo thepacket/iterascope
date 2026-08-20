@@ -1065,13 +1065,23 @@ pub(crate) const MAX_LAYERS: usize = 8;
 /// `vec4<f32>` words per layer in the uniform block: outside a–d,
 /// inside a–d, blend.
 const LAYER_WORDS: usize = 9;
+/// Register-resident statistics accumulator slots in the shader; the first
+/// `STATS_SLOTS` stats-bearing layers (in stack order) get one each, and
+/// any further stats-bearing layer colours as if its statistics were
+/// unavailable. Must match `MAX_STATS_SLOTS` in `fractal.wgsl`.
+pub(crate) const STATS_SLOTS: usize = 4;
+/// `vec4<f32>` words per stats slot: (layer, skip, flags, stripe
+/// frequency), the outside trap (shape, centre, size), the inside trap.
+const SLOT_WORDS: usize = 3;
 /// Number of `vec4<f32>` words in the colouring uniform block; must match
-/// `ColouringUniforms` in `fractal.wgsl`: header, needs union, then the
-/// layer array.
-pub(crate) const GPU_WORDS: usize = 2 + MAX_LAYERS * LAYER_WORDS;
+/// `ColouringUniforms` in `fractal.wgsl`: header, needs union, the layer
+/// array, then the stats-slot plans.
+pub(crate) const GPU_WORDS: usize = 2 + MAX_LAYERS * LAYER_WORDS + STATS_SLOTS * SLOT_WORDS;
 /// Index of the word holding the union of accumulator flags (trap, triangle
 /// inequality, stripes, derivative).
 pub(crate) const NEEDS_WORD: usize = 1;
+/// First word of the stats-slot plans.
+const SLOTS_BASE: usize = 2 + MAX_LAYERS * LAYER_WORDS;
 
 impl Colouring {
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -1103,6 +1113,15 @@ impl Colouring {
     /// Whether any selected algorithm needs the per-iteration accumulator.
     fn needs(&self, algorithm: ColouringAlgorithm) -> bool {
         self.outside.algorithm == algorithm || self.inside.algorithm == algorithm
+    }
+
+    /// Whether any selected algorithm feeds the per-iteration statistics
+    /// accumulators — and therefore occupies one of the shader's
+    /// [`STATS_SLOTS`] register slots.
+    pub(crate) fn uses_statistics(&self) -> bool {
+        self.needs(ColouringAlgorithm::OrbitTrap)
+            || self.needs(ColouringAlgorithm::TriangleInequality)
+            || self.needs(ColouringAlgorithm::Stripes)
     }
 }
 
@@ -1471,8 +1490,13 @@ impl LayerStack {
     /// merge mode is forced in the shader, not here.
     pub(crate) fn gpu_words(&self, pixel_log: f32) -> [[f32; 4]; GPU_WORDS] {
         let mut words = [[0.0f32; 4]; GPU_WORDS];
+        // Unused stats slots carry the no-layer sentinel.
+        for slot in 0..STATS_SLOTS {
+            words[SLOTS_BASE + slot * SLOT_WORDS][0] = 255.0;
+        }
         let mut needs = [false; 4];
         let mut count = 0usize;
+        let mut slot = 0usize;
         for layer in self.visible().take(MAX_LAYERS) {
             let colouring = &layer.colouring;
             let outside = colouring.outside.gpu_words();
@@ -1486,6 +1510,7 @@ impl LayerStack {
             words[base + 7][3] = layer.skip_iterations.min(49_999) as f32;
             let needs_trap = colouring.needs(ColouringAlgorithm::OrbitTrap);
             let needs_stripes = colouring.needs(ColouringAlgorithm::Stripes);
+            let needs_tia = colouring.needs(ColouringAlgorithm::TriangleInequality);
             words[base + 8] = [
                 layer.merge_mode.code() as f32,
                 layer.opacity,
@@ -1493,9 +1518,32 @@ impl LayerStack {
                 needs_stripes as u8 as f32,
             ];
             needs[0] |= needs_trap;
-            needs[1] |= colouring.needs(ColouringAlgorithm::TriangleInequality);
+            needs[1] |= needs_tia;
             needs[2] |= needs_stripes;
             needs[3] |= colouring.needs(ColouringAlgorithm::DistanceEstimate);
+            // Assign the layer a stats slot: (layer, skip, flag bits, stripe
+            // frequency), then the outside and inside trap descriptions —
+            // everything the per-iteration accumulator update needs, so the
+            // shader never touches the per-layer words in its hot loop.
+            if slot < STATS_SLOTS && (needs_trap || needs_stripes || needs_tia) {
+                let slot_base = SLOTS_BASE + slot * SLOT_WORDS;
+                let frequency = if colouring.outside.algorithm == ColouringAlgorithm::Stripes {
+                    outside[1][2]
+                } else {
+                    inside[1][2]
+                };
+                let flags =
+                    u8::from(needs_trap) | (u8::from(needs_tia) << 1) | (u8::from(needs_stripes) << 2);
+                words[slot_base] = [
+                    count as f32,
+                    layer.skip_iterations.min(49_999) as f32,
+                    f32::from(flags),
+                    frequency,
+                ];
+                words[slot_base + 1] = [outside[1][3], outside[2][0], outside[2][1], outside[2][2]];
+                words[slot_base + 2] = [inside[1][3], inside[2][0], inside[2][1], inside[2][2]];
+                slot += 1;
+            }
             count += 1;
         }
         if count == 0 {

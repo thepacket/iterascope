@@ -2357,6 +2357,21 @@ impl App {
             let name = &mut self.layers.active_layer_mut().name;
             ui.add(egui::TextEdit::singleline(name).desired_width(110.0));
         });
+        let stats_layers = self
+            .layers
+            .visible()
+            .filter(|layer| layer.colouring.uses_statistics())
+            .count();
+        if stats_layers > crate::colouring::STATS_SLOTS {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Only the first {} layers with traps, stripes or triangle averages accumulate orbit statistics; {stats_layers} use them here.",
+                    crate::colouring::STATS_SLOTS
+                ))
+                .small()
+                .color(CREAM),
+            );
+        }
     }
 
     fn colouring_controls(&mut self, ui: &mut egui::Ui) {

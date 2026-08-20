@@ -191,6 +191,12 @@ struct ColouringUniforms {
     needs: vec4<f32>,
     // Visible layers, bottom first.
     layers: array<LayerColouring, 8>,
+    // Statistics slot plans, three words per slot (see `observe_slot`):
+    // (layer or 255, skip, flag bits trap|tia|stripes, stripe frequency),
+    // the outside trap (shape, centre.xy, size), the inside trap. Packed on
+    // the CPU so the per-iteration accumulator updates never touch the
+    // per-layer words.
+    slots: array<vec4<f32>, 12>,
 };
 @group(0) @binding(2) var<uniform> colouring: ColouringUniforms;
 // Rasterised cyclic gradients, RGBA; one table of header.z entries per
@@ -239,24 +245,49 @@ struct ScaledComplex {
 // Statistics gathered along an orbit for the colour stage. Every iteration
 // loop feeds its f32 orbit values through `observe`; which accumulators are
 // live is decided per frame by `colouring.needs`.
+// Stats-bearing layers are assigned to this many register-resident
+// accumulator slots, in layer order; layers beyond the last slot colour as
+// if the statistics were unavailable. Dynamically indexed per-layer arrays
+// would spill every accumulator to thread memory and pay a read-modify-
+// write per layer per iteration — statically addressed slots stay in
+// registers, which is most of the statistics pipelines' speed.
+const MAX_STATS_SLOTS: u32 = 4u;
+const NO_STATS_LAYER: u32 = 0xffu;
+
+// The per-orbit accumulators of one stats-bearing layer.
+struct SlotStats {
+    // Best (smallest) trap metric, for the layer's outside and inside trap
+    // shapes.
+    trap_outside: f32,
+    trap_inside: f32,
+    // Triangle-inequality terms: running sum and the most recent term. Per
+    // layer because each layer may skip a different number of leading
+    // iterations; the term counts are derived from the final iteration
+    // count and the skip, so they are not stored.
+    tia_sum: f32,
+    tia_last: f32,
+    // Stripe-average terms (the frequency is a layer setting).
+    stripe_sum: f32,
+    stripe_last: f32,
+};
+
 struct OrbitStats {
-    // Best (smallest) trap metric per layer, for the layer's outside and
-    // inside trap shapes.
-    trap_outside: array<f32, 8>,
-    trap_inside: array<f32, 8>,
-    // Triangle-inequality terms per layer: running sum and the most recent
-    // term. Per layer because each layer may skip a different number of
-    // leading iterations; the term counts are derived from the final
-    // iteration count and the skip, so they are not stored.
-    tia_sum: array<f32, 8>,
-    tia_last: array<f32, 8>,
-    // Stripe-average terms per layer (the frequency is a layer setting).
-    stripe_sum: array<f32, 8>,
-    stripe_last: array<f32, 8>,
+    // One statically addressed field per slot; never index dynamically.
+    s0: SlotStats,
+    s1: SlotStats,
+    s2: SlotStats,
+    s3: SlotStats,
     // Derivative of z_n with respect to the pixel coordinate, for distance
     // estimation; scaled so it survives deep zooms. Shared across layers.
     derivative: ScaledComplex,
 };
+
+// The orbit statistics of the fragment being shaded. Exactly one orbit is
+// iterated per fragment, so a single private instance serves it — keeping
+// the accumulators out of every result struct and iterate signature (the
+// perturbation restart paths simply keep accumulating into it).
+var<private> orbit_stats: OrbitStats;
+
 
 // Iterations a layer's trap and average accumulators ignore at the start of
 // every orbit. Deep-zoom pixels share hundreds of identical leading
@@ -270,7 +301,6 @@ struct EscapeResult {
     escaped: bool,
     iteration: u32,
     z: vec2<f32>,
-    stats: OrbitStats,
 };
 
 struct GenericState {
@@ -292,7 +322,6 @@ struct GenericResult {
     // Continuous iteration count (escape- or convergence-time smoothed when
     // smooth colouring is enabled).
     value: f32,
-    stats: OrbitStats,
 };
 
 @vertex
@@ -495,43 +524,43 @@ fn iterate_f32(world: vec2<f32>, julia: bool) -> EscapeResult {
     let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
     var escaped = false;
     var iteration = 0u;
-    var stats = stats_new(julia);
+    stats_reset(julia);
     for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
         let z_prev = z;
         z = complex_square(z) + c;
         iteration = i + 1u;
-        observe(&stats, FAMILY_QUADRATIC, z, z_prev, c, iteration, julia);
+        observe(FAMILY_QUADRATIC, z, z_prev, c, iteration, julia);
         let magnitude_squared = dot(z, z);
         if (magnitude_squared > u.dynamics_hi.w) {
             escaped = true;
             break;
         }
     }
-    return EscapeResult(escaped, iteration, z, stats);
+    return EscapeResult(escaped, iteration, z);
 }
 
+// Continues an orbit mid-flight (the perturbation tail); the fragment's
+// accumulated statistics carry on uninterrupted.
 fn continue_f32(
     initial_z: vec2<f32>,
     c: vec2<f32>,
     first_iteration: u32,
     max_iterations: u32,
-    initial_stats: OrbitStats,
     julia: bool,
 ) -> EscapeResult {
     var z = initial_z;
-    var stats = initial_stats;
     for (var i = first_iteration; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
         let z_prev = z;
         z = complex_square(z) + c;
-        observe(&stats, FAMILY_QUADRATIC, z, z_prev, c, i + 1u, julia);
+        observe(FAMILY_QUADRATIC, z, z_prev, c, i + 1u, julia);
         let magnitude_squared = dot(z, z);
         if (magnitude_squared > u.dynamics_hi.w) {
-            return EscapeResult(true, i + 1u, z, stats);
+            return EscapeResult(true, i + 1u, z);
         }
     }
-    return EscapeResult(false, max_iterations, z, stats);
+    return EscapeResult(false, max_iterations, z);
 }
 
 fn iterate_ds(centre: Ds2, local_offset: vec2<f32>, julia: bool) -> EscapeResult {
@@ -558,7 +587,7 @@ fn iterate_ds(centre: Ds2, local_offset: vec2<f32>, julia: bool) -> EscapeResult
     let max_iterations = u32(clamp(u.dynamics_hi.z, 1.0, 50000.0));
     var escaped = false;
     var iteration = 0u;
-    var stats = stats_new(julia);
+    stats_reset(julia);
     var approximate = ds2_approx(reference_z) + delta_z;
     for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
@@ -593,7 +622,7 @@ fn iterate_ds(centre: Ds2, local_offset: vec2<f32>, julia: bool) -> EscapeResult
             approximate = ds2_approx(reference_z);
         }
         iteration = i + 1u;
-        observe(&stats, FAMILY_QUADRATIC, approximate, z_prev,
+        observe(FAMILY_QUADRATIC, approximate, z_prev,
             ds2_approx(reference_c) + delta_c, iteration, julia);
         let magnitude_squared = dot(approximate, approximate);
         if (magnitude_squared > u.dynamics_hi.w) {
@@ -601,7 +630,7 @@ fn iterate_ds(centre: Ds2, local_offset: vec2<f32>, julia: bool) -> EscapeResult
             break;
         }
     }
-    return EscapeResult(escaped, iteration, approximate, stats);
+    return EscapeResult(escaped, iteration, approximate);
 }
 
 fn iterate_perturbation(
@@ -627,7 +656,7 @@ fn iterate_perturbation(
 
     let c = select(reference_c + scaled_to_f32(delta_c), u.dynamics_hi.xy, julia);
     var approximate = reference_value(0u) + scaled_to_f32(delta_z);
-    var stats = stats_new(julia);
+    stats_reset(julia);
     for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= available_iterations) { break; }
         let reference_before = reference_value(i);
@@ -636,10 +665,10 @@ fn iterate_perturbation(
         let quadratic = scaled_complex_mul(delta_z, delta_z);
         delta_z = scaled_add(scaled_add(linear, quadratic), delta_c);
         approximate = reference_value(i + 1u) + scaled_to_f32(delta_z);
-        observe(&stats, FAMILY_QUADRATIC, approximate, z_prev, c, i + 1u, julia);
+        observe(FAMILY_QUADRATIC, approximate, z_prev, c, i + 1u, julia);
         let magnitude_squared = dot(approximate, approximate);
         if (magnitude_squared > u.dynamics_hi.w) {
-            return EscapeResult(true, i + 1u, approximate, stats);
+            return EscapeResult(true, i + 1u, approximate);
         }
     }
 
@@ -654,9 +683,9 @@ fn iterate_perturbation(
         // DS. Continue from the already-separated perturbed state instead of
         // restarting from a collapsed coordinate. Automatic reference
         // rebasing will ultimately replace this conservative visual tail.
-        return continue_f32(approximate, c, available_iterations, max_iterations, stats, julia);
+        return continue_f32(approximate, c, available_iterations, max_iterations, julia);
     }
-    return EscapeResult(false, max_iterations, approximate, stats);
+    return EscapeResult(false, max_iterations, approximate);
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,20 +1153,19 @@ fn iterate_family_f32(family: u32, world: vec2<f32>, dynamical: bool) -> Generic
     let radius_squared = family_escape_radius_squared(family);
     let threshold = family_convergence_threshold(family);
     var previous_residual = 1e30;
-    var stats = stats_new(dynamical);
+    stats_reset(dynamical);
     for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
         let previous = state.z;
         state = family_step_f32(family, state);
         let iteration = i + 1u;
-        observe(&stats, family, state.z, previous, state.c, iteration, dynamical);
+        observe(family, state.z, previous, state.c, iteration, dynamical);
         if (family_escaped(family, state.z, radius_squared)) {
             return GenericResult(
                 RESULT_ESCAPED,
                 iteration,
                 state.z,
                 smooth_escape_value(family, iteration, state.z),
-                stats,
             );
         }
         let residual = family_residual(family, state.z, previous);
@@ -1147,12 +1175,11 @@ fn iterate_family_f32(family: u32, world: vec2<f32>, dynamical: bool) -> Generic
                 iteration,
                 state.z,
                 smooth_convergence_value(iteration, previous_residual, residual, threshold),
-                stats,
             );
         }
         previous_residual = residual;
     }
-    return GenericResult(RESULT_BOUNDED, max_iterations, state.z, f32(max_iterations), stats);
+    return GenericResult(RESULT_BOUNDED, max_iterations, state.z, f32(max_iterations));
 }
 
 // Double-single rendering of the generic families.
@@ -1193,7 +1220,7 @@ fn iterate_family_ds(
     }
 
     var previous_residual = 1e30;
-    var stats = stats_new(dynamical);
+    stats_reset(dynamical);
     var approximate = ds2_approx(reference.z) + deltas.dz;
     for (var i = 0u; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
@@ -1226,14 +1253,13 @@ fn iterate_family_ds(
         }
 
         let iteration = i + 1u;
-        observe(&stats, family, approximate, previous, deltas.c_ref + deltas.dc, iteration, dynamical);
+        observe(family, approximate, previous, deltas.c_ref + deltas.dc, iteration, dynamical);
         if (family_escaped(family, approximate, radius_squared)) {
             return GenericResult(
                 RESULT_ESCAPED,
                 iteration,
                 approximate,
                 smooth_escape_value(family, iteration, approximate),
-                stats,
             );
         }
         let residual = family_residual(family, approximate, previous);
@@ -1243,12 +1269,11 @@ fn iterate_family_ds(
                 iteration,
                 approximate,
                 smooth_convergence_value(iteration, previous_residual, residual, threshold),
-                stats,
             );
         }
         previous_residual = residual;
     }
-    return GenericResult(RESULT_BOUNDED, max_iterations, approximate, f32(max_iterations), stats);
+    return GenericResult(RESULT_BOUNDED, max_iterations, approximate, f32(max_iterations));
 }
 
 // --- Lyapunov plane --------------------------------------------------------
@@ -1439,7 +1464,6 @@ fn continue_family_f32(
     initial: GenericState,
     first_iteration: u32,
     max_iterations: u32,
-    initial_stats: OrbitStats,
     initial_previous_residual: f32,
     dynamical: bool,
 ) -> GenericResult {
@@ -1447,25 +1471,24 @@ fn continue_family_f32(
     let radius_squared = family_escape_radius_squared(family);
     let threshold = family_convergence_threshold(family);
     var previous_residual = initial_previous_residual;
-    var stats = initial_stats;
     for (var i = first_iteration; i < 50000u; i = i + 1u) {
         if (i >= max_iterations) { break; }
         let previous = state.z;
         state = family_step_f32(family, state);
         let iteration = i + 1u;
-        observe(&stats, family, state.z, previous, state.c, iteration, dynamical);
+        observe(family, state.z, previous, state.c, iteration, dynamical);
         if (family_escaped(family, state.z, radius_squared)) {
             return GenericResult(RESULT_ESCAPED, iteration, state.z,
-                smooth_escape_value(family, iteration, state.z), stats);
+                smooth_escape_value(family, iteration, state.z));
         }
         let residual = family_residual(family, state.z, previous);
         if (residual >= 0.0 && residual < threshold) {
             return GenericResult(RESULT_CONVERGED, iteration, state.z,
-                smooth_convergence_value(iteration, previous_residual, residual, threshold), stats);
+                smooth_convergence_value(iteration, previous_residual, residual, threshold));
         }
         previous_residual = residual;
     }
-    return GenericResult(RESULT_BOUNDED, max_iterations, state.z, f32(max_iterations), stats);
+    return GenericResult(RESULT_BOUNDED, max_iterations, state.z, f32(max_iterations));
 }
 
 // Plain-f32 delta helpers for the `_f32` instantiation.
@@ -1848,7 +1871,7 @@ fn iterate_family_perturbation__T(
 
     var approximate = z0 + dc_to_f32(state.dz);
     var previous_residual = 1e30;
-    var stats = stats_new(dynamical);
+    stats_reset(dynamical);
     var z_prev = initial_prev;
     var z = z0;
     for (var i = 0u; i < 50000u; i = i + 1u) {
@@ -1860,15 +1883,15 @@ fn iterate_family_perturbation__T(
         z = z_next;
         approximate = z_next + dc_to_f32(state.dz);
         let iteration = i + 1u;
-        observe(&stats, family, approximate, previous, state.c_ref + dc_to_f32(state.dc), iteration, dynamical);
+        observe(family, approximate, previous, state.c_ref + dc_to_f32(state.dc), iteration, dynamical);
         if (family_escaped(family, approximate, radius_squared)) {
             return GenericResult(RESULT_ESCAPED, iteration, approximate,
-                smooth_escape_value(family, iteration, approximate), stats);
+                smooth_escape_value(family, iteration, approximate));
         }
         let residual = family_residual(family, approximate, previous);
         if (residual >= 0.0 && residual < threshold) {
             return GenericResult(RESULT_CONVERGED, iteration, approximate,
-                smooth_convergence_value(iteration, previous_residual, residual, threshold), stats);
+                smooth_convergence_value(iteration, previous_residual, residual, threshold));
         }
         previous_residual = residual;
     }
@@ -1883,9 +1906,9 @@ fn iterate_family_perturbation__T(
             z_prev + dc_to_f32(state.dz_prev),
             state.c_ref + dc_to_f32(state.dc),
         );
-        return continue_family_f32(family, tail, available_iterations, max_iterations, stats, previous_residual, dynamical);
+        return continue_family_f32(family, tail, available_iterations, max_iterations, previous_residual, dynamical);
     }
-    return GenericResult(RESULT_BOUNDED, max_iterations, approximate, f32(max_iterations), stats);
+    return GenericResult(RESULT_BOUNDED, max_iterations, approximate, f32(max_iterations));
 }
 // END DELTA TEMPLATE
 
@@ -1898,21 +1921,47 @@ fn iterate_family_perturbation__T(
 // it up in the rasterised gradient.
 // ---------------------------------------------------------------------------
 
-fn stats_new(dynamical: bool) -> OrbitStats {
+fn slot_stats_new() -> SlotStats {
+    return SlotStats(1e30, 1e30, 0.0, 0.0, 0.0, 0.0);
+}
+
+// Resets the fragment's accumulators for a fresh orbit. The perturbation
+// restart paths do not reset — their orbit continues.
+fn stats_reset(dynamical: bool) {
+    if (!ORBIT_STATS) { return; }
     // In the dynamical plane the pixel is z0, so dz0/dz0 = 1; in the
     // parameter plane the families with derivative support start from a
     // constant, so dz0/dc = 0 and the first step contributes ∂f/∂c.
-    var stats: OrbitStats;
-    for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
-        stats.trap_outside[layer] = 1e30;
-        stats.trap_inside[layer] = 1e30;
-        stats.tia_sum[layer] = 0.0;
-        stats.tia_last[layer] = 0.0;
-        stats.stripe_sum[layer] = 0.0;
-        stats.stripe_last[layer] = 0.0;
+    orbit_stats.s0 = slot_stats_new();
+    orbit_stats.s1 = slot_stats_new();
+    orbit_stats.s2 = slot_stats_new();
+    orbit_stats.s3 = slot_stats_new();
+    orbit_stats.derivative = ScaledComplex(vec2<f32>(select(0.0, 1.0, dynamical), 0.0), 0);
+}
+
+// The layer stats slot `slot` serves, or NO_STATS_LAYER.
+fn stats_slot_layer(slot: u32) -> u32 {
+    return u32(colouring.slots[slot * 3u].x + 0.5);
+}
+
+// The slot accumulators serving `layer`, for the colouring stage; a miss
+// (a stats-bearing layer beyond the last slot) colours as if statistics
+// were unavailable.
+struct SlotLookup {
+    found: bool,
+    stats: SlotStats,
+};
+
+fn stats_for_layer(layer: u32) -> SlotLookup {
+    if (ORBIT_STATS) {
+        if (stats_slot_layer(0u) == layer) { return SlotLookup(true, orbit_stats.s0); }
+        if (stats_slot_layer(1u) == layer) { return SlotLookup(true, orbit_stats.s1); }
+        if (stats_slot_layer(2u) == layer) { return SlotLookup(true, orbit_stats.s2); }
+        if (stats_slot_layer(3u) == layer) { return SlotLookup(true, orbit_stats.s3); }
     }
-    stats.derivative = ScaledComplex(vec2<f32>(select(0.0, 1.0, dynamical), 0.0), 0);
-    return stats;
+    var lookup: SlotLookup;
+    lookup.found = false;
+    return lookup;
 }
 
 // Metric of z against a trap shape. Point traps accumulate the squared
@@ -1971,8 +2020,47 @@ fn derivative_step(
     return next;
 }
 
+// One slot's per-iteration update. The accumulators are statically
+// addressed struct fields (registers); the slot's plan words live in the
+// uniform block (constant address space) so no per-fragment state carries
+// them, and an unused slot exits after one cached load.
+fn observe_slot(
+    slot: ptr<private, SlotStats>,
+    index: u32,
+    z: vec2<f32>,
+    iteration: u32,
+    trap_active: bool,
+    tia_active: bool,
+    tia_term: f32,
+    stripe_active: bool,
+    stripe_angle: f32,
+) {
+    let plan = colouring.slots[index * 3u];
+    let skip = u32(plan.y + 0.5);
+    if (plan.x > 254.0 || iteration <= skip) {
+        return;
+    }
+    let flags = u32(plan.z + 0.5);
+    if (trap_active && (flags & 1u) != 0u) {
+        let outside = colouring.slots[index * 3u + 1u];
+        let inside = colouring.slots[index * 3u + 2u];
+        (*slot).trap_outside = min((*slot).trap_outside,
+            trap_metric(u32(outside.x + 0.5), outside.yz, outside.w, z));
+        (*slot).trap_inside = min((*slot).trap_inside,
+            trap_metric(u32(inside.x + 0.5), inside.yz, inside.w, z));
+    }
+    if (tia_active && (flags & 2u) != 0u && iteration > 1u + skip) {
+        (*slot).tia_sum = (*slot).tia_sum + tia_term;
+        (*slot).tia_last = tia_term;
+    }
+    if (stripe_active && (flags & 4u) != 0u) {
+        let term = 0.5 + 0.5 * sin(plan.w * stripe_angle);
+        (*slot).stripe_sum = (*slot).stripe_sum + term;
+        (*slot).stripe_last = term;
+    }
+}
+
 fn observe(
-    stats: ptr<function, OrbitStats>,
     family: u32,
     z: vec2<f32>,
     z_prev: vec2<f32>,
@@ -1981,26 +2069,10 @@ fn observe(
     dynamical: bool,
 ) {
     if (!ORBIT_STATS) { return; }
-    let count = layer_count();
-    if (colouring.needs.x > 0.5) {
-        // Field-wise reads: copying the whole layer struct per iteration
-        // costs real time on Metal.
-        for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
-            if (layer >= count) { break; }
-            if (colouring.layers[layer].blend.z < 0.5 || iteration <= layer_skip(layer)) {
-                continue;
-            }
-            let outside_b = colouring.layers[layer].outside_b;
-            let outside_c = colouring.layers[layer].outside_c;
-            let inside_b = colouring.layers[layer].inside_b;
-            let inside_c = colouring.layers[layer].inside_c;
-            (*stats).trap_outside[layer] = min((*stats).trap_outside[layer], trap_metric(
-                u32(outside_b.w + 0.5), outside_c.xy, outside_c.z, z));
-            (*stats).trap_inside[layer] = min((*stats).trap_inside[layer], trap_metric(
-                u32(inside_b.w + 0.5), inside_c.xy, inside_c.z, z));
-        }
-    }
-    if (colouring.needs.y > 0.5 && iteration > 1u) {
+    let trap_active = colouring.needs.x > 0.5;
+    let tia_active = colouring.needs.y > 0.5 && iteration > 1u;
+    var tia_term = 0.0;
+    if (tia_active) {
         // |z_{n+1}| lies between ||z_n|^d − |c|| and |z_n|^d + |c| for
         // z_{n+1} = z_n^d + c; record where in that range it fell.
         let degree = family_degree();
@@ -2012,40 +2084,26 @@ fn observe(
         let low = abs(power - c_size);
         let high = power + c_size;
         let span = high - low;
-        var term = 0.0;
         if (span > 1e-12) {
-            term = clamp((length(z) - low) / span, 0.0, 1.0);
-        }
-        for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
-            if (layer >= count) { break; }
-            let uses_tia = u32(colouring.layers[layer].outside_a.x + 0.5) == ALGORITHM_TRIANGLE
-                || u32(colouring.layers[layer].inside_a.x + 0.5) == ALGORITHM_TRIANGLE;
-            if (!uses_tia || iteration <= 1u + layer_skip(layer)) { continue; }
-            (*stats).tia_sum[layer] = (*stats).tia_sum[layer] + term;
-            (*stats).tia_last[layer] = term;
+            tia_term = clamp((length(z) - low) / span, 0.0, 1.0);
         }
     }
-    if (colouring.needs.z > 0.5) {
-        let angle = atan2(z.y, z.x);
-        for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
-            if (layer >= count) { break; }
-            if (colouring.layers[layer].blend.w < 0.5 || iteration <= layer_skip(layer)) {
-                continue;
-            }
-            // The layer's outside frequency when its outside uses stripes,
-            // otherwise its inside frequency.
-            let frequency = select(
-                colouring.layers[layer].inside_b.z,
-                colouring.layers[layer].outside_b.z,
-                u32(colouring.layers[layer].outside_a.x + 0.5) == ALGORITHM_STRIPES,
-            );
-            let term = 0.5 + 0.5 * sin(frequency * angle);
-            (*stats).stripe_sum[layer] = (*stats).stripe_sum[layer] + term;
-            (*stats).stripe_last[layer] = term;
-        }
+    let stripe_active = colouring.needs.z > 0.5;
+    var stripe_angle = 0.0;
+    if (stripe_active) {
+        stripe_angle = atan2(z.y, z.x);
     }
+    observe_slot(&orbit_stats.s0, 0u, z, iteration,
+        trap_active, tia_active, tia_term, stripe_active, stripe_angle);
+    observe_slot(&orbit_stats.s1, 1u, z, iteration,
+        trap_active, tia_active, tia_term, stripe_active, stripe_angle);
+    observe_slot(&orbit_stats.s2, 2u, z, iteration,
+        trap_active, tia_active, tia_term, stripe_active, stripe_angle);
+    observe_slot(&orbit_stats.s3, 3u, z, iteration,
+        trap_active, tia_active, tia_term, stripe_active, stripe_angle);
     if (colouring.needs.w > 0.5 && family_has_derivative(family)) {
-        (*stats).derivative = derivative_step(family, (*stats).derivative, z_prev, c, dynamical);
+        orbit_stats.derivative =
+            derivative_step(family, orbit_stats.derivative, z_prev, c, dynamical);
     }
 }
 
@@ -2135,20 +2193,26 @@ fn colour_side(
         }
         case ALGORITHM_TRIANGLE: {
             if (ORBIT_STATS) {
-                // Terms start at iteration 2 + skip.
-                let terms = f32(result.iteration) - 1.0 - f32(layer_skip(layer));
-                value = blended_average(result.stats.tia_sum[layer],
-                    result.stats.tia_last[layer],
-                    terms, final_term_weight(family, result));
+                let lookup = stats_for_layer(layer);
+                if (lookup.found) {
+                    // Terms start at iteration 2 + skip.
+                    let terms = f32(result.iteration) - 1.0 - f32(layer_skip(layer));
+                    value = blended_average(lookup.stats.tia_sum,
+                        lookup.stats.tia_last,
+                        terms, final_term_weight(family, result));
+                }
             }
         }
         case ALGORITHM_STRIPES: {
             if (ORBIT_STATS) {
-                // Terms start at iteration 1 + skip.
-                let terms = f32(result.iteration) - f32(layer_skip(layer));
-                value = blended_average(result.stats.stripe_sum[layer],
-                    result.stats.stripe_last[layer],
-                    terms, final_term_weight(family, result));
+                let lookup = stats_for_layer(layer);
+                if (lookup.found) {
+                    // Terms start at iteration 1 + skip.
+                    let terms = f32(result.iteration) - f32(layer_skip(layer));
+                    value = blended_average(lookup.stats.stripe_sum,
+                        lookup.stats.stripe_last,
+                        terms, final_term_weight(family, result));
+                }
             }
         }
         case ALGORITHM_DISTANCE: {
@@ -2156,8 +2220,8 @@ fn colour_side(
                 // Exterior distance |z| ln|z| / |dz| expressed in pixels,
                 // evaluated in logarithms so deep zooms stay in range.
                 let magnitude = max(length(result.z), 1.000001);
-                let mantissa = max(length(result.stats.derivative.mantissa), 1e-30);
-                let log_derivative = log(mantissa) + f32(result.stats.derivative.exponent) * 0.69314718;
+                let mantissa = max(length(orbit_stats.derivative.mantissa), 1e-30);
+                let log_derivative = log(mantissa) + f32(orbit_stats.derivative.exponent) * 0.69314718;
                 let log_distance = log(magnitude) + log(max(log(magnitude), 1e-6)) - log_derivative;
                 value = exp(clamp(log_distance - colouring.header.y, -40.0, 40.0));
             } else if (result.kind != RESULT_ESCAPED) {
@@ -2166,10 +2230,13 @@ fn colour_side(
         }
         case ALGORITHM_TRAP: {
             if (ORBIT_STATS) {
-                let shape = u32(b.w + 0.5);
-                let metric = select(result.stats.trap_outside[layer],
-                    result.stats.trap_inside[layer], inside);
-                value = select(trap_distance(shape, metric), 0.0, metric >= 1e29);
+                let lookup = stats_for_layer(layer);
+                if (lookup.found) {
+                    let shape = u32(b.w + 0.5);
+                    let metric = select(lookup.stats.trap_outside,
+                        lookup.stats.trap_inside, inside);
+                    value = select(trap_distance(shape, metric), 0.0, metric >= 1e29);
+                }
             }
         }
         default: {}
@@ -2399,7 +2466,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     }
 
     var generic = GenericResult(RESULT_BOUNDED, result.iteration, result.z,
-        f32(result.iteration), result.stats);
+        f32(result.iteration));
     if (result.escaped) {
         generic.kind = RESULT_ESCAPED;
         generic.value = smooth_escape_value(FAMILY_QUADRATIC, result.iteration, result.z);
