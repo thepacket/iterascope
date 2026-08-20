@@ -19,6 +19,8 @@ mod newton;
 mod orbit;
 mod precision;
 pub mod render;
+#[cfg(target_arch = "wasm32")]
+mod webvideo;
 
 pub(crate) const MAX_ITERATIONS: u32 = 50_000;
 

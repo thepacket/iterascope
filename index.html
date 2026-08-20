@@ -37,6 +37,17 @@
     </style>
 </head>
 <body>
+    <script>
+        // Smoke-test harness: with ?autotest=… the app must run even in a
+        // hidden window (where requestAnimationFrame never fires), so the
+        // frame callback falls back to a timer.
+        if (location.search.indexOf("autotest") !== -1) {
+            window.requestAnimationFrame = function (callback) {
+                return setTimeout(function () { callback(performance.now()); }, 33);
+            };
+            window.cancelAnimationFrame = clearTimeout;
+        }
+    </script>
     <canvas id="iterascope_canvas"></canvas>
     <div id="iterascope_loading">
         <div class="brand">ITERASCOPE</div>

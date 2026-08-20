@@ -4,7 +4,6 @@ use std::time::Duration;
 use web_time::Instant;
 
 use crate::animation::{self, ZoomAnimation};
-#[cfg(not(target_arch = "wasm32"))]
 use crate::arbitrary::ReferenceOrbit;
 use crate::arbitrary::{
     ARBITRARY_HANDOFF_ZOOM, DeepComplex, DeepReal, DeepState, DeepView, MAX_DECIMAL_ZOOM_EXPONENT,
@@ -30,7 +29,6 @@ use crate::precision::{
     DoubleSingle, DsValidity, PathProbeResult, PrecisionMode, ProbeCache, ProbeInput, ProbeResult,
     ValidityLevel,
 };
-#[cfg(not(target_arch = "wasm32"))]
 use crate::render::GpuReferencePoint;
 use crate::render::{
     self, ColouringUniforms, DeepRenderData, FractalPipeline, GradientTable, Uniforms,
@@ -274,7 +272,12 @@ pub struct App {
     export: Option<ExportJob>,
     #[cfg(not(target_arch = "wasm32"))]
     still: Option<StillJob>,
-    #[cfg(not(target_arch = "wasm32"))]
+    /// The browser build's export task, still or video; one at a time.
+    #[cfg(target_arch = "wasm32")]
+    web_job: Option<Arc<std::sync::Mutex<WebJobProgress>>>,
+    /// Whether the `?autotest=` URL parameter has been acted on.
+    #[cfg(target_arch = "wasm32")]
+    autotest_checked: bool,
     export_generation: u64,
     export_message: Option<(String, bool)>,
     zoom_focus: [Option<[f64; 2]>; 2],
@@ -358,7 +361,10 @@ impl App {
             export: None,
             #[cfg(not(target_arch = "wasm32"))]
             still: None,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(target_arch = "wasm32")]
+            web_job: None,
+            #[cfg(target_arch = "wasm32")]
+            autotest_checked: false,
             export_generation: 0,
             export_message: None,
             zoom_focus: [None, None],
@@ -1000,7 +1006,6 @@ impl App {
 
                 section(ui, "Colouring", |ui| self.colouring_controls(ui));
 
-                #[cfg(not(target_arch = "wasm32"))]
                 section(ui, "Still image", |ui| self.still_controls(ui));
 
                 section(ui, "Animation", |ui| self.animation_controls(ui));
@@ -2432,14 +2437,222 @@ impl App {
             self.animation_export_controls(ui);
         }
         #[cfg(target_arch = "wasm32")]
-        ui.label(
-            egui::RichText::new("Image-sequence export runs in the native application.")
-                .small()
-                .color(CREAM),
-        );
+        {
+            self.animation_export_controls_web(ui);
+        }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_arch = "wasm32")]
+    fn animation_export_controls_web(&mut self, ui: &mut egui::Ui) {
+        let webcodecs = crate::webvideo::supported();
+        if webcodecs {
+            ui.checkbox(&mut self.animation.encode_video, "Encode MP4 (WebCodecs)");
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "This browser has no WebCodecs video encoder; frames download as a ZIP of PNGs.",
+                )
+                .small()
+                .color(CREAM),
+            );
+        }
+        if let Some(job) = self.web_job.clone() {
+            let progress = job.lock().unwrap();
+            if progress.label == "frame" {
+                ui.add(
+                    egui::ProgressBar::new(progress.done as f32 / progress.total.max(1) as f32)
+                        .text(format!("frame {}/{}", progress.done, progress.total)),
+                );
+                drop(progress);
+                if ui.button("Cancel").clicked() {
+                    job.lock().unwrap().cancel = true;
+                }
+            }
+        } else {
+            let frames = self.animation.frame_count();
+            ui.label(
+                egui::RichText::new(format!(
+                    "{frames} frames at {}×{}",
+                    self.animation.width, self.animation.height
+                ))
+                .small()
+                .color(MUTED),
+            );
+            let label = if webcodecs && self.animation.encode_video {
+                "Render video (download)"
+            } else {
+                "Render frames (ZIP download)"
+            };
+            if ui.button(label).clicked() {
+                let ctx = ui.ctx().clone();
+                self.start_export_web(&ctx);
+            }
+        }
+        if let Some((message, error)) = &self.export_message {
+            let colour = if *error { CORAL } else { BLUE };
+            ui.label(egui::RichText::new(message).small().color(colour));
+        }
+    }
+
+    /// Renders the zoom animation in a browser task — one frame per GPU
+    /// readback await so the interface stays live — encoding to MP4 through
+    /// WebCodecs, or collecting a ZIP of PNG frames without it.
+    #[cfg(target_arch = "wasm32")]
+    fn start_export_web(&mut self, ctx: &egui::Context) {
+        if self.web_job.is_some() {
+            return;
+        }
+        self.export_message = None;
+        let mut animation = self.animation.clone();
+        animation.width &= !1;
+        animation.height &= !1;
+        if let Err(error) = animation.validate() {
+            self.export_message = Some((error, true));
+            return;
+        }
+        let pane = self.active_pane;
+        let current = self.magnification_log10(pane);
+        let mut clamped = false;
+        for target in [
+            &mut animation.start_magnification_log10,
+            &mut animation.end_magnification_log10,
+        ] {
+            if *target > current + 1e-9 {
+                *target = current;
+                clamped = true;
+            }
+        }
+        let scene = match self.freeze_scene(pane) {
+            Ok(scene) => scene,
+            Err(error) => {
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
+        if clamped {
+            self.export_message = Some((
+                "Magnification clamped to the current view (zoom further first to go deeper)"
+                    .to_owned(),
+                false,
+            ));
+        }
+        let use_mp4 = animation.encode_video && crate::webvideo::supported();
+        let family_id = self.family.document_id();
+        let progress = Arc::new(std::sync::Mutex::new(WebJobProgress {
+            total: animation.frame_count(),
+            label: "frame",
+            ..WebJobProgress::default()
+        }));
+        self.web_job = Some(Arc::clone(&progress));
+        let render_state = self.render_state.clone();
+        let ctx = ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let finish = |message: Result<String, String>| {
+                let mut progress = progress.lock().unwrap();
+                progress.message = Some(match message {
+                    Ok(message) => (message, false),
+                    Err(error) => (error, true),
+                });
+                progress.finished = true;
+            };
+            let (width, height, fps) = (animation.width, animation.height, animation.fps);
+            let total = animation.frame_count();
+            let mut encoder = None;
+            let mut zip = None;
+            if use_mp4 {
+                match crate::webvideo::Mp4Encoder::new(width, height, fps) {
+                    Ok(built) => encoder = Some(built),
+                    Err(error) => {
+                        finish(Err(error));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+            } else {
+                zip = Some(zip::ZipWriter::new(std::io::Cursor::new(Vec::new())));
+            }
+            for frame in 0..total {
+                if progress.lock().unwrap().cancel {
+                    finish(Err("Export cancelled".to_owned()));
+                    ctx.request_repaint();
+                    return;
+                }
+                let magnification = animation.magnification_log10_at(frame);
+                let rgba = match scene
+                    .render_region_async(
+                        &render_state,
+                        magnification,
+                        (width, height),
+                        (0, 0),
+                        (width, height),
+                        animation.gradient_offset_at(frame),
+                    )
+                    .await
+                {
+                    Ok(rgba) => rgba,
+                    Err(error) => {
+                        finish(Err(error));
+                        ctx.request_repaint();
+                        return;
+                    }
+                };
+                let encoded = if let Some(encoder) = &encoder {
+                    encoder.encode_rgba(&rgba, frame)
+                } else if let Some(zip) = &mut zip {
+                    use std::io::Write;
+                    encode_png(width, height, &rgba).and_then(|png| {
+                        let options = zip::write::SimpleFileOptions::default()
+                            .compression_method(zip::CompressionMethod::Stored);
+                        zip.start_file(format!("frame-{frame:05}.png"), options)
+                            .map_err(|error| error.to_string())
+                            .and_then(|()| zip.write_all(&png).map_err(|error| error.to_string()))
+                    })
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = encoded {
+                    finish(Err(error));
+                    ctx.request_repaint();
+                    return;
+                }
+                progress.lock().unwrap().done += 1;
+                ctx.request_repaint();
+            }
+            let result = if let Some(encoder) = encoder {
+                match encoder.finish().await {
+                    Ok(bytes) => {
+                        let filename = format!("zoom-{family_id}.mp4");
+                        download_bytes(&filename, &bytes, "video/mp4").map(|()| {
+                            format!(
+                                "Downloading {filename} ({total} frames, {:.1} MB)",
+                                bytes.len() as f64 / 1e6
+                            )
+                        })
+                    }
+                    Err(error) => Err(error),
+                }
+            } else if let Some(zip) = zip {
+                match zip.finish() {
+                    Ok(cursor) => {
+                        let bytes = cursor.into_inner();
+                        let filename = format!("zoom-{family_id}-frames.zip");
+                        download_bytes(&filename, &bytes, "application/zip").map(|()| {
+                            format!(
+                                "Downloading {filename} ({total} frames, {:.1} MB)",
+                                bytes.len() as f64 / 1e6
+                            )
+                        })
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            } else {
+                Err("nothing to export".to_owned())
+            };
+            finish(result);
+            ctx.request_repaint();
+        });
+    }
+
     fn still_controls(&mut self, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new(
@@ -2473,6 +2686,7 @@ impl App {
                     }
                 });
         });
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(job) = &self.still {
             let total = job.tile_count();
             ui.add(
@@ -2488,6 +2702,28 @@ impl App {
             .clicked()
         {
             self.start_still();
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(job) = self.web_job.clone() {
+            let progress = job.lock().unwrap();
+            if progress.label == "tile" {
+                ui.add(
+                    egui::ProgressBar::new(progress.done as f32 / progress.total.max(1) as f32)
+                        .text(format!("tile {}/{}", progress.done, progress.total)),
+                );
+                drop(progress);
+                if ui.button("Cancel").clicked() {
+                    job.lock().unwrap().cancel = true;
+                }
+            }
+        } else if ui.button("Render still (download)").clicked() {
+            let ctx = ui.ctx().clone();
+            self.start_still_web(&ctx);
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some((message, error)) = &self.export_message {
+            let colour = if *error { CORAL } else { BLUE };
+            ui.label(egui::RichText::new(message).small().color(colour));
         }
     }
 
@@ -2613,7 +2849,6 @@ impl App {
     /// offline rendering. The centre never moves, so one orbit — the
     /// arbitrary-precision orbit of a deep centre, or an `f64` orbit
     /// otherwise — serves any magnification up to the current view's.
-    #[cfg(not(target_arch = "wasm32"))]
     fn freeze_scene(&mut self, pane: usize) -> Result<FrozenScene, String> {
         let dynamical = self.pane_is_dynamical(pane);
         self.export_generation += 1;
@@ -2737,6 +2972,168 @@ impl App {
             path,
             started: Instant::now(),
         });
+    }
+
+    /// Renders the still in a browser task: one tile per readback await so
+    /// the interface stays live, then downloads the PNG.
+    #[cfg(target_arch = "wasm32")]
+    fn start_still_web(&mut self, ctx: &egui::Context) {
+        if self.web_job.is_some() {
+            return;
+        }
+        self.export_message = None;
+        let width = (self.still_width & !1).clamp(16, animation::MAX_STILL_DIMENSION);
+        let height = (self.still_height & !1).clamp(16, animation::MAX_STILL_DIMENSION);
+        let supersample = self.still_supersample.clamp(1, 3);
+        let pane = self.active_pane;
+        let magnification = self.magnification_log10(pane);
+        let scene = match self.freeze_scene(pane) {
+            Ok(scene) => scene,
+            Err(error) => {
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
+        let max_tile = animation::MAX_DIMENSION / supersample;
+        let columns = animation::tile_spans(width, max_tile);
+        let rows = animation::tile_spans(height, max_tile);
+        let filename = format!("still-{}.png", self.family.document_id());
+        let progress = Arc::new(std::sync::Mutex::new(WebJobProgress {
+            total: columns.len() * rows.len(),
+            label: "tile",
+            ..WebJobProgress::default()
+        }));
+        self.web_job = Some(Arc::clone(&progress));
+        let render_state = self.render_state.clone();
+        let ctx = ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut image = vec![0u8; width as usize * height as usize * 4];
+            'tiles: for (row_offset, tile_height) in rows {
+                for (column_offset, tile_width) in &columns {
+                    if progress.lock().unwrap().cancel {
+                        break 'tiles;
+                    }
+                    let rendered = match scene
+                        .render_region_async(
+                            &render_state,
+                            magnification,
+                            (width * supersample, height * supersample),
+                            (column_offset * supersample, row_offset * supersample),
+                            (tile_width * supersample, tile_height * supersample),
+                            0.0,
+                        )
+                        .await
+                    {
+                        Ok(rendered) => rendered,
+                        Err(error) => {
+                            let mut progress = progress.lock().unwrap();
+                            progress.message = Some((error, true));
+                            progress.finished = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                    };
+                    let tile = downsample_srgb(&rendered, tile_width * supersample, supersample);
+                    for y in 0..tile_height as usize {
+                        let source =
+                            y * *tile_width as usize * 4..(y + 1) * *tile_width as usize * 4;
+                        let target = ((row_offset as usize + y) * width as usize
+                            + *column_offset as usize)
+                            * 4;
+                        image[target..target + *tile_width as usize * 4]
+                            .copy_from_slice(&tile[source]);
+                    }
+                    let mut progress = progress.lock().unwrap();
+                    progress.done += 1;
+                    ctx.request_repaint();
+                }
+            }
+            let mut result = progress.lock().unwrap();
+            if result.cancel {
+                result.message = Some(("Still render cancelled".to_owned(), true));
+            } else {
+                match encode_png(width, height, &image)
+                    .and_then(|bytes| download_bytes(&filename, &bytes, "image/png"))
+                {
+                    Ok(()) => {
+                        result.message = Some((
+                            format!(
+                                "Downloading {filename} ({width}×{height}, {supersample}×{supersample} anti-aliasing)"
+                            ),
+                            false,
+                        ));
+                    }
+                    Err(error) => result.message = Some((error, true)),
+                }
+            }
+            result.finished = true;
+            ctx.request_repaint();
+        });
+    }
+
+    /// Collects a finished browser export task's message.
+    #[cfg(target_arch = "wasm32")]
+    fn poll_web_job(&mut self) {
+        let Some(job) = &self.web_job else {
+            return;
+        };
+        let finished = job.lock().unwrap().finished;
+        if finished {
+            self.export_message = job.lock().unwrap().message.take();
+            if let Some((message, error)) = &self.export_message {
+                if *error {
+                    log::warn!("web export failed: {message}");
+                } else {
+                    log::info!("web export: {message}");
+                }
+            }
+            self.web_job = None;
+        }
+    }
+
+    /// One step of the `?autotest=` smoke harness, driven by a timer in
+    /// `main` so it works even when the window is hidden and no frames run.
+    /// Returns whether an export task is still in flight.
+    #[cfg(target_arch = "wasm32")]
+    pub fn web_autotest_step(&mut self) -> bool {
+        let ctx = egui::Context::default();
+        self.run_autotest(&ctx);
+        self.poll_web_job();
+        self.web_job.is_some()
+    }
+
+    /// Headless smoke harness for the browser build: `?autotest=still`,
+    /// `?autotest=video` or `?autotest=zip` starts a small export on load
+    /// and reports through the console, so the export pipeline can be
+    /// exercised in environments where the canvas cannot be driven.
+    #[cfg(target_arch = "wasm32")]
+    fn run_autotest(&mut self, ctx: &egui::Context) {
+        if self.autotest_checked {
+            return;
+        }
+        self.autotest_checked = true;
+        let Some(search) = web_sys::window().and_then(|window| window.location().search().ok())
+        else {
+            return;
+        };
+        if search.contains("autotest=still") {
+            log::info!("autotest: rendering a 640×360 still at 2×2 anti-aliasing");
+            self.still_width = 640;
+            self.still_height = 360;
+            self.still_supersample = 2;
+            self.start_still_web(ctx);
+        } else if search.contains("autotest=video") || search.contains("autotest=zip") {
+            log::info!("autotest: exporting a one-second 320×240 animation");
+            self.animation.duration_seconds = 1.0;
+            self.animation.fps = 12;
+            self.animation.width = 320;
+            self.animation.height = 240;
+            self.animation.start_magnification_log10 = 0.0;
+            self.animation.end_magnification_log10 = 0.0;
+            self.animation.gradient_sweep_turns = 0.5;
+            self.animation.encode_video = search.contains("autotest=video");
+            self.start_export_web(ctx);
+        }
     }
 
     /// Renders one still tile per UI update.
@@ -3982,6 +4379,10 @@ impl eframe::App for App {
 
         #[cfg(target_arch = "wasm32")]
         self.poll_pending_document();
+        #[cfg(target_arch = "wasm32")]
+        self.poll_web_job();
+        #[cfg(target_arch = "wasm32")]
+        self.run_autotest(ui.ctx());
         self.orbit_inspector(ui.ctx());
         self.gradient_editor(ui.ctx());
         self.switch_picker(ui.ctx());
@@ -4017,7 +4418,6 @@ struct ExportJob {
 /// for it: the dynamics, the layer stack, and the reference orbit of the
 /// fixed centre — re-described in scale for any magnification a frame asks
 /// for.
-#[cfg(not(target_arch = "wasm32"))]
 struct FrozenScene {
     family: FractalFamily,
     dynamical: bool,
@@ -4036,13 +4436,13 @@ struct FrozenScene {
     f64_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl FrozenScene {
     /// Renders one frame of this scene at `magnification` through the
     /// export pipeline. Reference selection mirrors the interactive
     /// renderer: plain f32 for families without perturbation, the f64
     /// reference below the handoff, the arbitrary-precision reference
     /// beyond it. `sweep` is added to every layer's gradient offsets.
+    #[cfg(not(target_arch = "wasm32"))]
     fn render_frame(
         &self,
         render_state: &eframe::egui_wgpu::RenderState,
@@ -4053,20 +4453,23 @@ impl FrozenScene {
         self.render_region(render_state, magnification, size, (0, 0), size, sweep)
     }
 
-    /// Renders one rectangular region of a frame — the whole frame is the
-    /// trivial region. Tiles render around the same reference orbit as the
-    /// frame (the frame centre moves to the region's `reference_offset`),
-    /// so tiling is exact at any magnification.
-    #[allow(clippy::too_many_arguments)]
-    fn render_region(
+    /// The uniforms, colouring block and reference upload of one region
+    /// render; shared by the blocking and asynchronous paths. Tiles render
+    /// around the same reference orbit as the frame (the frame centre moves
+    /// to the region's `reference_offset`), so tiling is exact at any
+    /// magnification.
+    fn region_inputs(
         &self,
-        render_state: &eframe::egui_wgpu::RenderState,
         magnification: f64,
         full_size: (u32, u32),
         origin: (u32, u32),
         region_size: (u32, u32),
         sweep: f32,
-    ) -> Result<Vec<u8>, String> {
+    ) -> (
+        Uniforms,
+        ColouringUniforms,
+        Option<(u64, &[GpuReferencePoint])>,
+    ) {
         let handoff_log = ARBITRARY_HANDOFF_ZOOM.log10();
         let region = animation::region_view(magnification, full_size, origin, region_size);
         let reference = if magnification > handoff_log {
@@ -4124,6 +4527,28 @@ impl FrozenScene {
             &layers,
             animation::frame_pixel_log(magnification, full_size.1),
         );
+        (
+            uniforms,
+            colouring_uniforms,
+            reference.map(|(generation, points, _)| (generation, points)),
+        )
+    }
+
+    /// Renders one rectangular region of a frame — the whole frame is the
+    /// trivial region — blocking until the GPU finishes.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_arguments)]
+    fn render_region(
+        &self,
+        render_state: &eframe::egui_wgpu::RenderState,
+        magnification: f64,
+        full_size: (u32, u32),
+        origin: (u32, u32),
+        region_size: (u32, u32),
+        sweep: f32,
+    ) -> Result<Vec<u8>, String> {
+        let (uniforms, colouring_uniforms, reference) =
+            self.region_inputs(magnification, full_size, origin, region_size, sweep);
         let renderer = render_state.renderer.read();
         let pipeline = renderer
             .callback_resources
@@ -4135,10 +4560,67 @@ impl FrozenScene {
             &uniforms,
             &colouring_uniforms,
             &self.gradient,
-            reference.map(|(generation, points, _)| (generation, points)),
+            reference,
             region_size,
         ))
     }
+
+    /// The browser cannot block on the GPU: submit, await the readback
+    /// mapping with no renderer lock held (the UI thread needs it every
+    /// frame), then collect.
+    #[cfg(target_arch = "wasm32")]
+    async fn render_region_async(
+        &self,
+        render_state: &eframe::egui_wgpu::RenderState,
+        magnification: f64,
+        full_size: (u32, u32),
+        origin: (u32, u32),
+        region_size: (u32, u32),
+        sweep: f32,
+    ) -> Result<Vec<u8>, String> {
+        let receiver = {
+            let (uniforms, colouring_uniforms, reference) =
+                self.region_inputs(magnification, full_size, origin, region_size, sweep);
+            let renderer = render_state.renderer.read();
+            let pipeline = renderer
+                .callback_resources
+                .get::<FractalPipeline>()
+                .ok_or_else(|| "renderer not initialised".to_owned())?;
+            pipeline.export_prepare(
+                &render_state.device,
+                &render_state.queue,
+                &uniforms,
+                &colouring_uniforms,
+                &self.gradient,
+                reference,
+                region_size,
+            );
+            pipeline.export_map_async()
+        };
+        receiver
+            .await
+            .map_err(|_| "the GPU readback was dropped".to_owned())?
+            .map_err(|error| format!("GPU readback failed: {error:?}"))?;
+        let renderer = render_state.renderer.read();
+        let pipeline = renderer
+            .callback_resources
+            .get::<FractalPipeline>()
+            .ok_or_else(|| "renderer not initialised".to_owned())?;
+        Ok(pipeline.export_read(region_size))
+    }
+}
+
+/// Progress of a browser-side export task, shared between the UI and the
+/// spawned async task.
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+struct WebJobProgress {
+    done: usize,
+    total: usize,
+    label: &'static str,
+    cancel: bool,
+    finished: bool,
+    message: Option<(String, bool)>,
 }
 
 /// A still render in progress: tiles of the supersampled frame render one
@@ -4183,14 +4665,28 @@ fn default_export_directory() -> String {
 /// Hands `text` to the browser as a file download.
 #[cfg(target_arch = "wasm32")]
 fn download_text_file(filename: &str, text: &str) -> Result<(), String> {
+    download_bytes(filename, text.as_bytes(), "application/json")
+}
+
+/// Hands `bytes` to the browser as a file download.
+#[cfg(target_arch = "wasm32")]
+fn download_bytes(filename: &str, bytes: &[u8], mime: &str) -> Result<(), String> {
     use wasm_bindgen::JsCast;
     let document = web_sys::window()
         .and_then(|window| window.document())
         .ok_or("no browser document")?;
-    let parts = js_sys::Array::of1(&wasm_bindgen::JsValue::from_str(text));
+    let array = js_sys::Uint8Array::from(bytes);
+    // Keep the last export inspectable from the console (and from automated
+    // smoke tests).
+    let _ = js_sys::Reflect::set(
+        &js_sys::global(),
+        &wasm_bindgen::JsValue::from_str("__iterascope_last_export"),
+        &array,
+    );
+    let parts = js_sys::Array::of1(&array);
     let options = web_sys::BlobPropertyBag::new();
-    options.set_type("application/json");
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)
+    options.set_type(mime);
+    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &options)
         .map_err(|_| "cannot build the file blob")?;
     let url = web_sys::Url::create_object_url_with_blob(&blob)
         .map_err(|_| "cannot build the download URL")?;
@@ -4209,7 +4705,6 @@ fn download_text_file(filename: &str, text: &str) -> Result<(), String> {
 /// Box-filters `factor`×`factor` blocks of RGBA sRGB pixels down to one, in
 /// linear light so anti-aliased edges keep their brightness. `width` is the
 /// supersampled row width; the output is `width/factor` wide.
-#[cfg(not(target_arch = "wasm32"))]
 fn downsample_srgb(rgba: &[u8], width: u32, factor: u32) -> Vec<u8> {
     if factor <= 1 {
         return rgba.to_vec();
@@ -4261,16 +4756,25 @@ fn downsample_srgb(rgba: &[u8], width: u32, factor: u32) -> Vec<u8> {
     out
 }
 
+/// Encodes RGBA rows (top first) as a PNG in memory.
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(std::io::Cursor::new(&mut bytes), width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .and_then(|mut writer| writer.write_image_data(rgba))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(bytes)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
-    let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder
-        .write_header()
-        .and_then(|mut writer| writer.write_image_data(rgba))
-        .map_err(|error| error.to_string())
+    let bytes = encode_png(width, height, rgba)?;
+    std::fs::write(path, bytes).map_err(|error| error.to_string())
 }
 
 /// Encodes `frame-%05d.png` in `directory` into `zoom.mp4` with ffmpeg.

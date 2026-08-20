@@ -154,11 +154,15 @@ from it.
   dynamical plane, **Pick c…** opens a parameter-plane window with
   crosshair, scroll zoom and a live Julia thumbnail of the hovered
   parameter; clicking sets `c` and the composited image follows immediately
-- Still-image export (native app): the current view rendered to PNG at up
-  to 16384×16384 with 2×2 or 3×3 supersampled anti-aliasing box-filtered in
-  linear light; sizes whose supersampled frame exceeds the 8192-pixel
+- Still-image export on both targets: the current view rendered to PNG at
+  up to 16384×16384 with 2×2 or 3×3 supersampled anti-aliasing box-filtered
+  in linear light; sizes whose supersampled frame exceeds the 8192-pixel
   texture limit render as tiles around the same reference orbit, seamless
-  at any magnification
+  at any magnification. The browser build renders through an asynchronous
+  GPU readback and downloads the PNG
+- In-browser video: the browser build encodes the zoom animation to MP4
+  (H.264) with WebCodecs and downloads it — no server, no ffmpeg — falling
+  back to a ZIP of PNG frames where WebCodecs is unavailable
 - Two independently collapsible, drag-resizable control panes: the left
   **Instrument** pane (family, document, parameters, computation,
   navigation, diagnostics) and the right **Studio** pane (layers, colouring,
@@ -226,14 +230,16 @@ active pane's centre, from a start to an end magnification exponent (defaults:
 `10^0` to the current view via **End = view**) at constant logarithmic speed,
 optionally eased at both ends, with an optional constant-speed gradient sweep.
 The exporter writes `frame-00000.png …` at the chosen resolution and frame
-rate into a new directory under the configured folder, one frame per UI
-update so the interface stays live, and — when ffmpeg is installed — encodes
-`zoom.mp4` when the sequence completes. Because the centre is fixed, the
-arbitrary-precision reference orbit is computed once and re-described in
-scale for every frame; frames below the `1.14e14×` handoff use the same orbit
-projected to `f64`, and the switch between the paths is seamless. Export runs
-in the native application; the browser build shows the settings but cannot
-write files.
+rate, one frame per interface update so the application stays live. The
+native app writes `frame-00000.png …` into a new directory under the
+configured folder and — when ffmpeg is installed — encodes `zoom.mp4` when
+the sequence completes. The browser build encodes the video directly with
+WebCodecs (H.264, muxed to MP4 in the app) and downloads it when the last
+frame is in; without WebCodecs it downloads the frames as a ZIP of PNGs.
+Because the centre is fixed, the arbitrary-precision reference orbit is
+computed once and re-described in scale for every frame; frames below the
+`1.14e14×` handoff use the same orbit projected to `f64`, and the switch
+between the paths is seamless.
 
 ### Layers
 

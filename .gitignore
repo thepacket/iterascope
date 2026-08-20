@@ -3,3 +3,4 @@
 /.trunk/
 .DS_Store
 *.log
+.claude/

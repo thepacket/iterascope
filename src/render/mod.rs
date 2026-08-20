@@ -779,9 +779,11 @@ impl FractalPipeline {
     }
 
     /// Renders one export frame at `size` and returns tightly packed RGBA
-    /// rows, top first. Blocks until the GPU finishes; the exporter calls
-    /// this between UI frames, one frame per update. `reference` carries a
-    /// generation so an orbit shared by many frames uploads once.
+    /// rows, top first. Blocks until the GPU finishes; the native exporter
+    /// calls this between UI frames, one frame per update. The browser
+    /// build cannot block on the GPU: it uses [`Self::export_prepare`],
+    /// awaits [`Self::export_map_async`]'s receiver, then reads with
+    /// [`Self::export_read`].
     #[cfg(not(target_arch = "wasm32"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_export(
@@ -794,6 +796,38 @@ impl FractalPipeline {
         reference: Option<(u64, &[GpuReferencePoint])>,
         size: (u32, u32),
     ) -> Vec<u8> {
+        self.export_prepare(
+            device, queue, uniforms, colouring, gradient, reference, size,
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        {
+            let slot = self.export_target.lock().unwrap();
+            slot.as_ref().unwrap().readback.slice(..).map_async(
+                wgpu::MapMode::Read,
+                move |result| {
+                    let _ = sender.send(result);
+                },
+            );
+        }
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
+        self.export_read(size)
+    }
+
+    /// Uploads the frame's state, encodes the render and the copy into the
+    /// readback buffer, and submits. `reference` carries a generation so an
+    /// orbit shared by many frames uploads once.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn export_prepare(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        uniforms: &Uniforms,
+        colouring: &ColouringUniforms,
+        gradient: &GradientTable,
+        reference: Option<(u64, &[GpuReferencePoint])>,
+        size: (u32, u32),
+    ) {
         let resources = &self.panes[EXPORT_PANE];
         queue.write_buffer(&resources.buffer, 0, bytemuck::bytes_of(uniforms));
         self.upload_colouring(queue, EXPORT_PANE, colouring, Some(gradient));
@@ -886,22 +920,37 @@ impl FractalPipeline {
             },
         );
         queue.submit([encoder.finish()]);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        target
+    }
+
+    /// Registers the readback mapping and returns a receiver that resolves
+    /// when the browser (or driver) finishes it. The caller must not hold
+    /// any renderer lock while awaiting, or the UI thread deadlocks.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn export_map_async(
+        &self,
+    ) -> futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>> {
+        let (sender, receiver) = futures_channel::oneshot::channel();
+        let slot = self.export_target.lock().unwrap();
+        slot.as_ref()
+            .expect("export_prepare ran first")
             .readback
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = sender.send(result);
             });
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        receiver.recv().unwrap().unwrap();
+        receiver
+    }
+
+    /// Copies the mapped readback out as tightly packed RGBA rows, top
+    /// first, and unmaps. Texture row 0 is the top of the viewport (clip
+    /// y = +1), which the fullscreen triangle maps to uv.y = 1 and the
+    /// fragment shader to positive imaginary values — the buffer is already
+    /// top-first, so only the copy padding needs stripping.
+    pub(crate) fn export_read(&self, size: (u32, u32)) -> Vec<u8> {
+        let slot = self.export_target.lock().unwrap();
+        let target = slot.as_ref().expect("export_prepare ran first");
         let padded = target.readback.slice(..).get_mapped_range().to_vec();
         target.readback.unmap();
-
-        // Texture row 0 is the top of the viewport (clip y = +1), which the
-        // fullscreen triangle maps to uv.y = 1 and the fragment shader to
-        // positive imaginary values — the buffer is already top-first, so
-        // only the copy padding needs stripping.
         let tight_row = (size.0 * 4) as usize;
         let mut rgba = Vec::with_capacity(tight_row * size.1 as usize);
         for row in padded
