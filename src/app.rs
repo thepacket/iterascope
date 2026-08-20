@@ -1824,6 +1824,22 @@ impl App {
             .map_or((view.centre, view.half_height), |deep| {
                 (deep.centre_preview(), deep.half_height_preview())
             });
+        // Past the handoff the location is captured at arbitrary precision;
+        // the f64 fields keep the projection for display.
+        let deep = self.deep_views[pane].as_ref().and_then(|deep| {
+            (deep.magnification_log10 > ARBITRARY_HANDOFF_ZOOM.log10()).then(|| {
+                crate::colouring::LayerSceneDeep {
+                    centre_re: deep.centre.re.exact_decimal(),
+                    centre_im: deep.centre.im.exact_decimal(),
+                    half_height: deep.half_height.exact_decimal(),
+                    magnification_log10: deep.magnification_log10,
+                    julia: self
+                        .deep_julia_c
+                        .as_ref()
+                        .map(|julia| (julia.re.exact_decimal(), julia.im.exact_decimal())),
+                }
+            })
+        });
         LayerScene {
             family: self.family,
             dynamical: self.pane_is_dynamical(pane),
@@ -1836,6 +1852,7 @@ impl App {
                 self.family,
                 &self.family_parameters,
             ),
+            deep,
         }
     }
 
@@ -1848,7 +1865,7 @@ impl App {
         if ui
             .checkbox(&mut detached, "Own formula and location")
             .on_hover_text(
-                "The layer renders its own family, parameter and view instead of the image's, exact to 1.14e14× magnification. Detaching captures the current view.",
+                "The layer renders its own family, parameter and view instead of the image's, at any magnification. Detaching captures the current view, including arbitrary-precision deep locations.",
             )
             .changed()
         {
@@ -1858,9 +1875,14 @@ impl App {
             return;
         };
         egui::CollapsingHeader::new(format!(
-            "Scene: {} ×{:.2e}",
+            "Scene: {} ×10^{:.1}",
             scene.family.name(),
-            1.45 / scene.half_height
+            scene
+                .deep
+                .as_ref()
+                .map_or_else(|| (1.45 / scene.half_height).log10(), |deep| {
+                    deep.magnification_log10
+                })
         ))
         .id_salt("iterascope.layer.scene")
         .default_open(true)
@@ -1877,42 +1899,70 @@ impl App {
             if scene.dynamical {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("c").monospace().color(MUTED));
-                    ui.add(
-                        egui::DragValue::new(&mut scene.julia_c[0])
-                            .speed(0.001)
-                            .max_decimals(12),
-                    );
-                    ui.add(
-                        egui::DragValue::new(&mut scene.julia_c[1])
-                            .speed(0.001)
-                            .max_decimals(12),
-                    );
+                    let changed = ui
+                        .add(
+                            egui::DragValue::new(&mut scene.julia_c[0])
+                                .speed(0.001)
+                                .max_decimals(12),
+                        )
+                        .changed()
+                        | ui.add(
+                            egui::DragValue::new(&mut scene.julia_c[1])
+                                .speed(0.001)
+                                .max_decimals(12),
+                        )
+                        .changed();
+                    // An edited f64 parameter supersedes a captured deep one.
+                    if changed && let Some(deep) = &mut scene.deep {
+                        deep.julia = None;
+                    }
                 });
             }
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("centre").monospace().color(MUTED));
-                ui.add(
-                    egui::DragValue::new(&mut scene.centre[0])
-                        .speed(0.001)
-                        .max_decimals(14),
+            if let Some(deep) = &scene.deep {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Deep location: ×10^{:.1} (captured at arbitrary precision)",
+                        deep.magnification_log10
+                    ))
+                    .small()
+                    .color(BLUE),
                 );
-                ui.add(
-                    egui::DragValue::new(&mut scene.centre[1])
-                        .speed(0.001)
-                        .max_decimals(14),
-                );
-            });
-            let mut zoom_log10 = (1.45 / scene.half_height).log10();
-            if ui
-                .add(
-                    egui::Slider::new(&mut zoom_log10, 0.0..=14.0)
-                        .text("zoom 10^")
-                        .fixed_decimals(2),
-                )
-                .changed()
-            {
-                scene.half_height =
-                    (1.45 / 10f64.powf(zoom_log10)).max(LayerScene::MIN_HALF_HEIGHT);
+                if ui
+                    .button("Clear deep location")
+                    .on_hover_text(
+                        "Drop back to the f64 projection so the centre and zoom can be edited numerically",
+                    )
+                    .clicked()
+                {
+                    scene.deep = None;
+                    scene.half_height = scene.half_height.max(LayerScene::MIN_HALF_HEIGHT);
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("centre").monospace().color(MUTED));
+                    ui.add(
+                        egui::DragValue::new(&mut scene.centre[0])
+                            .speed(0.001)
+                            .max_decimals(14),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut scene.centre[1])
+                            .speed(0.001)
+                            .max_decimals(14),
+                    );
+                });
+                let mut zoom_log10 = (1.45 / scene.half_height).log10();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut zoom_log10, 0.0..=14.0)
+                            .text("zoom 10^")
+                            .fixed_decimals(2),
+                    )
+                    .changed()
+                {
+                    scene.half_height =
+                        (1.45 / 10f64.powf(zoom_log10)).max(LayerScene::MIN_HALF_HEIGHT);
+                }
             }
             ui.horizontal(|ui| {
                 ui.add(
@@ -1931,7 +1981,7 @@ impl App {
             if ui
                 .button("Capture current view")
                 .on_hover_text(
-                    "Copy the active pane's family, parameter and location into this layer's scene (clamped to 1.14e14×)",
+                    "Copy the active pane's family, parameter and location into this layer's scene, at full precision",
                 )
                 .clicked()
             {
@@ -1968,7 +2018,8 @@ impl App {
             let (uniforms, reference, layer_pixel_log) = if let Some(scene) = &layer.scene {
                 let magnification = 1.45 / scene.half_height.max(f64::MIN_POSITIVE);
                 let reference = (magnification > Self::DETACHED_PERTURBATION_ZOOM)
-                    .then(|| self.detached_reference(scene));
+                    .then(|| self.detached_reference(scene))
+                    .flatten();
                 let mut uniforms = Uniforms::new(
                     scene.centre,
                     scene.half_height,
@@ -1996,7 +2047,13 @@ impl App {
                         reference.reference_offset,
                     );
                 }
-                let layer_pixel_log = (2.0 * scene.half_height / viewport_pixels_y.max(1.0)).ln();
+                let layer_pixel_log = scene.deep.as_ref().map_or_else(
+                    || (2.0 * scene.half_height / viewport_pixels_y.max(1.0)).ln(),
+                    |deep| {
+                        std::f64::consts::LN_10 * (1.45_f64.log10() - deep.magnification_log10)
+                            + (2.0 / viewport_pixels_y.max(1.0)).ln()
+                    },
+                );
                 (uniforms, reference, layer_pixel_log)
             } else {
                 let mut uniforms = Uniforms::new(
@@ -2040,37 +2097,73 @@ impl App {
         Some(passes)
     }
 
-    /// The f64 reference orbit of a detached scene, cached by value.
-    fn detached_reference(&mut self, scene: &LayerScene) -> Arc<DeepRenderData> {
+    /// The reference orbit of a detached scene, cached by value: an
+    /// arbitrary-precision orbit for a captured deep location, an `f64`
+    /// orbit otherwise. Errors (a corrupt deep location) are logged and
+    /// yield `None`; documents validate locations before they get here.
+    fn detached_reference(&mut self, scene: &LayerScene) -> Option<Arc<DeepRenderData>> {
         if let Some(position) = self
             .detached_references
             .iter()
             .position(|(key, _)| key == scene)
         {
-            return Arc::clone(&self.detached_references[position].1);
+            return Some(Arc::clone(&self.detached_references[position].1));
         }
         let parameters = scene.parameters();
-        let orbit = reference_orbit_f64(
-            scene.family,
-            &parameters,
-            initial_state_with(scene.family, scene.centre, scene.dynamical, scene.julia_c),
-            scene.iterations,
-            scene.bailout as f64,
-        );
         self.deep_generation += 1;
-        let data = Arc::new(DeepRenderData::from_f64_orbit(
-            self.deep_generation,
-            scene.half_height,
-            &orbit.points,
-            true,
-            [0.0; 2],
-        ));
+        let data = if let Some(deep) = &scene.deep {
+            let built = deep.parse_view().and_then(|view| {
+                let julia = match &deep.julia {
+                    Some((re, im)) => DeepComplex::parse(re, im, deep.zoom_exponent())?,
+                    None => DeepComplex::from_f64(scene.julia_c, deep.zoom_exponent())?,
+                };
+                let initial =
+                    DeepState::initial(scene.family, &view.centre, scene.dynamical, &julia)?;
+                let orbit = ReferenceOrbit::family(
+                    scene.family,
+                    &parameters,
+                    initial,
+                    scene.iterations,
+                    scene.bailout as f64,
+                )?;
+                let (mantissa, exponent) = view.half_height.scaled_f32();
+                Ok(DeepRenderData::from_points(
+                    self.deep_generation,
+                    mantissa,
+                    exponent,
+                    &orbit.points,
+                    false,
+                ))
+            });
+            match built {
+                Ok(data) => Arc::new(data),
+                Err(error) => {
+                    log::warn!("detached layer reference failed: {error}");
+                    return None;
+                }
+            }
+        } else {
+            let orbit = reference_orbit_f64(
+                scene.family,
+                &parameters,
+                initial_state_with(scene.family, scene.centre, scene.dynamical, scene.julia_c),
+                scene.iterations,
+                scene.bailout as f64,
+            );
+            Arc::new(DeepRenderData::from_f64_orbit(
+                self.deep_generation,
+                scene.half_height,
+                &orbit.points,
+                true,
+                [0.0; 2],
+            ))
+        };
         if self.detached_references.len() >= 8 {
             self.detached_references.remove(0);
         }
         self.detached_references
             .push((scene.clone(), Arc::clone(&data)));
-        data
+        Some(data)
     }
 
     /// The rasterised gradients for the render callbacks, rebuilt only when
@@ -3322,13 +3415,21 @@ impl App {
             let pass = if let Some(scene) = layer.scene.clone() {
                 let magnification = 1.45 / scene.half_height.max(f64::MIN_POSITIVE);
                 let reference = (magnification > Self::DETACHED_PERTURBATION_ZOOM)
-                    .then(|| self.detached_reference(&scene));
+                    .then(|| self.detached_reference(&scene))
+                    .flatten();
+                let is_deep = scene.deep.is_some();
+                let fixed_magnification = scene
+                    .deep
+                    .as_ref()
+                    .map_or_else(|| magnification.log10(), |deep| deep.magnification_log10);
+                let reference =
+                    reference.map(|data| (data.generation, Arc::clone(&data.reference)));
                 FrozenPass {
                     merge_mode: layer.merge_mode.code(),
                     opacity: layer.opacity,
                     mask: layer.mask,
                     animated: false,
-                    fixed_magnification: magnification.log10(),
+                    fixed_magnification,
                     scene: FrozenScene {
                         family: scene.family,
                         dynamical: scene.dynamical,
@@ -3339,9 +3440,8 @@ impl App {
                         centre: scene.centre,
                         layers: self.layers.clone(),
                         gradient: Arc::clone(&shared.gradient),
-                        ap_reference: None,
-                        f64_reference: reference
-                            .map(|data| (data.generation, Arc::clone(&data.reference))),
+                        ap_reference: is_deep.then(|| reference.clone()).flatten(),
+                        f64_reference: (!is_deep).then(|| reference.clone()).flatten(),
                         single_pass: Some((layer, gradient_base)),
                     },
                 }

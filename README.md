@@ -147,8 +147,9 @@ from it.
   colouring algorithm can shape where another layer shows — and any layer
   can detach into its own scene: its own formula, plane, parameter and
   location, rendered as a separate pass through the same engine and
-  composited over the stack, exact through the `f64`-reference perturbation
-  range (to the `1.14e14×` handoff) —
+  composited over the stack — exact at any magnification: shallow scenes
+  use `f64` reference orbits and deep captures carry their location at
+  arbitrary precision —
   with a single-image workspace (the default layout) that gives the
   composited image the full window. Layers share the image's location and
   family, so one reference orbit serves the whole stack and the deep-zoom
@@ -268,12 +269,16 @@ multiply.
 
 **Own formula and location** in the Colouring section detaches the active
 layer into its own scene: it captures the current view (family, plane,
-parameter, centre and zoom, clamped to `1.14e14×`) and from then on renders
-that scene regardless of where the image navigates — a Burning Ship backdrop
+parameter, centre and zoom — including arbitrary-precision deep locations,
+stored as exact decimals) and from then on renders that scene regardless of
+where the image navigates — a Burning Ship backdrop
 behind a Mandelbrot dive, a Julia overlay masked into a parameter-plane
 image. Detached scenes are edited numerically (family, `c`, centre, zoom,
-iterations, bailout) or re-captured from the view, render as separate passes
-through the unchanged deep-zoom engine, and composite with the layer's usual
+iterations, bailout) or re-captured from the view; deep captures show their
+magnification and are re-captured or cleared rather than edited digit by
+digit. They render as separate passes through the unchanged deep-zoom
+engine — an `f64` reference orbit below the `1.14e14×` handoff, an
+arbitrary-precision one beyond it — and composite with the layer's usual
 opacity, merge mode and masks. In animations they hold their location while
 the shared-scene layers dive. A stack whose layers all share the image's
 scene keeps the single-pass compositor, byte-identical to before.
@@ -570,7 +575,8 @@ crossing every precision path at a row-padded width, a layer-compositing test
 every merge mode must be distinct, white/black/gradient masks must behave,
 an eight-layer stack must survive, and skipping leading iterations must
 revive the orbit trap at depth), a GPU-versus-CPU compositor equivalence
-test over a stack mixing shared, mask and detached layers,
+test over a stack mixing shared, mask and detached layers (and a second at
+`1e30` through an arbitrary-precision detached reference),
 and a timing probe that also records the cost of the orbit-statistics
 variant:
 
@@ -605,9 +611,7 @@ stored. Opened documents are validated before any live state is changed.
 5. Orbit probes for the non-quadratic escape-time families, and
    arbitrary-precision exponential/trigonometric reference orbits so the
    transcendental families can join the deep-zoom path
-6. Towards generative fractal art: arbitrary-precision locations for
-   detached layer scenes (they currently stop at the `1.14e14×` handoff;
-   per-layer formulas and locations landed); keyframed centre drift and
+6. Towards generative fractal art: keyframed centre drift and
    per-parameter animation curves; register-resident accumulators for the
    first statistics-bearing layer (the per-layer arrays cost the opt-in
    statistics variant roughly 2× today); derivatives for the remaining

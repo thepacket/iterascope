@@ -3555,6 +3555,225 @@ mod tests {
         }
     }
 
+    /// A detached layer at 1e30 through the arbitrary-precision reference,
+    /// composited over a shallow shared layer, must resolve structure and
+    /// match the CPU compositor. Run with
+    /// `cargo test --release gpu_detached_deep_layer -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gpu_detached_deep_layer() {
+        use crate::animation::{frame_half_height_f64, frame_scale};
+        use crate::arbitrary::{DeepComplex, DeepReal, DeepState, DeepView, ReferenceOrbit};
+        use crate::colouring::{Gradient, Layer, LayerStack, MergeMode};
+        use crate::family::{FamilyParameters, FractalFamily};
+
+        let gpu = GpuHarness::new(320, 240);
+        let size = (320u32, 240u32);
+        let parameters = FamilyParameters::default();
+        let family = FractalFamily::Quadratic;
+        let iterations = 2_048u32;
+        let zoom_exponent = 30u32;
+        let precision_exponent = zoom_exponent + 40;
+        let c_f64 = family.default_parameter();
+        let c = DeepComplex::from_f64(c_f64, precision_exponent).unwrap();
+        let (fixed_point, _) = [[0.6, 0.4], [-0.5, 0.7], [1.1, -0.3]]
+            .iter()
+            .filter_map(|start| {
+                repelling_fixed_point(family, &parameters, &c, *start, precision_exponent)
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("a repelling fixed point");
+        let view = DeepView {
+            centre: fixed_point.clone(),
+            half_height: DeepReal::parse(&format!("1.45e-{zoom_exponent}"), precision_exponent)
+                .unwrap(),
+            zoom_exponent: precision_exponent,
+            magnification_log10: zoom_exponent as f64,
+        };
+        let initial = DeepState::initial(family, &view.centre, true, &c).unwrap();
+        let orbit = ReferenceOrbit::family(family, &parameters, initial, iterations, 4.0).unwrap();
+        let (mantissa, exponent) = view.half_height.scaled_f32();
+        let deep_data = Arc::new(DeepRenderData::from_points(
+            91,
+            mantissa,
+            exponent,
+            &orbit.points,
+            false,
+        ));
+
+        let mut bottom = Layer::default();
+        bottom.colouring.gradient = Gradient::random(4);
+        let mut top = Layer {
+            merge_mode: MergeMode::Screen,
+            opacity: 0.6,
+            ..Layer::default()
+        };
+        top.colouring.gradient = Gradient::random(13);
+        let stack = LayerStack::from_layers(vec![bottom.clone(), top.clone()]);
+        let gradient = GradientTable::new(93, &stack);
+        let shallow_view = family.default_parameter_view();
+        let shallow_uniforms = Uniforms::new(
+            shallow_view.centre,
+            shallow_view.half_height,
+            gpu.aspect(),
+            c_f64,
+            256,
+            4.0,
+            family.shader_flag(),
+            0,
+            true,
+            false,
+            PrecisionMode::F32,
+            parameters.uniform_words(false),
+        );
+        // The deep pass mirrors the app: preview centre/half in the view
+        // uniforms, the true scale via the perturbation description.
+        let magnification = zoom_exponent as f64;
+        let deep_uniforms = Uniforms::new(
+            view.centre_preview(),
+            frame_half_height_f64(magnification),
+            gpu.aspect(),
+            c_f64,
+            iterations,
+            4.0,
+            family.shader_flag(),
+            1,
+            true,
+            false,
+            PrecisionMode::DoubleSingle,
+            parameters.uniform_words(true),
+        )
+        .enable_perturbation(
+            frame_scale(magnification).0,
+            frame_scale(magnification).1,
+            deep_data.reference.len(),
+            false,
+            [0.0; 2],
+        );
+
+        // CPU reference from individual renders.
+        let shallow_rgba = gpu.pipeline.render_export(
+            &gpu.device,
+            &gpu.queue,
+            &shallow_uniforms,
+            &ColouringUniforms::for_layer(&bottom, -5.0, 0),
+            &gradient,
+            None,
+            size,
+        );
+        let deep_rgba = gpu.pipeline.render_export(
+            &gpu.device,
+            &gpu.queue,
+            &deep_uniforms,
+            &ColouringUniforms::for_layer(&top, -70.0, crate::colouring::LOOKUP_TABLE_LEN),
+            &gradient,
+            Some((91, deep_data.reference.as_slice())),
+            size,
+        );
+        let deep_distinct: std::collections::HashSet<&[u8]> = deep_rgba.chunks(4).collect();
+        eprintln!("deep pass alone: {} distinct colours", deep_distinct.len());
+        assert!(deep_distinct.len() > 200, "the 1e30 pass collapsed");
+        let cpu = composite_cpu(&[
+            (
+                shallow_rgba,
+                bottom.merge_mode.code(),
+                bottom.opacity,
+                false,
+            ),
+            (deep_rgba, top.merge_mode.code(), top.opacity, false),
+        ]);
+
+        // GPU compositor over the same passes.
+        let passes = vec![
+            LayerPass {
+                uniforms: shallow_uniforms,
+                colouring: ColouringUniforms::for_layer(&bottom, -5.0, 0),
+                reference: None,
+                merge_mode: bottom.merge_mode.code(),
+                opacity: bottom.opacity,
+                mask: false,
+            },
+            LayerPass {
+                uniforms: deep_uniforms,
+                colouring: ColouringUniforms::for_layer(
+                    &top,
+                    -70.0,
+                    crate::colouring::LOOKUP_TABLE_LEN,
+                ),
+                reference: Some(Arc::clone(&deep_data)),
+                merge_mode: top.merge_mode.code(),
+                opacity: top.opacity,
+                mask: false,
+            },
+        ];
+        gpu.set_layers(0, &stack, -5.0);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        gpu.pipeline
+            .run_layer_passes(&gpu.device, &gpu.queue, &mut encoder, 0, &passes, size);
+        {
+            let compositor = gpu.pipeline.panes[0].compositor.lock().unwrap();
+            let final_texture = &compositor.compose[compositor.final_index].0;
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: final_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &gpu.readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(size.0 * 4),
+                        rows_per_image: Some(size.1),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        gpu.queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        gpu.readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        receiver.recv().unwrap().unwrap();
+        let composed = gpu.readback.slice(..).get_mapped_range().to_vec();
+        gpu.readback.unmap();
+
+        let differing = cpu
+            .chunks(4)
+            .zip(composed.chunks(4))
+            .filter(|(a, b)| {
+                a[..3]
+                    .iter()
+                    .zip(b[..3].iter())
+                    .any(|(x, y)| x.abs_diff(*y) > 2)
+            })
+            .count();
+        let fraction = differing as f64 / (size.0 * size.1) as f64;
+        eprintln!(
+            "deep composite GPU vs CPU: {:.3}% of pixels differ",
+            100.0 * fraction
+        );
+        assert!(fraction < 0.005);
+        if let Ok(directory) = std::env::var("ITERASCOPE_RENDER_DIR") {
+            std::fs::create_dir_all(&directory).unwrap();
+            let rgb: Vec<u8> = composed.chunks(4).flat_map(|p| p[..3].to_vec()).collect();
+            let mut ppm = format!("P6\n{} {}\n255\n", size.0, size.1).into_bytes();
+            ppm.extend_from_slice(&rgb);
+            std::fs::write(format!("{directory}/detached-deep.ppm"), ppm).unwrap();
+        }
+    }
+
     /// Finds a point on the boundary between bounded and finished orbits by
     /// scanning a horizontal line through `centre` and bisecting in f64.
     fn boundary_point(

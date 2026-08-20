@@ -1165,10 +1165,42 @@ impl MergeMode {
     }
 }
 
+/// An arbitrary-precision location for a detached scene beyond the f64
+/// handoff: exact decimal strings, captured from a deep view. The scene's
+/// f64 fields then hold the projection for display.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct LayerSceneDeep {
+    pub(crate) centre_re: String,
+    pub(crate) centre_im: String,
+    pub(crate) half_height: String,
+    pub(crate) magnification_log10: f64,
+    /// The Julia parameter at full precision; absent, the scene's f64
+    /// parameter is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) julia: Option<(String, String)>,
+}
+
+impl LayerSceneDeep {
+    /// The working precision for parsing this location.
+    pub(crate) fn zoom_exponent(&self) -> u32 {
+        (self.magnification_log10.ceil().max(0.0) as u32).saturating_add(40)
+    }
+
+    pub(crate) fn parse_view(&self) -> Result<crate::arbitrary::DeepView, String> {
+        crate::arbitrary::DeepView::parse(
+            &self.centre_re,
+            &self.centre_im,
+            &self.half_height,
+            self.magnification_log10,
+        )
+    }
+}
+
 /// A layer's own scene: its formula, plane, parameter and location,
 /// independent of the image the stack belongs to. Detached scenes render as
-/// their own pass and are limited to the `f64`-reference perturbation range
-/// (magnification up to the ~1.14e14× handoff).
+/// their own pass; locations are exact through the `f64`-reference range and,
+/// with a captured [`LayerSceneDeep`], through arbitrary precision.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct LayerScene {
@@ -1185,6 +1217,10 @@ pub(crate) struct LayerScene {
     /// Family-specific settings, in the experiment document's shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) family_parameters: Option<crate::experiment::FamilyParametersDocument>,
+    /// The location at arbitrary precision, when captured beyond the f64
+    /// handoff; the f64 fields then hold its projection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) deep: Option<LayerSceneDeep>,
 }
 
 impl Default for LayerScene {
@@ -1200,6 +1236,7 @@ impl Default for LayerScene {
             iterations: 256,
             bailout: 4.0,
             family_parameters: None,
+            deep: None,
         }
     }
 }
@@ -1239,6 +1276,16 @@ impl LayerScene {
             parameters
                 .validate()
                 .map_err(|error| format!("layer {index}: {error}"))?;
+        }
+        if let Some(deep) = &self.deep {
+            if !self.family.supports_deep_zoom() {
+                return Err(format!(
+                    "layer {index}: {} scenes cannot go beyond f32/f64 range",
+                    self.family.name()
+                ));
+            }
+            deep.parse_view()
+                .map_err(|error| format!("layer {index}: deep location: {error}"))?;
         }
         Ok(())
     }
@@ -1727,6 +1774,48 @@ gradient:
         let old: Layer = serde_json::from_str("{\"name\":\"x\"}").unwrap();
         assert!(!old.mask);
         assert_eq!(old.skip_iterations, 0);
+    }
+
+    #[test]
+    fn deep_scene_locations_round_trip_and_validate() {
+        let mut scene = LayerScene {
+            family: FractalFamily::Quadratic,
+            ..LayerScene::default()
+        };
+        scene.deep = Some(LayerSceneDeep {
+            centre_re: "-7.45e-1".to_owned(),
+            centre_im: "1.13e-1".to_owned(),
+            half_height: "1.45e-200".to_owned(),
+            magnification_log10: 200.0,
+            julia: Some(("-7.45e-1".to_owned(), "1.13e-1".to_owned())),
+        });
+        scene.validate(0).unwrap();
+        let json = serde_json::to_string(&scene).unwrap();
+        let back: LayerScene = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, scene);
+        assert_eq!(back.deep.as_ref().unwrap().zoom_exponent(), 240);
+        back.deep.as_ref().unwrap().parse_view().unwrap();
+
+        // A corrupt decimal fails validation with the layer index.
+        scene.deep.as_mut().unwrap().centre_re = "not a number".to_owned();
+        let error = scene.validate(3).unwrap_err();
+        assert!(error.contains("layer 3"), "{error}");
+
+        // Families without deep-zoom support cannot carry deep locations.
+        let mut shallow = LayerScene {
+            family: FractalFamily::Exponential,
+            deep: Some(LayerSceneDeep {
+                centre_re: "0".to_owned(),
+                centre_im: "0".to_owned(),
+                half_height: "1.45e-20".to_owned(),
+                magnification_log10: 20.0,
+                julia: None,
+            }),
+            ..LayerScene::default()
+        };
+        assert!(shallow.validate(0).is_err());
+        shallow.deep = None;
+        shallow.validate(0).unwrap();
     }
 
     #[test]
