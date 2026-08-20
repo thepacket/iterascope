@@ -280,8 +280,10 @@ pub struct App {
     zoom_focus: [Option<[f64; 2]>; 2],
     active_pane: usize,
     pending_pan_steps: [f64; 2],
-    experiment_editor_open: bool,
-    experiment_json: String,
+    /// Result of the browser's asynchronous file-open dialog, polled each
+    /// frame: (file name, contents) or an error.
+    #[cfg(target_arch = "wasm32")]
+    pending_document: Arc<std::sync::Mutex<Option<Result<(String, String), String>>>>,
     experiment_message: Option<(String, bool)>,
     orbit_inspector_open: bool,
     show_orbit_overlay: bool,
@@ -362,8 +364,8 @@ impl App {
             zoom_focus: [None, None],
             active_pane: 0,
             pending_pan_steps: [0.0; 2],
-            experiment_editor_open: false,
-            experiment_json: String::new(),
+            #[cfg(target_arch = "wasm32")]
+            pending_document: Arc::new(std::sync::Mutex::new(None)),
             experiment_message: None,
             orbit_inspector_open: false,
             show_orbit_overlay: true,
@@ -443,30 +445,19 @@ impl App {
 
             section(ui, "Document", |ui| {
                 ui.horizontal(|ui| {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        if ui
-                            .button("Open…")
-                            .on_hover_text("Load an experiment document (.json)")
-                            .clicked()
-                        {
-                            self.open_document();
-                        }
-                        if ui
-                            .button("Save…")
-                            .on_hover_text("Save the experiment as a .json document")
-                            .clicked()
-                        {
-                            self.save_document();
-                        }
-                    }
                     if ui
-                        .button("Edit JSON…")
-                        .on_hover_text("View, copy or paste the document as JSON text")
+                        .button(egui::RichText::new("Open…").strong())
+                        .on_hover_text("Load an experiment document (.json)")
                         .clicked()
                     {
-                        self.refresh_experiment_json();
-                        self.experiment_editor_open = true;
+                        self.open_document(ui.ctx());
+                    }
+                    if ui
+                        .button(egui::RichText::new("Save…").strong())
+                        .on_hover_text("Save the experiment as a .json document")
+                        .clicked()
+                    {
+                        self.save_document();
                     }
                 });
                 ui.label(
@@ -476,9 +467,7 @@ impl App {
                     .small()
                     .color(MUTED),
                 );
-                if let Some((message, error)) = &self.experiment_message
-                    && !self.experiment_editor_open
-                {
+                if let Some((message, error)) = &self.experiment_message {
                     let colour = if *error { CORAL } else { BLUE };
                     ui.label(egui::RichText::new(message).small().color(colour));
                 }
@@ -1114,7 +1103,7 @@ impl App {
 
     /// Loads an experiment document chosen in the native file dialog.
     #[cfg(not(target_arch = "wasm32"))]
-    fn open_document(&mut self) {
+    fn open_document(&mut self, _ctx: &egui::Context) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("IteraScope experiment", &["json"])
             .set_title("Open experiment document")
@@ -1134,6 +1123,50 @@ impl App {
                 self.experiment_message =
                     Some((format!("Cannot load {}: {error}", path.display()), true));
             }
+        }
+    }
+
+    /// Opens the browser's file picker; the chosen file lands in
+    /// `pending_document` and is applied by `poll_pending_document`.
+    #[cfg(target_arch = "wasm32")]
+    fn open_document(&mut self, ctx: &egui::Context) {
+        let pending = Arc::clone(&self.pending_document);
+        let ctx = ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Some(file) = rfd::AsyncFileDialog::new()
+                .add_filter("IteraScope experiment", &["json"])
+                .set_title("Open experiment document")
+                .pick_file()
+                .await
+            else {
+                return;
+            };
+            let name = file.file_name();
+            let result = match String::from_utf8(file.read().await) {
+                Ok(json) => Ok((name, json)),
+                Err(_) => Err(format!("{name} is not UTF-8 text")),
+            };
+            *pending.lock().unwrap() = Some(result);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Applies a document delivered by the browser's asynchronous picker.
+    #[cfg(target_arch = "wasm32")]
+    fn poll_pending_document(&mut self) {
+        let Some(result) = self.pending_document.lock().unwrap().take() else {
+            return;
+        };
+        match result.and_then(|(name, json)| {
+            ExperimentDocument::from_json(&json)
+                .map_err(|error| format!("Cannot load {name}: {error}"))
+                .map(|document| (name, document))
+        }) {
+            Ok((name, document)) => {
+                self.apply_experiment(document);
+                self.experiment_message = Some((format!("Loaded {name}"), false));
+            }
+            Err(error) => self.experiment_message = Some((error, true)),
         }
     }
 
@@ -1166,13 +1199,24 @@ impl App {
         }
     }
 
-    fn refresh_experiment_json(&mut self) {
-        match self.experiment_document().to_pretty_json() {
-            Ok(json) => {
-                self.experiment_json = json;
-                self.experiment_message = None;
+    /// Saves the current experiment document as a browser download.
+    #[cfg(target_arch = "wasm32")]
+    fn save_document(&mut self) {
+        let json = match self.experiment_document().to_pretty_json() {
+            Ok(json) => json,
+            Err(error) => {
+                self.experiment_message = Some((error, true));
+                return;
             }
-            Err(error) => self.experiment_message = Some((error, true)),
+        };
+        let filename = format!("{}-experiment.json", self.family.document_id());
+        match download_text_file(&filename, &json) {
+            Ok(()) => {
+                self.experiment_message = Some((format!("Downloading {filename}"), false));
+            }
+            Err(error) => {
+                self.experiment_message = Some((format!("Cannot save: {error}"), true));
+            }
         }
     }
 
@@ -1262,72 +1306,6 @@ impl App {
                 .map_or(15, |view| view.zoom_exponent);
             self.deep_julia_c = DeepComplex::parse(&value.re, &value.im, exponent).ok();
         }
-    }
-
-    fn experiment_editor(&mut self, ctx: &egui::Context) {
-        if !self.experiment_editor_open {
-            return;
-        }
-
-        let mut open = self.experiment_editor_open;
-        let mut close_requested = false;
-        egui::Window::new("Experiment document")
-            .open(&mut open)
-            .default_width(680.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "IteraScope JSON · format version {FORMAT_VERSION}"
-                    ))
-                        .monospace()
-                        .color(CREAM),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Copy this document to export it. To import, replace the text with another IteraScope document and choose Load JSON.",
-                    )
-                    .small()
-                    .color(MUTED),
-                );
-                ui.add_space(6.0);
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.experiment_json)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(22),
-                );
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Refresh current").clicked() {
-                        self.refresh_experiment_json();
-                    }
-                    if ui.button("Copy JSON").clicked() {
-                        ui.ctx().copy_text(self.experiment_json.clone());
-                        self.experiment_message = Some(("JSON copied to clipboard".to_owned(), false));
-                    }
-                    if ui.button("Load JSON").clicked() {
-                        match ExperimentDocument::from_json(&self.experiment_json) {
-                            Ok(document) => {
-                                self.apply_experiment(document);
-                                self.experiment_message =
-                                    Some(("Experiment loaded".to_owned(), false));
-                            }
-                            Err(error) => {
-                                self.experiment_message = Some((format!("Import failed: {error}"), true));
-                            }
-                        }
-                    }
-                    if ui.button("Close").clicked() {
-                        close_requested = true;
-                    }
-                });
-                if let Some((message, error)) = &self.experiment_message {
-                    let colour = if *error { CORAL } else { BLUE };
-                    ui.label(egui::RichText::new(message).color(colour));
-                }
-            });
-        self.experiment_editor_open = open && !close_requested;
     }
 
     fn orbit_inspector(&mut self, ctx: &egui::Context) {
@@ -4002,7 +3980,8 @@ impl eframe::App for App {
             ui.ctx().request_repaint_after(delay);
         }
 
-        self.experiment_editor(ui.ctx());
+        #[cfg(target_arch = "wasm32")]
+        self.poll_pending_document();
         self.orbit_inspector(ui.ctx());
         self.gradient_editor(ui.ctx());
         self.switch_picker(ui.ctx());
@@ -4199,6 +4178,32 @@ fn default_export_directory() -> String {
 #[cfg(target_arch = "wasm32")]
 fn default_export_directory() -> String {
     String::new()
+}
+
+/// Hands `text` to the browser as a file download.
+#[cfg(target_arch = "wasm32")]
+fn download_text_file(filename: &str, text: &str) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    let document = web_sys::window()
+        .and_then(|window| window.document())
+        .ok_or("no browser document")?;
+    let parts = js_sys::Array::of1(&wasm_bindgen::JsValue::from_str(text));
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type("application/json");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)
+        .map_err(|_| "cannot build the file blob")?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|_| "cannot build the download URL")?;
+    let anchor: web_sys::HtmlAnchorElement = document
+        .create_element("a")
+        .map_err(|_| "cannot create the download link")?
+        .dyn_into()
+        .map_err(|_| "cannot create the download link")?;
+    anchor.set_href(&url);
+    anchor.set_download(filename);
+    anchor.click();
+    let _ = web_sys::Url::revoke_object_url(&url);
+    Ok(())
 }
 
 /// Box-filters `factor`×`factor` blocks of RGBA sRGB pixels down to one, in
