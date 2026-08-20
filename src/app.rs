@@ -1108,6 +1108,8 @@ impl App {
             } else {
                 None
             },
+            animation: (self.animation != ZoomAnimation::default())
+                .then(|| self.animation.clone()),
         }
     }
 
@@ -1282,6 +1284,7 @@ impl App {
             }))
         };
         self.gradient_selected_stop = 0;
+        self.animation = document.animation.unwrap_or_default();
 
         self.zoom_focus = [None, None];
         self.pending_pan_steps = [0.0; 2];
@@ -2752,13 +2755,12 @@ impl App {
     }
 
     fn animation_controls(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            egui::RichText::new(
-                "A zoom dive to the current view's centre: the magnification moves between the start and end exponents at constant (optionally eased) logarithmic speed. One reference orbit serves every frame.",
-            )
-            .small()
-            .color(MUTED),
-        );
+        let description = if self.animation.path_active() {
+            "The camera flies through the waypoints in order — zooming, panning, or both per leg. Each leg renders around its deeper waypoint's reference orbit, so the drift stays exact at any depth; time is apportioned by perceived motion."
+        } else {
+            "A zoom dive to the current view's centre: the magnification moves between the start and end exponents at constant (optionally eased) logarithmic speed. One reference orbit serves every frame. Capture two or more waypoints to fly a path instead."
+        };
+        ui.label(egui::RichText::new(description).small().color(MUTED));
         ui.add(
             egui::Slider::new(&mut self.animation.duration_seconds, 1.0..=180.0)
                 .logarithmic(true)
@@ -2785,29 +2787,33 @@ impl App {
                     .speed(8),
             );
         });
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("zoom 10^").color(MUTED));
-            ui.add(
-                egui::DragValue::new(&mut self.animation.start_magnification_log10)
-                    .range(-3.0..=MAX_DECIMAL_ZOOM_EXPONENT as f64)
-                    .speed(0.25)
-                    .fixed_decimals(2),
-            );
-            ui.label("→ 10^");
-            ui.add(
-                egui::DragValue::new(&mut self.animation.end_magnification_log10)
-                    .range(-3.0..=MAX_DECIMAL_ZOOM_EXPONENT as f64)
-                    .speed(0.25)
-                    .fixed_decimals(2),
-            );
-            if ui
-                .button("= view")
-                .on_hover_text("Set the end magnification to the active pane's current zoom")
-                .clicked()
-            {
-                self.animation.end_magnification_log10 = self.magnification_log10(self.active_pane);
-            }
-        });
+        if !self.animation.path_active() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("zoom 10^").color(MUTED));
+                ui.add(
+                    egui::DragValue::new(&mut self.animation.start_magnification_log10)
+                        .range(-3.0..=MAX_DECIMAL_ZOOM_EXPONENT as f64)
+                        .speed(0.25)
+                        .fixed_decimals(2),
+                );
+                ui.label("→ 10^");
+                ui.add(
+                    egui::DragValue::new(&mut self.animation.end_magnification_log10)
+                        .range(-3.0..=MAX_DECIMAL_ZOOM_EXPONENT as f64)
+                        .speed(0.25)
+                        .fixed_decimals(2),
+                );
+                if ui
+                    .button("= view")
+                    .on_hover_text("Set the end magnification to the active pane's current zoom")
+                    .clicked()
+                {
+                    self.animation.end_magnification_log10 =
+                        self.magnification_log10(self.active_pane);
+                }
+            });
+        }
+        self.waypoint_controls(ui);
         ui.checkbox(&mut self.animation.ease, "Ease in and out");
         ui.checkbox(
             &mut self.animation.scale_iterations,
@@ -2828,6 +2834,102 @@ impl App {
         {
             self.animation_export_controls_web(ui);
         }
+    }
+
+    /// The waypoint list of the animation's flight path: capture the active
+    /// view as a waypoint, reorder or drop waypoints. With two or more, the
+    /// export flies the path instead of the fixed-centre dive.
+    fn waypoint_controls(&mut self, ui: &mut egui::Ui) {
+        let mut remove: Option<usize> = None;
+        let mut swap: Option<usize> = None;
+        let count = self.animation.waypoints.len();
+        for (index, waypoint) in self.animation.waypoints.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let deep = waypoint.exact.is_some();
+                let label = format!(
+                    "{}. 10^{:.2} at {:.6} {} {:.6}i{}",
+                    index + 1,
+                    waypoint.magnification_log10,
+                    waypoint.centre[0],
+                    if waypoint.centre[1] < 0.0 { "−" } else { "+" },
+                    waypoint.centre[1].abs(),
+                    if deep { " (exact deep centre)" } else { "" },
+                );
+                ui.label(egui::RichText::new(label).small().monospace());
+                if ui
+                    .add_enabled(index > 0, egui::Button::new("↑").small())
+                    .clicked()
+                {
+                    swap = Some(index - 1);
+                }
+                if ui
+                    .add_enabled(index + 1 < count, egui::Button::new("↓").small())
+                    .clicked()
+                {
+                    swap = Some(index);
+                }
+                if ui.small_button("✕").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = swap {
+            self.animation.waypoints.swap(index, index + 1);
+        }
+        if let Some(index) = remove {
+            self.animation.waypoints.remove(index);
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.animation.waypoints.len() < animation::MAX_WAYPOINTS,
+                    egui::Button::new("Add waypoint from view"),
+                )
+                .on_hover_text(
+                    "Append the active pane's centre and magnification to the flight path (deep views are captured at full precision)",
+                )
+                .clicked()
+            {
+                self.capture_waypoint();
+            }
+            if !self.animation.waypoints.is_empty() && ui.button("Clear path").clicked() {
+                self.animation.waypoints.clear();
+            }
+        });
+        if self.animation.waypoints.len() == 1 {
+            ui.label(
+                egui::RichText::new(
+                    "One waypoint so far — capture at least one more to fly a path.",
+                )
+                .small()
+                .color(MUTED),
+            );
+        }
+    }
+
+    /// Captures the active pane's location as a path waypoint — the exact
+    /// decimal centre when the view is beyond the f64 handoff.
+    fn capture_waypoint(&mut self) {
+        let pane = self.active_pane;
+        let magnification_log10 = self.magnification_log10(pane);
+        let (centre, exact) = if let Some(view) = &self.deep_views[pane] {
+            (
+                view.centre_preview(),
+                Some((
+                    view.centre.re.exact_decimal(),
+                    view.centre.im.exact_decimal(),
+                )),
+            )
+        } else if pane == 0 {
+            (self.parameter.centre, None)
+        } else {
+            (self.dynamical.centre, None)
+        };
+        self.animation.waypoints.push(animation::ZoomWaypoint {
+            magnification_log10,
+            centre,
+            exact,
+        });
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -2901,29 +3003,44 @@ impl App {
         let pane = self.active_pane;
         let current = self.magnification_log10(pane);
         let mut clamped = false;
-        for target in [
-            &mut animation.start_magnification_log10,
-            &mut animation.end_magnification_log10,
-        ] {
-            if *target > current + 1e-9 {
-                *target = current;
-                clamped = true;
+        if !animation.path_active() {
+            for target in [
+                &mut animation.start_magnification_log10,
+                &mut animation.end_magnification_log10,
+            ] {
+                if *target > current + 1e-9 {
+                    *target = current;
+                    clamped = true;
+                }
             }
         }
-        let scene = match self.freeze_scene(pane) {
+        let path = match self.freeze_path(&animation, pane) {
+            Ok(path) => path,
+            Err(error) => {
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
+        let mut scene = match self.freeze_scene(pane) {
             Ok(scene) => scene,
             Err(error) => {
                 self.export_message = Some((error, true));
                 return;
             }
         };
-        let passes = match self.freeze_passes(pane) {
+        scene.path = path.clone();
+        let mut passes = match self.freeze_passes(pane) {
             Ok(passes) => passes,
             Err(error) => {
                 self.export_message = Some((error, true));
                 return;
             }
         };
+        if let Some(passes) = &mut passes {
+            for pass in passes.iter_mut().filter(|pass| pass.animated) {
+                pass.scene.path = path.clone();
+            }
+        }
         if clamped {
             self.export_message = Some((
                 "Magnification clamped to the current view (zoom further first to go deeper)"
@@ -2975,7 +3092,7 @@ impl App {
                     ctx.request_repaint();
                     return;
                 }
-                let magnification = animation.magnification_log10_at(frame);
+                let view = scene.frame_view(&animation, frame);
                 let sweep = animation.gradient_offset_at(frame);
                 let rgba = if let Some(passes) = &passes {
                     let mut rendered = Vec::with_capacity(passes.len());
@@ -2991,13 +3108,13 @@ impl App {
                             ));
                             continue;
                         }
-                        let pass_magnification = if pass.animated {
-                            magnification
+                        let pass_view = if pass.animated {
+                            view
                         } else {
-                            pass.fixed_magnification
+                            ExportFrameView::fixed(pass.fixed_magnification)
                         };
                         let pass_iterations = if pass.animated {
-                            animation.frame_iterations(pass.scene.iterations, frame)
+                            animation.frame_iterations_at(pass.scene.iterations, view.magnification)
                         } else {
                             pass.scene.iterations
                         };
@@ -3005,7 +3122,7 @@ impl App {
                             .scene
                             .render_region_async(
                                 &render_state,
-                                pass_magnification,
+                                pass_view,
                                 (width, height),
                                 (0, 0),
                                 (width, height),
@@ -3033,11 +3150,12 @@ impl App {
                     }
                     composite_cpu(&rendered)
                 } else {
-                    let iterations = animation.frame_iterations(scene.iterations, frame);
+                    let iterations =
+                        animation.frame_iterations_at(scene.iterations, view.magnification);
                     match scene
                         .render_region_async(
                             &render_state,
-                            magnification,
+                            view,
                             (width, height),
                             (0, 0),
                             (width, height),
@@ -3263,23 +3381,32 @@ impl App {
         let pane = self.active_pane;
         let current = self.magnification_log10(pane);
         let mut clamped = false;
-        for target in [
-            &mut animation.start_magnification_log10,
-            &mut animation.end_magnification_log10,
-        ] {
-            if *target > current + 1e-9 {
-                *target = current;
-                clamped = true;
+        if !animation.path_active() {
+            for target in [
+                &mut animation.start_magnification_log10,
+                &mut animation.end_magnification_log10,
+            ] {
+                if *target > current + 1e-9 {
+                    *target = current;
+                    clamped = true;
+                }
             }
         }
-
-        let scene = match self.freeze_scene(pane) {
+        let path = match self.freeze_path(&animation, pane) {
+            Ok(path) => path,
+            Err(error) => {
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
+        let mut scene = match self.freeze_scene(pane) {
             Ok(scene) => scene,
             Err(error) => {
                 self.export_message = Some((error, true));
                 return;
             }
         };
+        scene.path = path.clone();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
@@ -3291,13 +3418,18 @@ impl App {
             return;
         }
 
-        let passes = match self.freeze_passes(pane) {
+        let mut passes = match self.freeze_passes(pane) {
             Ok(passes) => passes,
             Err(error) => {
                 self.export_message = Some((error, true));
                 return;
             }
         };
+        if let Some(passes) = &mut passes {
+            for pass in passes.iter_mut().filter(|pass| pass.animated) {
+                pass.scene.path = path.clone();
+            }
+        }
         let static_cache = passes
             .as_ref()
             .map_or_else(Vec::new, |passes| vec![None; passes.len()]);
@@ -3396,7 +3528,118 @@ impl App {
             ap_reference,
             f64_reference,
             single_pass: None,
+            path: None,
         })
+    }
+
+    /// Freezes the animation's waypoint flight path: validates it, computes
+    /// the pans in arbitrary precision, and builds one reference orbit per
+    /// anchoring waypoint — arbitrary precision beyond the handoff, f64
+    /// below. Returns `None` when the animation is a fixed-centre dive.
+    fn freeze_path(
+        &mut self,
+        animation: &ZoomAnimation,
+        pane: usize,
+    ) -> Result<Option<Arc<FrozenPath>>, String> {
+        if !animation.path_active() {
+            return Ok(None);
+        }
+        let dynamical = self.pane_is_dynamical(pane);
+        let plan = animation::CameraPath::new(&animation.waypoints)?;
+        let mut anchors: Vec<Option<AnchorReference>> = vec![None; animation.waypoints.len()];
+        for index in plan.anchor_indices() {
+            let reference = self
+                .waypoint_reference(&animation.waypoints[index], dynamical)
+                .map_err(|error| format!("waypoint {index}: {error}"))?;
+            anchors[index] = Some(reference);
+        }
+        Ok(Some(Arc::new(FrozenPath { plan, anchors })))
+    }
+
+    /// The reference orbit set of one anchoring waypoint, mirroring
+    /// `freeze_scene`'s reference construction for the fixed centre.
+    fn waypoint_reference(
+        &mut self,
+        waypoint: &animation::ZoomWaypoint,
+        dynamical: bool,
+    ) -> Result<AnchorReference, String> {
+        self.export_generation += 1;
+        let base = self.export_generation * 4;
+        if !self.family.supports_deep_zoom() {
+            return Ok(AnchorReference {
+                centre: waypoint.centre,
+                ap_reference: None,
+                f64_reference: None,
+            });
+        }
+        let handoff_log = ARBITRARY_HANDOFF_ZOOM.log10();
+        if waypoint.magnification_log10 > handoff_log {
+            let zoom_exponent = (waypoint.magnification_log10.ceil() as u32)
+                .max(handoff_log.ceil() as u32);
+            let centre = match &waypoint.exact {
+                Some((re, im)) => DeepComplex::parse(re, im, zoom_exponent)?,
+                None => DeepComplex::from_f64(waypoint.centre, zoom_exponent)?,
+            };
+            let julia_c = self.deep_julia_c.clone().unwrap_or_else(|| {
+                DeepComplex::from_f64(self.julia_c, zoom_exponent).expect("finite Julia parameter")
+            });
+            let initial = DeepState::initial(self.family, &centre, dynamical, &julia_c)?;
+            let orbit = ReferenceOrbit::family(
+                self.family,
+                &self.family_parameters,
+                initial,
+                self.iterations,
+                self.bailout as f64,
+            )?;
+            let f64_points = orbit
+                .points
+                .iter()
+                .map(|point| [point.re.to_f64(), point.im.to_f64()])
+                .collect::<Vec<_>>();
+            let ap_reference = Some((
+                base + 1,
+                Arc::clone(
+                    &DeepRenderData::from_points(base + 1, 1.0, 0, &orbit.points, false).reference,
+                ),
+            ));
+            let f64_reference = (!f64_points.is_empty()).then(|| {
+                (
+                    base + 2,
+                    Arc::clone(
+                        &DeepRenderData::from_f64_orbit(base + 2, 1.0, &f64_points, true, [0.0; 2])
+                            .reference,
+                    ),
+                )
+            });
+            Ok(AnchorReference {
+                centre: [centre.re.to_f64(), centre.im.to_f64()],
+                ap_reference,
+                f64_reference,
+            })
+        } else {
+            let points = reference_orbit_f64(
+                self.family,
+                &self.family_parameters,
+                initial_state_with(self.family, waypoint.centre, dynamical, self.julia_c),
+                self.iterations,
+                self.bailout as f64,
+            )
+            .points;
+            let f64_reference = (!points.is_empty()).then(|| {
+                (
+                    base + 2,
+                    Arc::clone(
+                        &DeepRenderData::from_f64_orbit(base + 2, 1.0, &points, true, [0.0; 2])
+                            .reference,
+                    ),
+                )
+            });
+            Ok(AnchorReference {
+                centre: waypoint.centre,
+                ap_reference: None,
+                f64_reference,
+            })
+        }
     }
 
     /// Freezes a multi-pass composition: one scene per visible layer, or
@@ -3443,6 +3686,7 @@ impl App {
                         ap_reference: is_deep.then(|| reference.clone()).flatten(),
                         f64_reference: (!is_deep).then(|| reference.clone()).flatten(),
                         single_pass: Some((layer, gradient_base)),
+                        path: None,
                     },
                 }
             } else {
@@ -3459,6 +3703,7 @@ impl App {
                     ap_reference: shared.ap_reference.clone(),
                     f64_reference: shared.f64_reference.clone(),
                     single_pass: None,
+                    path: None,
                 };
                 scene.single_pass = Some((layer.clone(), gradient_base));
                 FrozenPass {
@@ -3595,7 +3840,7 @@ impl App {
                                 .scene
                                 .render_region_async(
                                     &render_state,
-                                    pass_magnification,
+                                    ExportFrameView::fixed(pass_magnification),
                                     full,
                                     origin,
                                     region,
@@ -3625,7 +3870,7 @@ impl App {
                         match scene
                             .render_region_async(
                                 &render_state,
-                                magnification,
+                                ExportFrameView::fixed(magnification),
                                 full,
                                 origin,
                                 region,
@@ -3744,6 +3989,26 @@ impl App {
             self.animation.gradient_sweep_turns = 0.5;
             self.animation.encode_video = search.contains("autotest=video");
             self.start_export_web(ctx);
+        } else if search.contains("autotest=path") {
+            log::info!("autotest: exporting a one-second 320×240 waypoint-path animation");
+            self.animation.duration_seconds = 1.0;
+            self.animation.fps = 12;
+            self.animation.width = 320;
+            self.animation.height = 240;
+            self.animation.encode_video = crate::webvideo::supported();
+            self.animation.waypoints = vec![
+                animation::ZoomWaypoint {
+                    magnification_log10: 0.0,
+                    centre: [-0.5, 0.0],
+                    exact: None,
+                },
+                animation::ZoomWaypoint {
+                    magnification_log10: 1.5,
+                    centre: [-0.7435, 0.1314],
+                    exact: None,
+                },
+            ];
+            self.start_export_web(ctx);
         }
     }
 
@@ -3774,7 +4039,7 @@ impl App {
                 };
                 match pass.scene.render_region(
                     &render_state,
-                    pass_magnification,
+                    ExportFrameView::fixed(pass_magnification),
                     full,
                     origin,
                     region,
@@ -3797,7 +4062,7 @@ impl App {
         } else {
             match job.scene.render_region(
                 &render_state,
-                job.magnification,
+                ExportFrameView::fixed(job.magnification),
                 full,
                 origin,
                 region,
@@ -3854,7 +4119,7 @@ impl App {
         };
         let frame = job.next_frame;
         let total = job.animation.frame_count();
-        let magnification = job.animation.magnification_log10_at(frame);
+        let view = job.scene.frame_view(&job.animation, frame);
         let sweep = job.animation.gradient_offset_at(frame);
         let size = (job.animation.width, job.animation.height);
         let rgba = if let Some(passes) = &job.passes {
@@ -3866,23 +4131,21 @@ impl App {
                     rendered.push((cached.clone(), pass.merge_mode, pass.opacity, pass.mask));
                     continue;
                 }
-                let pass_magnification = if pass.animated {
-                    magnification
+                let pass_view = if pass.animated {
+                    view
                 } else {
-                    pass.fixed_magnification
+                    ExportFrameView::fixed(pass.fixed_magnification)
                 };
                 let pass_iterations = if pass.animated {
-                    job.animation.frame_iterations(pass.scene.iterations, frame)
+                    job.animation
+                        .frame_iterations_at(pass.scene.iterations, view.magnification)
                 } else {
                     pass.scene.iterations
                 };
-                match pass.scene.render_frame(
-                    &render_state,
-                    pass_magnification,
-                    size,
-                    sweep,
-                    pass_iterations,
-                ) {
+                match pass
+                    .scene
+                    .render_frame(&render_state, pass_view, size, sweep, pass_iterations)
+                {
                     Ok(image) => {
                         if cacheable {
                             job.static_cache[index] = Some(image.clone());
@@ -3902,10 +4165,12 @@ impl App {
             }
             composite_cpu(&rendered)
         } else {
-            let iterations = job.animation.frame_iterations(job.scene.iterations, frame);
+            let iterations = job
+                .animation
+                .frame_iterations_at(job.scene.iterations, view.magnification);
             match job
                 .scene
-                .render_frame(&render_state, magnification, size, sweep, iterations)
+                .render_frame(&render_state, view, size, sweep, iterations)
             {
                 Ok(rgba) => rgba,
                 Err(error) => {
@@ -5141,6 +5406,53 @@ struct FrozenScene {
     /// composition — full opacity, Normal mode, its gradient at the given
     /// base offset — and the compositor merges the results.
     single_pass: Option<(Layer, usize)>,
+    /// The waypoint flight path, when the export flies one: the sampling
+    /// plan plus one reference set per anchoring waypoint, shared by every
+    /// animated pass. `None` renders the classic fixed-centre dive.
+    path: Option<Arc<FrozenPath>>,
+}
+
+/// A frozen camera path: the pure sampling plan plus the reference orbits
+/// of the waypoints that anchor its segments.
+struct FrozenPath {
+    plan: animation::CameraPath,
+    /// Indexed by waypoint; `None` for waypoints that anchor no segment.
+    anchors: Vec<Option<AnchorReference>>,
+}
+
+/// The reference orbit set of one anchoring waypoint, mirroring the frozen
+/// scene's own reference fields: the arbitrary-precision orbit beyond the
+/// handoff, its f64 projection below it.
+#[derive(Clone)]
+struct AnchorReference {
+    /// f64 projection of the waypoint centre.
+    centre: [f64; 2],
+    ap_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
+    f64_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
+}
+
+/// One export frame's camera: its magnification, which reference anchors it
+/// (a path waypoint, or the scene's own fixed centre), and the frame
+/// centre's screen-space drift from that anchor.
+#[derive(Clone, Copy)]
+struct ExportFrameView {
+    magnification: f64,
+    /// Path waypoint anchoring the frame; `None` uses the scene's centre
+    /// and references.
+    anchor: Option<usize>,
+    /// Frame centre relative to the anchor, in units of the frame
+    /// half-height.
+    screen_offset: [f64; 2],
+}
+
+impl ExportFrameView {
+    fn fixed(magnification: f64) -> Self {
+        Self {
+            magnification,
+            anchor: None,
+            screen_offset: [0.0; 2],
+        }
+    }
 }
 
 /// One frozen layer of a multi-pass export: a scene rendering one layer,
@@ -5158,29 +5470,37 @@ struct FrozenPass {
 }
 
 impl FrozenScene {
-    /// Renders one frame of this scene at `magnification` through the
-    /// export pipeline. Reference selection mirrors the interactive
-    /// renderer: plain f32 for families without perturbation, the f64
-    /// reference below the handoff, the arbitrary-precision reference
-    /// beyond it. `sweep` is added to every layer's gradient offsets.
+    /// The camera of one animation frame: a sample of the flight path when
+    /// the scene carries one, the fixed-centre dive otherwise.
+    fn frame_view(&self, animation: &ZoomAnimation, frame: usize) -> ExportFrameView {
+        match &self.path {
+            Some(path) => {
+                let sample = path.plan.at(animation.eased_progress(frame));
+                ExportFrameView {
+                    magnification: sample.magnification_log10,
+                    anchor: Some(sample.anchor),
+                    screen_offset: sample.screen_offset,
+                }
+            }
+            None => ExportFrameView::fixed(animation.magnification_log10_at(frame)),
+        }
+    }
+
+    /// Renders one frame of this scene through the export pipeline.
+    /// Reference selection mirrors the interactive renderer: plain f32 for
+    /// families without perturbation, the f64 reference below the handoff,
+    /// the arbitrary-precision reference beyond it. `sweep` is added to
+    /// every layer's gradient offsets.
     #[cfg(not(target_arch = "wasm32"))]
     fn render_frame(
         &self,
         render_state: &eframe::egui_wgpu::RenderState,
-        magnification: f64,
+        view: ExportFrameView,
         size: (u32, u32),
         sweep: f32,
         iterations: u32,
     ) -> Result<Vec<u8>, String> {
-        self.render_region(
-            render_state,
-            magnification,
-            size,
-            (0, 0),
-            size,
-            sweep,
-            iterations,
-        )
+        self.render_region(render_state, view, size, (0, 0), size, sweep, iterations)
     }
 
     /// The uniforms, colouring block and reference upload of one region
@@ -5191,7 +5511,7 @@ impl FrozenScene {
     #[allow(clippy::too_many_arguments)]
     fn region_inputs(
         &self,
-        magnification: f64,
+        view: ExportFrameView,
         full_size: (u32, u32),
         origin: (u32, u32),
         region_size: (u32, u32),
@@ -5202,26 +5522,50 @@ impl FrozenScene {
         ColouringUniforms,
         Option<(u64, &[GpuReferencePoint])>,
     ) {
+        let magnification = view.magnification;
         let handoff_log = ARBITRARY_HANDOFF_ZOOM.log10();
-        let region = animation::region_view(magnification, full_size, origin, region_size);
-        let reference = if magnification > handoff_log {
-            self.ap_reference
-                .as_ref()
-                .map(|r| (r.0, r.1.as_slice(), false))
-        } else {
-            self.f64_reference
-                .as_ref()
-                .map(|r| (r.0, r.1.as_slice(), true))
-                .or_else(|| {
-                    self.ap_reference
-                        .as_ref()
-                        .map(|r| (r.0, r.1.as_slice(), false))
-                })
+        // A drifting frame renders around its anchor waypoint's reference
+        // orbit: the anchor sits −screen_offset from the frame centre.
+        let region = animation::region_view(
+            magnification,
+            full_size,
+            origin,
+            region_size,
+            [-view.screen_offset[0], -view.screen_offset[1]],
+        );
+        let (anchor_centre, ap_reference, f64_reference) = match view
+            .anchor
+            .and_then(|index| self.path.as_ref()?.anchors.get(index)?.as_ref())
+        {
+            Some(anchor) => (
+                anchor.centre,
+                anchor.ap_reference.as_ref(),
+                anchor.f64_reference.as_ref(),
+            ),
+            None => (
+                self.centre,
+                self.ap_reference.as_ref(),
+                self.f64_reference.as_ref(),
+            ),
         };
+        let reference = if magnification > handoff_log {
+            ap_reference.map(|r| (r.0, r.1.as_slice(), false))
+        } else {
+            f64_reference
+                .map(|r| (r.0, r.1.as_slice(), true))
+                .or_else(|| ap_reference.map(|r| (r.0, r.1.as_slice(), false)))
+        };
+        // The f64 frame centre only drives the shallow non-perturbation
+        // paths; the drift underflows harmlessly at depth.
+        let half_frame = animation::frame_half_height_f64(magnification);
+        let centre = [
+            anchor_centre[0] + view.screen_offset[0] * half_frame,
+            anchor_centre[1] + view.screen_offset[1] * half_frame,
+        ];
         let mut uniforms = Uniforms::new(
             [
-                self.centre[0] + region.centre_shift[0],
-                self.centre[1] + region.centre_shift[1],
+                centre[0] + region.centre_shift[0],
+                centre[1] + region.centre_shift[1],
             ],
             region.half_height_f64,
             region.aspect,
@@ -5278,21 +5622,15 @@ impl FrozenScene {
     fn render_region(
         &self,
         render_state: &eframe::egui_wgpu::RenderState,
-        magnification: f64,
+        view: ExportFrameView,
         full_size: (u32, u32),
         origin: (u32, u32),
         region_size: (u32, u32),
         sweep: f32,
         iterations: u32,
     ) -> Result<Vec<u8>, String> {
-        let (uniforms, colouring_uniforms, reference) = self.region_inputs(
-            magnification,
-            full_size,
-            origin,
-            region_size,
-            sweep,
-            iterations,
-        );
+        let (uniforms, colouring_uniforms, reference) =
+            self.region_inputs(view, full_size, origin, region_size, sweep, iterations);
         let renderer = render_state.renderer.read();
         let pipeline = renderer
             .callback_resources
@@ -5317,7 +5655,7 @@ impl FrozenScene {
     async fn render_region_async(
         &self,
         render_state: &eframe::egui_wgpu::RenderState,
-        magnification: f64,
+        view: ExportFrameView,
         full_size: (u32, u32),
         origin: (u32, u32),
         region_size: (u32, u32),
@@ -5325,14 +5663,8 @@ impl FrozenScene {
         iterations: u32,
     ) -> Result<Vec<u8>, String> {
         let receiver = {
-            let (uniforms, colouring_uniforms, reference) = self.region_inputs(
-                magnification,
-                full_size,
-                origin,
-                region_size,
-                sweep,
-                iterations,
-            );
+            let (uniforms, colouring_uniforms, reference) =
+                self.region_inputs(view, full_size, origin, region_size, sweep, iterations);
             let renderer = render_state.renderer.read();
             let pipeline = renderer
                 .callback_resources

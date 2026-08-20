@@ -2854,6 +2854,7 @@ mod tests {
             gradient_sweep_turns: 0.25,
             encode_video: false,
             scale_iterations: false,
+            waypoints: Vec::new(),
         };
         assert_eq!(animation.frame_count(), 5);
         let handoff_log = crate::arbitrary::ARBITRARY_HANDOFF_ZOOM.log10();
@@ -3167,7 +3168,7 @@ mod tests {
             (256, 176),
         );
         // region_view quadrant.
-        let region = region_view(0.0, full, (256, 0), (256, 176));
+        let region = region_view(0.0, full, (256, 0), (256, 176), [0.0; 2]);
         eprintln!("region = {region:?}");
         let via_region = render(
             [
@@ -3284,7 +3285,7 @@ mod tests {
         // the plain f32 path and the deep Julia view on the AP path.
         for (magnification, julia, label) in [(0.0f64, false, "shallow"), (30.0, true, "deep")] {
             let render_region = |origin: (u32, u32), size: (u32, u32)| -> Vec<u8> {
-                let region = region_view(magnification, full, origin, size);
+                let region = region_view(magnification, full, origin, size, [0.0; 2]);
                 let centre = if julia { deep_centre } else { [-0.6, 0.0] };
                 let mut uniforms = Uniforms::new(
                     [
@@ -4896,6 +4897,203 @@ mod tests {
                     distinct.len()
                 );
             }
+        }
+    }
+
+    /// The exactness guarantee of keyframed centre drift: a frame rendered
+    /// around its anchor waypoint's reference orbit — the anchor sitting
+    /// several half-heights off the frame centre, exactly as `region_view`
+    /// describes a drifting path frame — must match the same view rendered
+    /// around its own centred reference orbit. Checked with the f64
+    /// reference path at 1e11 and the arbitrary-precision path at 1e30.
+    #[test]
+    #[ignore]
+    fn gpu_path_drift_matches_recentred_render() {
+        use crate::animation::{frame_half_height_f64, region_view};
+        use crate::arbitrary::{DeepComplex, DeepReal, DeepState, DeepView, ReferenceOrbit};
+        use crate::family::{
+            FamilyParameters, FractalFamily, initial_state_with, reference_orbit_f64,
+        };
+
+        let gpu = GpuHarness::new(384, 256);
+        let size = (384u32, 256u32);
+        let parameters = FamilyParameters::default();
+        let family = FractalFamily::Quadratic;
+        let iterations = 512u32;
+        // The frame centre's drift from the anchor, in units of the frame
+        // half-height — a mid-segment path frame. Chosen so the drifted view
+        // also lands on integer pixels of a 4× anchor-centred frame, for the
+        // tiling cross-check below.
+        let drift = [2.5f64, -1.25];
+        let compare = |label: &str, drifted: &[u8], direct: &[u8]| {
+            let distinct: std::collections::HashSet<&[u8]> = drifted.chunks(3).collect();
+            let distinct_direct: std::collections::HashSet<&[u8]> = direct.chunks(3).collect();
+            eprintln!(
+                "path drift {label}: {} distinct colours drifted, {} direct",
+                distinct.len(),
+                distinct_direct.len()
+            );
+            assert!(
+                distinct.len() > 100,
+                "{label}: the drifted render collapsed ({} distinct colours)",
+                distinct.len()
+            );
+            let mut differing = 0usize;
+            let total = drifted.len() / 3;
+            for (a, b) in drifted.chunks(3).zip(direct.chunks(3)) {
+                let delta: i32 = (0..3)
+                    .map(|k| (a[k] as i32 - b[k] as i32).abs())
+                    .sum();
+                if delta > 60 {
+                    differing += 1;
+                }
+            }
+            let share = 100.0 * differing as f64 / total as f64;
+            eprintln!("path drift {label}: {share:.3}% of pixels differ");
+            assert!(
+                share < 2.0,
+                "{label}: drifted render diverges from the recentred one ({share:.2}%)"
+            );
+        };
+
+        // f64-reference depth: anchor on a boundary point at 1e11.
+        {
+            let magnification = 11.0f64;
+            let plane = family.default_parameter_view();
+            let anchor = boundary_point(
+                family,
+                &parameters,
+                plane.centre,
+                plane.half_height,
+                false,
+                family.default_parameter(),
+                iterations,
+            )
+            .unwrap();
+            let half = frame_half_height_f64(magnification);
+            let frame_centre = [anchor[0] + drift[0] * half, anchor[1] + drift[1] * half];
+            let render = |reference_centre: [f64; 2], offset: [f64; 2], centre: [f64; 2]| {
+                let orbit = reference_orbit_f64(
+                    family,
+                    &parameters,
+                    initial_state_with(family, reference_centre, false, family.default_parameter()),
+                    iterations,
+                    4.0,
+                );
+                let data = DeepRenderData::from_f64_orbit(1, 1.0, &orbit.points, true, [0.0; 2]);
+                let region = region_view(magnification, size, (0, 0), size, offset);
+                let uniforms = Uniforms::new(
+                    centre,
+                    region.half_height_f64,
+                    gpu.aspect(),
+                    family.default_parameter(),
+                    iterations,
+                    4.0,
+                    family.shader_flag(),
+                    0,
+                    true,
+                    false,
+                    PrecisionMode::DoubleSingle,
+                    parameters.uniform_words(false),
+                )
+                .enable_perturbation(
+                    region.scale_mantissa,
+                    region.scale_exponent,
+                    data.reference.len(),
+                    true,
+                    region.reference_offset,
+                );
+                gpu.render(0, uniforms, Some(data.reference.as_slice()))
+            };
+            let drifted = render(anchor, [-drift[0], -drift[1]], frame_centre);
+            let direct = render(frame_centre, [0.0; 2], frame_centre);
+            compare("f64 at 1e11", &drifted, &direct);
+        }
+
+        // Arbitrary-precision depth: anchor on a repelling fixed point of a
+        // Julia set at 1e30. A recentred reference orbit is no comparator
+        // here — any point off the fixed point escapes after a few hundred
+        // iterations — so the drifted frame is checked against the same view
+        // described as a region of a larger anchor-centred frame: the pinned
+        // tiling mechanism, around the same reference orbit.
+        {
+            let zoom_exponent = 30u32;
+            let precision_exponent = zoom_exponent + 40;
+            let magnification = zoom_exponent as f64;
+            let c_f64 = family.default_parameter();
+            let c = DeepComplex::from_f64(c_f64, precision_exponent).unwrap();
+            let (fixed_point, _) = [[0.6, 0.4], [-0.5, 0.7], [1.1, -0.3]]
+                .iter()
+                .filter_map(|start| {
+                    repelling_fixed_point(family, &parameters, &c, *start, precision_exponent)
+                })
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .expect("a repelling fixed point");
+            let anchor_view = DeepView {
+                centre: fixed_point.clone(),
+                half_height: DeepReal::parse(
+                    &format!("1.45e-{zoom_exponent}"),
+                    precision_exponent,
+                )
+                .unwrap(),
+                zoom_exponent: precision_exponent,
+                magnification_log10: magnification,
+            };
+            let mut frame_view = anchor_view.clone();
+            frame_view.recenter_local(drift).unwrap();
+            let initial = DeepState::initial(family, &anchor_view.centre, true, &c).unwrap();
+            let orbit =
+                ReferenceOrbit::family(family, &parameters, initial, iterations, 4.0).unwrap();
+            let data = DeepRenderData::from_points(1, 1.0, 0, &orbit.points, false);
+            let render = |centre: [f64; 2], region: crate::animation::RegionView| {
+                let uniforms = Uniforms::new(
+                    centre,
+                    region.half_height_f64,
+                    region.aspect,
+                    c_f64,
+                    iterations,
+                    4.0,
+                    family.shader_flag(),
+                    1,
+                    true,
+                    false,
+                    PrecisionMode::DoubleSingle,
+                    parameters.uniform_words(true),
+                )
+                .enable_perturbation(
+                    region.scale_mantissa,
+                    region.scale_exponent,
+                    data.reference.len(),
+                    false,
+                    region.reference_offset,
+                );
+                gpu.render(0, uniforms, Some(data.reference.as_slice()))
+            };
+            // The path mechanism: a whole frame drifted off its anchor.
+            let drifted = render(
+                frame_view.centre_preview(),
+                region_view(magnification, size, (0, 0), size, [-drift[0], -drift[1]]),
+            );
+            // The tiling mechanism: the same pixels as a region of a 4×
+            // anchor-centred frame (one half-height = size.1/2 pixels there).
+            let full = (size.0 * 4, size.1 * 4);
+            let pixels_per_half = f64::from(size.1) / 2.0;
+            let origin = (
+                (f64::from(full.0) / 2.0 + drift[0] * pixels_per_half - f64::from(size.0) / 2.0)
+                    as u32,
+                (f64::from(full.1) / 2.0 - drift[1] * pixels_per_half - f64::from(size.1) / 2.0)
+                    as u32,
+            );
+            let tile_region =
+                region_view(magnification - 4f64.log10(), full, origin, size, [0.0; 2]);
+            let tiled = render(
+                [
+                    anchor_view.centre_preview()[0] + tile_region.centre_shift[0],
+                    anchor_view.centre_preview()[1] + tile_region.centre_shift[1],
+                ],
+                tile_region,
+            );
+            compare("arbitrary precision at 1e30", &drifted, &tiled);
         }
     }
 }

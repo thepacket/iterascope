@@ -7,7 +7,7 @@ use crate::colouring::{Colouring, Layer, MAX_LAYERS};
 use crate::family::{FamilyParameters, FractalFamily, Linkage};
 
 pub(crate) const FORMAT_ID: &str = "iterascope-experiment";
-pub(crate) const FORMAT_VERSION: u32 = 7;
+pub(crate) const FORMAT_VERSION: u32 = 8;
 /// Largest escape radius a document may ask for. Large radii give the
 /// triangle-inequality and stripe colourings their smoothest results.
 pub(crate) const MAX_BAILOUT: f32 = 1e10;
@@ -55,6 +55,10 @@ pub(crate) struct ExperimentDocument {
     pub(crate) deep_dynamical_plane: Option<DeepPlaneDocument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) deep_parameter_c: Option<DeepComplexDocument>,
+    /// The zoom animation settings, flight-path waypoints included, when
+    /// they differ from the defaults (format version 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) animation: Option<crate::animation::ZoomAnimation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -268,6 +272,14 @@ impl ExperimentDocument {
                 return Err("a document records either layers or colouring, not both".to_owned());
             }
         }
+        if let Some(animation) = &self.animation {
+            if self.version < 8 {
+                return Err("animation settings require document version 8".to_owned());
+            }
+            animation
+                .validate()
+                .map_err(|error| format!("animation: {error}"))?;
+        }
         if !self.display.palette_phase.is_finite()
             || !(-1.0..=1.0).contains(&self.display.palette_phase)
         {
@@ -423,7 +435,39 @@ mod tests {
             deep_parameter_plane: None,
             deep_dynamical_plane: None,
             deep_parameter_c: None,
+            animation: None,
         }
+    }
+
+    #[test]
+    fn animation_with_waypoints_round_trips_and_needs_version_8() {
+        let mut document = example();
+        let mut animation = crate::animation::ZoomAnimation::default();
+        animation.waypoints = vec![
+            crate::animation::ZoomWaypoint {
+                magnification_log10: 0.0,
+                centre: [-0.5, 0.0],
+                exact: None,
+            },
+            crate::animation::ZoomWaypoint {
+                magnification_log10: 52.0,
+                centre: [-0.743, 0.131],
+                exact: Some(("-7.43e-1".to_owned(), "1.31e-1".to_owned())),
+            },
+        ];
+        document.animation = Some(animation);
+        let json = document.to_pretty_json().unwrap();
+        assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
+        document.version = 7;
+        assert!(document.validate().is_err());
+        document.version = FORMAT_VERSION;
+        document
+            .animation
+            .as_mut()
+            .unwrap()
+            .waypoints[0]
+            .magnification_log10 = f64::INFINITY;
+        assert!(document.validate().is_err());
     }
 
     #[test]

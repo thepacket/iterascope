@@ -1,16 +1,26 @@
 //! Zoom-path animation: a camera path through log-magnification, sampled
 //! into frames for the image-sequence exporter.
 //!
-//! The path model is deliberately the one deep-zoom videos actually use: a
-//! fixed centre (the deep target the user navigated to) and a magnification
-//! that moves through decades of zoom at constant — optionally eased —
-//! logarithmic speed. Because the centre never moves, one reference orbit
-//! serves every frame: the arbitrary-precision orbit of the centre is
-//! re-described (new scale mantissa and exponent) per frame instead of being
-//! rebuilt, so exporting a 10^1000× dive costs one orbit, not one per frame.
+//! The base model is the one deep-zoom videos actually use: a fixed centre
+//! (the deep target the user navigated to) and a magnification that moves
+//! through decades of zoom at constant — optionally eased — logarithmic
+//! speed. Because the centre never moves, one reference orbit serves every
+//! frame: the arbitrary-precision orbit of the centre is re-described (new
+//! scale mantissa and exponent) per frame instead of being rebuilt, so
+//! exporting a 10^1000× dive costs one orbit, not one per frame.
+//!
+//! With two or more captured [`ZoomWaypoint`]s the camera instead flies a
+//! [`CameraPath`]: the centre drifts between waypoints while the
+//! magnification follows them. Each path segment anchors on its deeper
+//! endpoint's reference orbit, and the drifting centre is expressed as a
+//! small screen-space offset from that anchor — the same off-centre-reference
+//! mechanism the tiled still exporter uses — so drift stays exact at any
+//! depth, one reference orbit per segment.
+//!
 //! An optional gradient sweep advances both colouring offsets across the
 //! animation for the classic slowly-turning-palette look.
 
+use crate::arbitrary::DeepReal;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_DIMENSION: u32 = 8_192;
@@ -43,7 +53,37 @@ pub(crate) struct ZoomAnimation {
     /// frames — whose structure resolves in far fewer iterations — use
     /// proportionally fewer, which speeds long dives up considerably.
     pub(crate) scale_iterations: bool,
+    /// Captured camera waypoints. With fewer than two the animation is the
+    /// classic fixed-centre dive between the start and end exponents; with
+    /// two or more, the camera flies the waypoint path and the exponents
+    /// above are ignored.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) waypoints: Vec<ZoomWaypoint>,
 }
+
+/// One waypoint of a keyframed camera path: a location and magnification
+/// captured from a view. `centre` is the f64 projection used for display and
+/// the shallow render paths; `exact` carries the full decimal centre when
+/// the waypoint was captured beyond f64 resolution.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ZoomWaypoint {
+    pub(crate) magnification_log10: f64,
+    pub(crate) centre: [f64; 2],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) exact: Option<(String, String)>,
+}
+
+pub(crate) const MAX_WAYPOINTS: usize = 64;
+/// The farthest a segment's shallow endpoint may sit from its deep anchor,
+/// in units of the shallow half-height: the offset reaches the shader as an
+/// f32, whose resolution at this magnitude is still ~1/100 pixel.
+const MAX_PAN_HALF_HEIGHTS: f64 = 20_000.0;
+/// Perceptual exchange rate between panning and zooming, decades per
+/// half-height: zooming at r decades/s moves a mid-frame pixel about as fast
+/// as panning at r·ln 10 half-heights/s, so a pan of x half-heights reads
+/// like x/ln 10 decades when apportioning time along the path.
+const PAN_DECADES_PER_HALF_HEIGHT: f64 = std::f64::consts::LOG10_E;
 
 impl Default for ZoomAnimation {
     fn default() -> Self {
@@ -58,6 +98,7 @@ impl Default for ZoomAnimation {
             gradient_sweep_turns: 0.0,
             encode_video: true,
             scale_iterations: true,
+            waypoints: Vec::new(),
         }
     }
 }
@@ -85,6 +126,17 @@ impl ZoomAnimation {
         }
     }
 
+    /// Eased progress of `frame`, the sampling parameter for [`CameraPath`].
+    pub(crate) fn eased_progress(&self, frame: usize) -> f64 {
+        self.eased(self.progress(frame))
+    }
+
+    /// Whether the animation flies a waypoint path rather than the
+    /// fixed-centre dive.
+    pub(crate) fn path_active(&self) -> bool {
+        self.waypoints.len() >= 2
+    }
+
     /// log10 of the magnification of `frame`.
     pub(crate) fn magnification_log10_at(&self, frame: usize) -> f64 {
         let u = self.eased(self.progress(frame));
@@ -100,17 +152,26 @@ impl ZoomAnimation {
 
     /// The deepest magnification any frame reaches.
     pub(crate) fn max_magnification_log10(&self) -> f64 {
-        self.start_magnification_log10
-            .max(self.end_magnification_log10)
+        if self.path_active() {
+            self.waypoints
+                .iter()
+                .map(|waypoint| waypoint.magnification_log10)
+                .fold(f64::NEG_INFINITY, f64::max)
+        } else {
+            self.start_magnification_log10
+                .max(self.end_magnification_log10)
+        }
     }
 
-    /// The iteration budget of `frame`. The budget the user set applies to
-    /// the deepest frame of the path; with iteration scaling on, shallower
-    /// frames interpolate linearly in log-magnification down to a floor —
-    /// escape times near a boundary grow roughly linearly with the zoom
-    /// exponent, so early frames of a deep dive need only a fraction of the
-    /// final budget.
-    pub(crate) fn frame_iterations(&self, user_iterations: u32, frame: usize) -> u32 {
+    /// The iteration budget of a frame rendered at `magnification_log10`
+    /// (the exporters sample the magnification first — off the fixed dive
+    /// or off the waypoint path — then budget from it). The budget the user
+    /// set applies to the deepest frame of the animation; with iteration
+    /// scaling on, shallower frames interpolate linearly in
+    /// log-magnification down to a floor — escape times near a boundary
+    /// grow roughly linearly with the zoom exponent, so early frames of a
+    /// deep dive need only a fraction of the final budget.
+    pub(crate) fn frame_iterations_at(&self, user_iterations: u32, magnification_log10: f64) -> u32 {
         if !self.scale_iterations {
             return user_iterations;
         }
@@ -119,7 +180,7 @@ impl ZoomAnimation {
         if deepest <= 1e-9 {
             return user_iterations;
         }
-        let share = (self.magnification_log10_at(frame) / deepest).clamp(0.0, 1.0);
+        let share = (magnification_log10 / deepest).clamp(0.0, 1.0);
         let budget = floor as f64 + (user_iterations as f64 - floor as f64) * share;
         (budget.round() as u32).clamp(floor.min(user_iterations), user_iterations)
     }
@@ -151,8 +212,194 @@ impl ZoomAnimation {
         if !self.gradient_sweep_turns.is_finite() || self.gradient_sweep_turns.abs() > 100.0 {
             return Err("gradient sweep must be between -100 and 100 turns".to_owned());
         }
+        if self.waypoints.len() > MAX_WAYPOINTS {
+            return Err(format!("a camera path may hold at most {MAX_WAYPOINTS} waypoints"));
+        }
+        for (index, waypoint) in self.waypoints.iter().enumerate() {
+            if !waypoint.magnification_log10.is_finite()
+                || !(-3.0..=5_000.0).contains(&waypoint.magnification_log10)
+            {
+                return Err(format!(
+                    "waypoint {index}: magnification exponent must be between -3 and 5000"
+                ));
+            }
+            if !waypoint.centre[0].is_finite() || !waypoint.centre[1].is_finite() {
+                return Err(format!("waypoint {index}: centre must be finite"));
+            }
+            if let Some((re, im)) = &waypoint.exact
+                && (re.trim().is_empty() || im.trim().is_empty())
+            {
+                return Err(format!("waypoint {index}: exact centre must not be empty"));
+            }
+        }
         Ok(())
     }
+}
+
+/// One frame of a [`CameraPath`], everything the exporter needs beyond the
+/// per-waypoint reference orbits it holds itself.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PathFrame {
+    pub(crate) magnification_log10: f64,
+    /// Index of the waypoint whose reference orbit anchors this frame.
+    pub(crate) anchor: usize,
+    /// Frame centre relative to the anchor, in units of the frame
+    /// half-height (screen space): world offset = `screen_offset × h`.
+    pub(crate) screen_offset: [f64; 2],
+}
+
+struct CameraSegment {
+    m_from: f64,
+    m_to: f64,
+    /// Offset of the shallow endpoint's centre from the deep endpoint's, in
+    /// units of the shallow half-height.
+    pan: [f64; 2],
+    /// Whether the segment's deeper endpoint — its reference anchor — is
+    /// the destination waypoint.
+    anchor_is_to: bool,
+    length: f64,
+}
+
+/// A precomputed flight path through the animation's waypoints.
+///
+/// Each segment anchors on its deeper endpoint: that waypoint's reference
+/// orbit serves every frame of the segment, and the frame centre approaches
+/// it along `centre(v) = anchor + pan·v·h(v)`, where `v` is the progress
+/// from the anchor and `h(v)` the frame half-height (log-interpolated). The
+/// centre's screen-space offset from the anchor is therefore `pan·v` —
+/// linear, bounded by the pan distance and independent of depth — which is
+/// exactly the off-centre-reference form the tiled still exporter already
+/// renders, so drift is as exact as tiling at any magnification. For a pure
+/// zoom (`pan = 0`) it degenerates to the fixed-centre dive; for a pure pan
+/// (equal magnifications) to a linear glide.
+///
+/// Frame time is apportioned across segments by a perceptual arc length
+/// mixing decades of zoom with screen-space pan, so the visual speed stays
+/// steady through waypoints.
+pub(crate) struct CameraPath {
+    segments: Vec<CameraSegment>,
+    /// Normalised cumulative-length boundaries, `segments.len() + 1` values
+    /// from 0 to 1.
+    cumulative: Vec<f64>,
+}
+
+impl CameraPath {
+    pub(crate) fn new(waypoints: &[ZoomWaypoint]) -> Result<Self, String> {
+        if waypoints.len() < 2 {
+            return Err("a camera path needs at least two waypoints".to_owned());
+        }
+        let mut segments = Vec::with_capacity(waypoints.len() - 1);
+        for (index, pair) in waypoints.windows(2).enumerate() {
+            let (from, to) = (&pair[0], &pair[1]);
+            let anchor_is_to = to.magnification_log10 >= from.magnification_log10;
+            let (deep, shallow) = if anchor_is_to { (to, from) } else { (from, to) };
+            let pan = waypoint_pan(deep, shallow)
+                .map_err(|error| format!("waypoints {index}–{}: {error}", index + 1))?;
+            let pan_norm = pan[0].hypot(pan[1]);
+            if pan_norm > MAX_PAN_HALF_HEIGHTS {
+                return Err(format!(
+                    "waypoints {index}–{}: the pan between them spans {pan_norm:.0} half-heights \
+                     of the shallower view (at most {MAX_PAN_HALF_HEIGHTS:.0}); add a waypoint at \
+                     a lower magnification between them",
+                    index + 1
+                ));
+            }
+            let dm = to.magnification_log10 - from.magnification_log10;
+            let length = dm
+                .hypot(pan_norm * PAN_DECADES_PER_HALF_HEIGHT)
+                .max(1e-9);
+            segments.push(CameraSegment {
+                m_from: from.magnification_log10,
+                m_to: to.magnification_log10,
+                pan,
+                anchor_is_to,
+                length,
+            });
+        }
+        let total: f64 = segments.iter().map(|segment| segment.length).sum();
+        let mut cumulative = Vec::with_capacity(segments.len() + 1);
+        cumulative.push(0.0);
+        let mut sum = 0.0;
+        for segment in &segments {
+            sum += segment.length;
+            cumulative.push(sum / total);
+        }
+        cumulative[segments.len()] = 1.0;
+        Ok(Self {
+            segments,
+            cumulative,
+        })
+    }
+
+    /// The camera at eased progress `s ∈ [0, 1]` along the path.
+    pub(crate) fn at(&self, s: f64) -> PathFrame {
+        let s = s.clamp(0.0, 1.0);
+        let index = self
+            .cumulative
+            .windows(2)
+            .position(|bounds| s <= bounds[1])
+            .unwrap_or(self.segments.len() - 1);
+        let span = self.cumulative[index + 1] - self.cumulative[index];
+        let t = if span > 0.0 {
+            ((s - self.cumulative[index]) / span).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let segment = &self.segments[index];
+        let v = if segment.anchor_is_to { 1.0 - t } else { t };
+        PathFrame {
+            magnification_log10: segment.m_from + (segment.m_to - segment.m_from) * t,
+            anchor: index + usize::from(segment.anchor_is_to),
+            screen_offset: [segment.pan[0] * v, segment.pan[1] * v],
+        }
+    }
+
+    /// The sorted waypoint indices that anchor at least one segment — the
+    /// waypoints whose reference orbits the exporter must compute.
+    pub(crate) fn anchor_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = self
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(index, segment)| index + usize::from(segment.anchor_is_to))
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+}
+
+/// The offset of `shallow`'s centre from `deep`'s, in units of the shallow
+/// half-height. Computed in decimal arbitrary precision — the difference of
+/// two deep centres cancels catastrophically in f64 — then lifted into f64
+/// range by the exact power of ten before the final small division.
+fn waypoint_pan(deep: &ZoomWaypoint, shallow: &ZoomWaypoint) -> Result<[f64; 2], String> {
+    let ms = shallow.magnification_log10;
+    let zoom_exponent = ms.ceil().max(0.0) as u32 + 40;
+    let parse = |waypoint: &ZoomWaypoint| -> Result<(DeepReal, DeepReal), String> {
+        match &waypoint.exact {
+            Some((re, im)) => Ok((
+                DeepReal::parse(re, zoom_exponent)?,
+                DeepReal::parse(im, zoom_exponent)?,
+            )),
+            None => Ok((
+                DeepReal::from_f64(waypoint.centre[0], zoom_exponent)?,
+                DeepReal::from_f64(waypoint.centre[1], zoom_exponent)?,
+            )),
+        }
+    };
+    let (deep_re, deep_im) = parse(deep)?;
+    let (shallow_re, shallow_im) = parse(shallow)?;
+    // h_shallow = 1.45 × 10^−ms. Divide in two steps so every intermediate
+    // stays representable: lift the exact decimal difference by 10^⌈ms⌉
+    // (an exact power of ten), then divide by the remaining f64 factor
+    // 1.45 × 10^{⌈ms⌉−ms} ∈ [1.45, 14.5).
+    let scale = DeepReal::parse(&format!("1e{}", ms.ceil() as i64), zoom_exponent)?;
+    let residual = 1.45 * 10f64.powf(ms.ceil() - ms);
+    Ok([
+        shallow_re.sub(&deep_re).mul(&scale).to_f64() / residual,
+        shallow_im.sub(&deep_im).mul(&scale).to_f64() / residual,
+    ])
 }
 
 /// Scale of one frame in the shader's mantissa × 2^exponent form, computed
@@ -203,11 +450,16 @@ pub(crate) struct RegionView {
     pub(crate) reference_offset: [f32; 2],
 }
 
+/// `frame_reference_offset` is the reference point's position relative to
+/// the frame centre, in units of the frame half-height — zero when the
+/// reference orbit sits at the frame centre, `−screen_offset` when a
+/// [`CameraPath`] frame drifts away from its anchor.
 pub(crate) fn region_view(
     magnification_log10: f64,
     full_size: (u32, u32),
     origin: (u32, u32),
     region_size: (u32, u32),
+    frame_reference_offset: [f64; 2],
 ) -> RegionView {
     let (full_width, full_height) = (full_size.0.max(1) as f64, full_size.1.max(1) as f64);
     let (region_width, region_height) = (region_size.0.max(1) as f64, region_size.1.max(1) as f64);
@@ -230,7 +482,10 @@ pub(crate) fn region_view(
         scale_mantissa: (scaled / 2f64.powi(shift)) as f32,
         scale_exponent: full_exponent + shift,
         aspect: (region_width / region_height) as f32,
-        reference_offset: [(-centre_x / share) as f32, (-centre_y / share) as f32],
+        reference_offset: [
+            ((frame_reference_offset[0] - centre_x) / share) as f32,
+            ((frame_reference_offset[1] - centre_y) / share) as f32,
+        ],
     }
 }
 
@@ -312,25 +567,27 @@ mod tests {
     fn iteration_budget_hits_the_user_value_at_depth_and_the_floor_at_the_top() {
         let animation = path(0.0, 300.0, false);
         let frames = animation.frame_count();
-        assert_eq!(animation.frame_iterations(2_400, frames - 1), 2_400);
-        assert_eq!(animation.frame_iterations(2_400, 0), 256);
-        let mid = animation.frame_iterations(2_400, frames / 2);
+        let budget_at =
+            |frame: usize| animation.frame_iterations_at(2_400, animation.magnification_log10_at(frame));
+        assert_eq!(budget_at(frames - 1), 2_400);
+        assert_eq!(budget_at(0), 256);
+        let mid = budget_at(frames / 2);
         assert!((1_200..=1_450).contains(&mid), "{mid}");
         // Monotonic along a zoom-in.
         let mut previous = 0;
         for frame in 0..frames {
-            let budget = animation.frame_iterations(2_400, frame);
+            let budget = budget_at(frame);
             assert!(budget >= previous);
             previous = budget;
         }
         // Disabled scaling and degenerate paths keep the full budget.
         let mut fixed = path(0.0, 300.0, false);
         fixed.scale_iterations = false;
-        assert_eq!(fixed.frame_iterations(2_400, 0), 2_400);
+        assert_eq!(fixed.frame_iterations_at(2_400, 0.0), 2_400);
         let flat = path(0.0, 0.0, false);
-        assert_eq!(flat.frame_iterations(2_400, 0), 2_400);
+        assert_eq!(flat.frame_iterations_at(2_400, 0.0), 2_400);
         // Small budgets never scale below themselves.
-        assert_eq!(path(0.0, 100.0, false).frame_iterations(64, 0), 64);
+        assert_eq!(path(0.0, 100.0, false).frame_iterations_at(64, 0.0), 64);
     }
 
     #[test]
@@ -355,7 +612,7 @@ mod tests {
 
     #[test]
     fn region_view_of_the_whole_frame_is_the_frame() {
-        let region = region_view(12.0, (1920, 1080), (0, 0), (1920, 1080));
+        let region = region_view(12.0, (1920, 1080), (0, 0), (1920, 1080), [0.0; 2]);
         let (mantissa, exponent) = frame_scale(12.0);
         assert_eq!(region.scale_mantissa, mantissa);
         assert_eq!(region.scale_exponent, exponent);
@@ -385,7 +642,7 @@ mod tests {
             ((320, 240), (320, 240)),
             ((160, 120), (321, 199)),
         ] {
-            let region = region_view(m, full, origin, size);
+            let region = region_view(m, full, origin, size, [0.0; 2]);
             let scale = region.scale_mantissa as f64 * 2f64.powi(region.scale_exponent);
             for (px, py) in [(0.3, 0.7), (0.9, 0.1)] {
                 // The sample point in region-local units.
@@ -425,6 +682,222 @@ mod tests {
         );
         assert!(spans.iter().all(|(_, size)| *size <= 2730));
         assert_eq!(tile_spans(5, 2), vec![(0, 2), (2, 2), (4, 1)]);
+    }
+
+    fn waypoint(m: f64, centre: [f64; 2]) -> ZoomWaypoint {
+        ZoomWaypoint {
+            magnification_log10: m,
+            centre,
+            exact: None,
+        }
+    }
+
+    /// The world-space camera centre a [`PathFrame`] describes, given the
+    /// anchor waypoints' f64 centres — the shallow-range reconstruction the
+    /// exporter performs.
+    fn frame_centre(path_frame: &PathFrame, waypoints: &[ZoomWaypoint]) -> [f64; 2] {
+        let h = frame_half_height_f64(path_frame.magnification_log10);
+        let anchor = waypoints[path_frame.anchor].centre;
+        [
+            anchor[0] + path_frame.screen_offset[0] * h,
+            anchor[1] + path_frame.screen_offset[1] * h,
+        ]
+    }
+
+    #[test]
+    fn path_segments_anchor_deep_and_hit_both_endpoints() {
+        let waypoints = [waypoint(1.0, [-0.5, 0.1]), waypoint(3.0, [-0.52, 0.13])];
+        let path = CameraPath::new(&waypoints).unwrap();
+        let start = path.at(0.0);
+        assert_eq!(start.magnification_log10, 1.0);
+        assert_eq!(start.anchor, 1);
+        let reconstructed = frame_centre(&start, &waypoints);
+        for axis in 0..2 {
+            assert!(
+                (reconstructed[axis] - waypoints[0].centre[axis]).abs() < 1e-12,
+                "axis {axis}: {} vs {}",
+                reconstructed[axis],
+                waypoints[0].centre[axis]
+            );
+        }
+        // The start sits (0.02, −0.03)/0.145 half-heights from the anchor.
+        assert!((start.screen_offset[0] - 0.02 / 0.145).abs() < 1e-9);
+        assert!((start.screen_offset[1] - -0.03 / 0.145).abs() < 1e-9);
+        let end = path.at(1.0);
+        assert_eq!(end.magnification_log10, 3.0);
+        assert_eq!(end.anchor, 1);
+        assert_eq!(end.screen_offset, [0.0, 0.0]);
+        // A zoom-out segment anchors on its start.
+        let out = CameraPath::new(&[waypoint(3.0, [-0.52, 0.13]), waypoint(1.0, [-0.5, 0.1])])
+            .unwrap();
+        assert_eq!(out.at(0.0).anchor, 0);
+        assert_eq!(out.at(0.0).screen_offset, [0.0, 0.0]);
+        assert_eq!(out.at(1.0).magnification_log10, 1.0);
+    }
+
+    #[test]
+    fn pure_pan_glides_linearly_at_constant_magnification() {
+        let waypoints = [waypoint(2.0, [-0.5, 0.0]), waypoint(2.0, [-0.47, 0.02])];
+        let path = CameraPath::new(&waypoints).unwrap();
+        for (s, share) in [(0.0, 0.0), (0.25, 0.25), (0.5, 0.5), (1.0, 1.0)] {
+            let frame = path.at(s);
+            assert_eq!(frame.magnification_log10, 2.0);
+            let centre = frame_centre(&frame, &waypoints);
+            for axis in 0..2 {
+                let expected = waypoints[0].centre[axis]
+                    + (waypoints[1].centre[axis] - waypoints[0].centre[axis]) * share;
+                assert!(
+                    (centre[axis] - expected).abs() < 1e-12,
+                    "s={s} axis {axis}: {} vs {expected}",
+                    centre[axis]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multi_segment_paths_are_continuous_at_waypoints() {
+        let waypoints = [
+            waypoint(0.5, [-0.6, 0.0]),
+            waypoint(2.5, [-0.58, 0.015]),
+            waypoint(2.5, [-0.55, 0.02]),
+            waypoint(1.0, [-0.53, 0.01]),
+        ];
+        let path = CameraPath::new(&waypoints).unwrap();
+        for s in [0.001, 0.25, 0.4999, 0.5001, 0.75, 0.999] {
+            let before = path.at(s - 1e-6);
+            let after = path.at(s + 1e-6);
+            assert!(
+                (before.magnification_log10 - after.magnification_log10).abs() < 1e-3,
+                "magnification jumps at s={s}"
+            );
+            let a = frame_centre(&before, &waypoints);
+            let b = frame_centre(&after, &waypoints);
+            let h = frame_half_height_f64(before.magnification_log10);
+            for axis in 0..2 {
+                assert!(
+                    (a[axis] - b[axis]).abs() < h * 1e-2,
+                    "centre jumps at s={s} axis {axis}: {} vs {}",
+                    a[axis],
+                    b[axis]
+                );
+            }
+        }
+        // Every waypoint is visited exactly, in order.
+        for (index, s) in [(0usize, 0.0f64), (3, 1.0)] {
+            let frame = path.at(s);
+            let centre = frame_centre(&frame, &waypoints);
+            for axis in 0..2 {
+                assert!((centre[axis] - waypoints[index].centre[axis]).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn deep_waypoint_pans_use_the_exact_decimals() {
+        // Two centres differing at the 51st decimal digit — far beyond f64
+        // resolution, so their f64 projections coincide.
+        let deep = ZoomWaypoint {
+            magnification_log10: 52.0,
+            centre: [0.1, 0.2],
+            exact: Some(("0.1".to_owned(), "0.2".to_owned())),
+        };
+        let mut shallow_re = "0.1".to_owned();
+        shallow_re.push_str(&"0".repeat(49));
+        shallow_re.push('1');
+        let shallow = ZoomWaypoint {
+            magnification_log10: 50.0,
+            centre: [0.1, 0.2],
+            exact: Some((shallow_re, "0.2".to_owned())),
+        };
+        let path = CameraPath::new(&[shallow.clone(), deep.clone()]).unwrap();
+        let start = path.at(0.0);
+        assert_eq!(start.anchor, 1);
+        // pan = 1e-51 / (1.45e-50) ≈ 0.0689655.
+        assert!(
+            (start.screen_offset[0] - 1e-51 / 1.45e-50).abs() < 1e-9,
+            "{}",
+            start.screen_offset[0]
+        );
+        assert_eq!(start.screen_offset[1], 0.0);
+        // The same pair through f64 projections would cancel to zero.
+        let blunt = CameraPath::new(&[
+            waypoint(50.0, [0.1, 0.2]),
+            waypoint(52.0, [0.1, 0.2]),
+        ])
+        .unwrap();
+        assert_eq!(blunt.at(0.0).screen_offset, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn path_time_is_apportioned_by_perceptual_length() {
+        // One decade then nine: the first waypoint boundary sits near s=0.1.
+        let waypoints = [
+            waypoint(0.0, [-0.5, 0.0]),
+            waypoint(1.0, [-0.5, 0.0]),
+            waypoint(10.0, [-0.5, 0.0]),
+        ];
+        let path = CameraPath::new(&waypoints).unwrap();
+        let boundary = path.at(0.1);
+        assert!((boundary.magnification_log10 - 1.0).abs() < 0.05);
+        // A long pan takes time even without any zoom.
+        let pan_heavy = CameraPath::new(&[
+            waypoint(1.0, [-0.5, 0.0]),
+            waypoint(1.0, [-0.5 + 0.29 * 40.0, 0.0]), // 80 half-heights at h=0.145
+            waypoint(4.0, [-0.5 + 0.29 * 40.0, 0.0]),
+        ])
+        .unwrap();
+        // Pan length ≈ 80·log10(e) ≈ 35 decades-equivalent vs 3 decades of
+        // zoom, so the halfway point is still inside the pan segment.
+        let mid = pan_heavy.at(0.5);
+        assert_eq!(mid.magnification_log10, 1.0, "still panning at s=0.5");
+    }
+
+    #[test]
+    fn paths_reject_oversized_pans_and_undersized_waypoint_lists() {
+        assert!(CameraPath::new(&[waypoint(1.0, [0.0, 0.0])]).is_err());
+        let too_far = CameraPath::new(&[
+            waypoint(6.0, [0.0, 0.0]),
+            waypoint(6.0, [1.0, 0.0]), // 1/1.45e-6 ≈ 690k half-heights
+        ]);
+        assert!(too_far.is_err());
+    }
+
+    #[test]
+    fn path_activation_and_budgets_follow_the_waypoints() {
+        let mut animation = path(0.0, 3.0, false);
+        assert!(!animation.path_active());
+        animation.waypoints = vec![waypoint(0.0, [-0.5, 0.0]), waypoint(120.0, [-0.5, 0.0])];
+        assert!(animation.path_active());
+        assert_eq!(animation.max_magnification_log10(), 120.0);
+        assert_eq!(animation.frame_iterations_at(2_400, 120.0), 2_400);
+        assert_eq!(animation.frame_iterations_at(2_400, 0.0), 256);
+        animation.validate().unwrap();
+        animation.waypoints[0].magnification_log10 = f64::NAN;
+        assert!(animation.validate().is_err());
+    }
+
+    #[test]
+    fn region_reference_offset_composes_the_path_drift() {
+        let m = 6.0;
+        let full = (640u32, 480u32);
+        let drift = [1.75f64, -0.6];
+        let plain = region_view(m, full, (160, 120), (320, 240), [0.0; 2]);
+        let drifted = region_view(m, full, (160, 120), (320, 240), drift);
+        // Only the reference offset moves — by drift/share — and the pixel
+        // grid mapping (centre, scale) is untouched.
+        assert_eq!(plain.centre_shift, drifted.centre_shift);
+        assert_eq!(plain.scale_mantissa, drifted.scale_mantissa);
+        assert_eq!(plain.scale_exponent, drifted.scale_exponent);
+        let share = 240.0 / 480.0;
+        for axis in 0..2 {
+            let expected = plain.reference_offset[axis] as f64 + drift[axis] / share;
+            assert!(
+                (drifted.reference_offset[axis] as f64 - expected).abs() < 1e-5,
+                "axis {axis}: {} vs {expected}",
+                drifted.reference_offset[axis]
+            );
+        }
     }
 
     #[test]
