@@ -7,7 +7,7 @@ use crate::colouring::{Colouring, Layer, MAX_LAYERS};
 use crate::family::{FamilyParameters, FractalFamily, Linkage};
 
 pub(crate) const FORMAT_ID: &str = "iterascope-experiment";
-pub(crate) const FORMAT_VERSION: u32 = 8;
+pub(crate) const FORMAT_VERSION: u32 = 9;
 /// Largest escape radius a document may ask for. Large radii give the
 /// triangle-inequality and stripe colourings their smoothest results.
 pub(crate) const MAX_BAILOUT: f32 = 1e10;
@@ -276,6 +276,9 @@ impl ExperimentDocument {
             if self.version < 8 {
                 return Err("animation settings require document version 8".to_owned());
             }
+            if self.version < 9 && animation.has_dynamics_curves() {
+                return Err("parameter curves require document version 9".to_owned());
+            }
             animation
                 .validate()
                 .map_err(|error| format!("animation: {error}"))?;
@@ -459,6 +462,25 @@ mod tests {
         let json = document.to_pretty_json().unwrap();
         assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
         document.version = 7;
+        assert!(document.validate().is_err());
+        document.version = FORMAT_VERSION;
+        // Parameter curves gate on version 9.
+        document.animation.as_mut().unwrap().julia_curve = Some(crate::animation::JuliaCurve {
+            keys: vec![
+                crate::animation::JuliaKey {
+                    time: 0.0,
+                    c: [-0.8, 0.156],
+                },
+                crate::animation::JuliaKey {
+                    time: 1.0,
+                    c: [0.285, 0.01],
+                },
+            ],
+            smooth: true,
+        });
+        let json = document.to_pretty_json().unwrap();
+        assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
+        document.version = 8;
         assert!(document.validate().is_err());
         document.version = FORMAT_VERSION;
         document

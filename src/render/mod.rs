@@ -2855,6 +2855,8 @@ mod tests {
             encode_video: false,
             scale_iterations: false,
             waypoints: Vec::new(),
+            julia_curve: None,
+            family_curves: Vec::new(),
         };
         assert_eq!(animation.frame_count(), 5);
         let handoff_log = crate::arbitrary::ARBITRARY_HANDOFF_ZOOM.log10();

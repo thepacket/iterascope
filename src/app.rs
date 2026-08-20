@@ -2826,6 +2826,7 @@ impl App {
             egui::Slider::new(&mut self.animation.gradient_sweep_turns, -4.0..=4.0)
                 .text("gradient sweep (turns)"),
         );
+        self.curve_controls(ui);
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.animation_export_controls(ui);
@@ -2833,6 +2834,178 @@ impl App {
         #[cfg(target_arch = "wasm32")]
         {
             self.animation_export_controls_web(ui);
+        }
+    }
+
+    /// Parameter-curve editors: a keyed morph of the Julia parameter and
+    /// keyed curves over continuous family settings. Each key pins a value
+    /// at a fraction of the animation; between keys the value interpolates,
+    /// beyond the outermost keys it holds. Animated dynamics rebuild the
+    /// reference orbit every frame, so deep exports slow accordingly.
+    fn curve_controls(&mut self, ui: &mut egui::Ui) {
+        let family = self.family;
+        let julia_now = self.julia_c;
+        let parameters_now = self.family_parameters.clone();
+
+        if let Some(curve) = &mut self.animation.julia_curve {
+            ui.label(egui::RichText::new("Julia c curve").small().strong());
+            let mut remove_key = None;
+            let key_count = curve.keys.len();
+            for (index, key) in curve.keys.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut key.time)
+                            .range(0.0..=1.0)
+                            .speed(0.01)
+                            .fixed_decimals(2)
+                            .prefix("t "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut key.c[0])
+                            .range(-8.0..=8.0)
+                            .speed(0.0005)
+                            .fixed_decimals(4),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut key.c[1])
+                            .range(-8.0..=8.0)
+                            .speed(0.0005)
+                            .fixed_decimals(4)
+                            .suffix("i"),
+                    );
+                    if ui
+                        .small_button("= c")
+                        .on_hover_text("Set this key to the current Julia parameter")
+                        .clicked()
+                    {
+                        key.c = julia_now;
+                    }
+                    if key_count > 1 && ui.small_button("✕").clicked() {
+                        remove_key = Some(index);
+                    }
+                });
+            }
+            if let Some(index) = remove_key {
+                curve.keys.remove(index);
+            }
+            let mut remove_curve = false;
+            ui.horizontal(|ui| {
+                if curve.keys.len() < animation::MAX_CURVE_KEYS && ui.button("Add key").clicked() {
+                    curve.keys.push(animation::JuliaKey {
+                        time: 1.0,
+                        c: julia_now,
+                    });
+                }
+                ui.checkbox(&mut curve.smooth, "Smooth");
+                if ui.button("Remove curve").clicked() {
+                    remove_curve = true;
+                }
+            });
+            if remove_curve {
+                self.animation.julia_curve = None;
+            }
+        } else if ui
+            .button("Animate Julia c")
+            .on_hover_text(
+                "Morph the Julia parameter along keyed values across the animation (Julia-plane exports; the reference orbit is rebuilt every frame)",
+            )
+            .clicked()
+        {
+            self.animation.julia_curve = Some(animation::JuliaCurve {
+                keys: vec![
+                    animation::JuliaKey {
+                        time: 0.0,
+                        c: julia_now,
+                    },
+                    animation::JuliaKey {
+                        time: 1.0,
+                        c: julia_now,
+                    },
+                ],
+                smooth: true,
+            });
+        }
+
+        let mut remove_curve = None;
+        for (curve_index, curve) in self.animation.family_curves.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} curve", curve.target.label()))
+                        .small()
+                        .strong(),
+                );
+                if !curve.target.applies_to(family) {
+                    ui.label(
+                        egui::RichText::new("(not used by this family)")
+                            .small()
+                            .color(CORAL),
+                    );
+                }
+            });
+            let (low, high) = curve.target.range();
+            let mut remove_key = None;
+            let key_count = curve.keys.len();
+            for (index, key) in curve.keys.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut key.time)
+                            .range(0.0..=1.0)
+                            .speed(0.01)
+                            .fixed_decimals(2)
+                            .prefix("t "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut key.value)
+                            .range(low..=high)
+                            .speed(0.005)
+                            .fixed_decimals(3),
+                    );
+                    if key_count > 1 && ui.small_button("✕").clicked() {
+                        remove_key = Some(index);
+                    }
+                });
+            }
+            if let Some(index) = remove_key {
+                curve.keys.remove(index);
+            }
+            ui.horizontal(|ui| {
+                if curve.keys.len() < animation::MAX_CURVE_KEYS && ui.button("Add key").clicked() {
+                    let value = curve.target.current(&parameters_now);
+                    curve.keys.push(animation::CurveKey { time: 1.0, value });
+                }
+                ui.checkbox(&mut curve.smooth, "Smooth");
+                if ui.button("Remove curve").clicked() {
+                    remove_curve = Some(curve_index);
+                }
+            });
+        }
+        if let Some(index) = remove_curve {
+            self.animation.family_curves.remove(index);
+        }
+        for target in [
+            animation::FamilyCurveTarget::NovaRelaxation,
+            animation::FamilyCurveTarget::MandelboxScale,
+            animation::FamilyCurveTarget::MandelboxMinRadius,
+            animation::FamilyCurveTarget::MandelboxFixedRadius,
+        ] {
+            if target.applies_to(family)
+                && !self
+                    .animation
+                    .family_curves
+                    .iter()
+                    .any(|curve| curve.target == target)
+                && ui.button(format!("Animate {}", target.label())).clicked()
+            {
+                let value = target.current(&parameters_now);
+                self.animation.family_curves.push(animation::FamilyCurve {
+                    target,
+                    keys: vec![
+                        animation::CurveKey { time: 0.0, value },
+                        animation::CurveKey { time: 1.0, value },
+                    ],
+                    smooth: true,
+                });
+            }
         }
     }
 
@@ -3001,6 +3174,10 @@ impl App {
             return;
         }
         let pane = self.active_pane;
+        if let Err(error) = self.validate_animation_dynamics(&animation, pane) {
+            self.export_message = Some((error, true));
+            return;
+        }
         let current = self.magnification_log10(pane);
         let mut clamped = false;
         if !animation.path_active() {
@@ -3092,7 +3269,14 @@ impl App {
                     ctx.request_repaint();
                     return;
                 }
-                let view = scene.frame_view(&animation, frame);
+                let view = match scene.frame_view(&animation, frame) {
+                    Ok(view) => view,
+                    Err(error) => {
+                        finish(Err(error));
+                        ctx.request_repaint();
+                        return;
+                    }
+                };
                 let sweep = animation.gradient_offset_at(frame);
                 let rgba = if let Some(passes) = &passes {
                     let mut rendered = Vec::with_capacity(passes.len());
@@ -3109,7 +3293,7 @@ impl App {
                             continue;
                         }
                         let pass_view = if pass.animated {
-                            view
+                            view.clone()
                         } else {
                             ExportFrameView::fixed(pass.fixed_magnification)
                         };
@@ -3379,6 +3563,10 @@ impl App {
             return;
         }
         let pane = self.active_pane;
+        if let Err(error) = self.validate_animation_dynamics(&animation, pane) {
+            self.export_message = Some((error, true));
+            return;
+        }
         let current = self.magnification_log10(pane);
         let mut clamped = false;
         if !animation.path_active() {
@@ -3462,7 +3650,12 @@ impl App {
         let mut ap_reference = None;
         let f64_points;
         let centre;
+        let recipe;
         if let Some(view) = &self.deep_views[pane] {
+            recipe = Some(CentreRecipe {
+                centre: view.centre_preview(),
+                deep: Some((view.centre.clone(), view.zoom_exponent)),
+            });
             let julia_c = self.deep_julia_c.clone().unwrap_or_else(|| {
                 DeepComplex::from_f64(self.julia_c, view.zoom_exponent)
                     .expect("finite Julia parameter")
@@ -3493,6 +3686,10 @@ impl App {
             } else {
                 self.dynamical.centre
             };
+            recipe = self.family.supports_deep_zoom().then_some(CentreRecipe {
+                centre,
+                deep: None,
+            });
             if self.family.supports_deep_zoom() {
                 f64_points = reference_orbit_f64(
                     self.family,
@@ -3529,7 +3726,35 @@ impl App {
             f64_reference,
             single_pass: None,
             path: None,
+            parameters: self.family_parameters.clone(),
+            deep_julia_c: self.deep_julia_c.clone(),
+            recipe,
         })
+    }
+
+    /// Family-aware checks of the animation's parameter curves: the Julia
+    /// curve only means something on the Julia (dynamical) plane, and each
+    /// family curve must drive a setting the current family actually uses.
+    fn validate_animation_dynamics(
+        &self,
+        animation: &ZoomAnimation,
+        pane: usize,
+    ) -> Result<(), String> {
+        if animation.julia_curve.is_some() && !self.pane_is_dynamical(pane) {
+            return Err(
+                "the Julia curve animates the Julia (dynamical) plane — export that image or remove the curve"
+                    .to_owned(),
+            );
+        }
+        for curve in &animation.family_curves {
+            if !curve.target.applies_to(self.family) {
+                return Err(format!(
+                    "the {} curve does not apply to this family — remove it",
+                    curve.target.label()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Freezes the animation's waypoint flight path: validates it, computes
@@ -3570,6 +3795,7 @@ impl App {
                 centre: waypoint.centre,
                 ap_reference: None,
                 f64_reference: None,
+                recipe: None,
             });
         }
         let handoff_log = ARBITRARY_HANDOFF_ZOOM.log10();
@@ -3615,6 +3841,10 @@ impl App {
                 centre: [centre.re.to_f64(), centre.im.to_f64()],
                 ap_reference,
                 f64_reference,
+                recipe: Some(CentreRecipe {
+                    centre: [centre.re.to_f64(), centre.im.to_f64()],
+                    deep: Some((centre, zoom_exponent)),
+                }),
             })
         } else {
             let points = reference_orbit_f64(
@@ -3638,6 +3868,10 @@ impl App {
                 centre: waypoint.centre,
                 ap_reference: None,
                 f64_reference,
+                recipe: Some(CentreRecipe {
+                    centre: waypoint.centre,
+                    deep: None,
+                }),
             })
         }
     }
@@ -3687,6 +3921,11 @@ impl App {
                         f64_reference: (!is_deep).then(|| reference.clone()).flatten(),
                         single_pass: Some((layer, gradient_base)),
                         path: None,
+                        // Detached scenes keep their own fixed dynamics;
+                        // parameter curves never touch them.
+                        parameters: scene.parameters(),
+                        deep_julia_c: None,
+                        recipe: None,
                     },
                 }
             } else {
@@ -3704,6 +3943,11 @@ impl App {
                     f64_reference: shared.f64_reference.clone(),
                     single_pass: None,
                     path: None,
+                    // The frame view carrying rebuilt references is computed
+                    // once on the job's scene and shared with these passes.
+                    parameters: shared.parameters.clone(),
+                    deep_julia_c: shared.deep_julia_c.clone(),
+                    recipe: shared.recipe.clone(),
                 };
                 scene.single_pass = Some((layer.clone(), gradient_base));
                 FrozenPass {
@@ -3989,6 +4233,31 @@ impl App {
             self.animation.gradient_sweep_turns = 0.5;
             self.animation.encode_video = search.contains("autotest=video");
             self.start_export_web(ctx);
+        } else if search.contains("autotest=curve") {
+            log::info!("autotest: exporting a one-second 320×240 Julia-morph animation");
+            // The Julia curve animates the dynamical plane.
+            self.active_pane = 1;
+            self.animation.duration_seconds = 1.0;
+            self.animation.fps = 12;
+            self.animation.width = 320;
+            self.animation.height = 240;
+            self.animation.start_magnification_log10 = 0.0;
+            self.animation.end_magnification_log10 = 0.0;
+            self.animation.encode_video = crate::webvideo::supported();
+            self.animation.julia_curve = Some(animation::JuliaCurve {
+                keys: vec![
+                    animation::JuliaKey {
+                        time: 0.0,
+                        c: [-0.8, 0.156],
+                    },
+                    animation::JuliaKey {
+                        time: 1.0,
+                        c: [0.285, 0.01],
+                    },
+                ],
+                smooth: true,
+            });
+            self.start_export_web(ctx);
         } else if search.contains("autotest=path") {
             log::info!("autotest: exporting a one-second 320×240 waypoint-path animation");
             self.animation.duration_seconds = 1.0;
@@ -4119,7 +4388,14 @@ impl App {
         };
         let frame = job.next_frame;
         let total = job.animation.frame_count();
-        let view = job.scene.frame_view(&job.animation, frame);
+        let view = match job.scene.frame_view(&job.animation, frame) {
+            Ok(view) => view,
+            Err(error) => {
+                self.export = None;
+                self.export_message = Some((error, true));
+                return;
+            }
+        };
         let sweep = job.animation.gradient_offset_at(frame);
         let size = (job.animation.width, job.animation.height);
         let rgba = if let Some(passes) = &job.passes {
@@ -4132,7 +4408,7 @@ impl App {
                     continue;
                 }
                 let pass_view = if pass.animated {
-                    view
+                    view.clone()
                 } else {
                     ExportFrameView::fixed(pass.fixed_magnification)
                 };
@@ -5410,7 +5686,39 @@ struct FrozenScene {
     /// plan plus one reference set per anchoring waypoint, shared by every
     /// animated pass. `None` renders the classic fixed-centre dive.
     path: Option<Arc<FrozenPath>>,
+    /// Base family settings, curve targets applied on top per frame.
+    parameters: FamilyParameters,
+    /// The Julia parameter at full precision, when the view was deep; a
+    /// Julia curve replaces it wholesale.
+    deep_julia_c: Option<DeepComplex>,
+    /// The scene centre in rebuildable form, for per-frame reference
+    /// reconstruction under animated dynamics.
+    recipe: Option<CentreRecipe>,
 }
+
+/// The exact centre a reference orbit can be rebuilt at when animated
+/// dynamics invalidate the frozen orbit.
+#[derive(Clone)]
+struct CentreRecipe {
+    /// f64 projection of the centre.
+    centre: [f64; 2],
+    /// The exact centre and its working precision, beyond the f64 handoff.
+    deep: Option<(DeepComplex, u32)>,
+}
+
+/// Reference orbits rebuilt for one frame's animated dynamics: the
+/// arbitrary-precision orbit beyond the handoff and/or its f64 companion.
+#[derive(Clone)]
+struct RebuiltReferences {
+    ap_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
+    f64_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
+}
+
+/// Generations for reference uploads minted inside export tasks (per-frame
+/// orbit rebuilds), far above the freeze-time `export_generation × 4`
+/// scheme so the two never collide.
+static REBUILD_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1 << 40);
 
 /// A frozen camera path: the pure sampling plan plus the reference orbits
 /// of the waypoints that anchor its segments.
@@ -5429,12 +5737,16 @@ struct AnchorReference {
     centre: [f64; 2],
     ap_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
     f64_reference: Option<(u64, Arc<Vec<GpuReferencePoint>>)>,
+    /// The anchor centre in rebuildable form, for animated dynamics.
+    recipe: Option<CentreRecipe>,
 }
 
-/// One export frame's camera: its magnification, which reference anchors it
-/// (a path waypoint, or the scene's own fixed centre), and the frame
-/// centre's screen-space drift from that anchor.
-#[derive(Clone, Copy)]
+/// One export frame's camera and dynamics: the magnification, which
+/// reference anchors the frame (a path waypoint, or the scene's own fixed
+/// centre), the frame centre's screen-space drift from that anchor, and —
+/// under parameter curves — this frame's dynamics overrides with the
+/// reference orbits rebuilt for them.
+#[derive(Clone)]
 struct ExportFrameView {
     magnification: f64,
     /// Path waypoint anchoring the frame; `None` uses the scene's centre
@@ -5443,6 +5755,13 @@ struct ExportFrameView {
     /// Frame centre relative to the anchor, in units of the frame
     /// half-height.
     screen_offset: [f64; 2],
+    /// The Julia parameter of this frame, when a Julia curve drives it.
+    julia_c: Option<[f64; 2]>,
+    /// Family uniform words of this frame, when family curves drive them.
+    family_words: Option<[f32; 8]>,
+    /// Reference orbits rebuilt for this frame's dynamics, overriding the
+    /// frozen ones.
+    rebuilt: Option<RebuiltReferences>,
 }
 
 impl ExportFrameView {
@@ -5451,6 +5770,9 @@ impl ExportFrameView {
             magnification,
             anchor: None,
             screen_offset: [0.0; 2],
+            julia_c: None,
+            family_words: None,
+            rebuilt: None,
         }
     }
 }
@@ -5470,19 +5792,148 @@ struct FrozenPass {
 }
 
 impl FrozenScene {
-    /// The camera of one animation frame: a sample of the flight path when
-    /// the scene carries one, the fixed-centre dive otherwise.
-    fn frame_view(&self, animation: &ZoomAnimation, frame: usize) -> ExportFrameView {
-        match &self.path {
+    /// The camera and dynamics of one animation frame: a sample of the
+    /// flight path when the scene carries one (the fixed-centre dive
+    /// otherwise), plus — under parameter curves — the frame's dynamics
+    /// overrides with their freshly rebuilt reference orbit.
+    fn frame_view(
+        &self,
+        animation: &ZoomAnimation,
+        frame: usize,
+    ) -> Result<ExportFrameView, String> {
+        let mut view = match &self.path {
             Some(path) => {
                 let sample = path.plan.at(animation.eased_progress(frame));
                 ExportFrameView {
                     magnification: sample.magnification_log10,
                     anchor: Some(sample.anchor),
                     screen_offset: sample.screen_offset,
+                    ..ExportFrameView::fixed(0.0)
                 }
             }
             None => ExportFrameView::fixed(animation.magnification_log10_at(frame)),
+        };
+        if !animation.has_dynamics_curves() {
+            return Ok(view);
+        }
+        let u = animation.linear_progress(frame);
+        let julia_from_curve = animation.julia_curve.is_some();
+        let julia = animation
+            .julia_curve
+            .as_ref()
+            .map_or(self.julia_c, |curve| curve.at(u));
+        view.julia_c = julia_from_curve.then_some(julia);
+        let mut parameters = self.parameters.clone();
+        if !animation.family_curves.is_empty() {
+            for curve in &animation.family_curves {
+                curve.target.apply(&mut parameters, curve.at(u));
+            }
+            view.family_words = Some(parameters.uniform_words(self.dynamical));
+        }
+        let recipe = match view.anchor {
+            Some(index) => self
+                .path
+                .as_ref()
+                .and_then(|path| path.anchors.get(index)?.as_ref())
+                .and_then(|anchor| anchor.recipe.as_ref()),
+            None => self.recipe.as_ref(),
+        };
+        if let Some(recipe) = recipe {
+            view.rebuilt =
+                Some(self.rebuild_references(recipe, julia, julia_from_curve, &parameters)?);
+        }
+        Ok(view)
+    }
+
+    /// Rebuilds the reference orbit at `recipe`'s centre for one frame's
+    /// animated dynamics, mirroring the freeze-time construction: the
+    /// arbitrary-precision orbit (plus f64 projection) beyond the handoff,
+    /// the f64 orbit below it.
+    fn rebuild_references(
+        &self,
+        recipe: &CentreRecipe,
+        julia_c: [f64; 2],
+        julia_from_curve: bool,
+        parameters: &FamilyParameters,
+    ) -> Result<RebuiltReferences, String> {
+        let generation =
+            REBUILD_GENERATION.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        if let Some((centre, zoom_exponent)) = &recipe.deep {
+            let julia = if julia_from_curve {
+                DeepComplex::from_f64(julia_c, *zoom_exponent)?
+            } else {
+                match &self.deep_julia_c {
+                    Some(deep) => deep.clone(),
+                    None => DeepComplex::from_f64(julia_c, *zoom_exponent)?,
+                }
+            };
+            let initial = DeepState::initial(self.family, centre, self.dynamical, &julia)?;
+            let orbit = ReferenceOrbit::family(
+                self.family,
+                parameters,
+                initial,
+                self.iterations,
+                self.bailout as f64,
+            )?;
+            let f64_points = orbit
+                .points
+                .iter()
+                .map(|point| [point.re.to_f64(), point.im.to_f64()])
+                .collect::<Vec<_>>();
+            let ap_reference = Some((
+                generation,
+                Arc::clone(
+                    &DeepRenderData::from_points(generation, 1.0, 0, &orbit.points, false)
+                        .reference,
+                ),
+            ));
+            let f64_reference = (!f64_points.is_empty()).then(|| {
+                (
+                    generation + 1,
+                    Arc::clone(
+                        &DeepRenderData::from_f64_orbit(
+                            generation + 1,
+                            1.0,
+                            &f64_points,
+                            true,
+                            [0.0; 2],
+                        )
+                        .reference,
+                    ),
+                )
+            });
+            Ok(RebuiltReferences {
+                ap_reference,
+                f64_reference,
+            })
+        } else {
+            let points = reference_orbit_f64(
+                self.family,
+                parameters,
+                initial_state_with(self.family, recipe.centre, self.dynamical, julia_c),
+                self.iterations,
+                self.bailout as f64,
+            )
+            .points;
+            let f64_reference = (!points.is_empty()).then(|| {
+                (
+                    generation + 1,
+                    Arc::clone(
+                        &DeepRenderData::from_f64_orbit(
+                            generation + 1,
+                            1.0,
+                            &points,
+                            true,
+                            [0.0; 2],
+                        )
+                        .reference,
+                    ),
+                )
+            });
+            Ok(RebuiltReferences {
+                ap_reference: None,
+                f64_reference,
+            })
         }
     }
 
@@ -5509,9 +5960,9 @@ impl FrozenScene {
     /// to the region's `reference_offset`), so tiling is exact at any
     /// magnification.
     #[allow(clippy::too_many_arguments)]
-    fn region_inputs(
-        &self,
-        view: ExportFrameView,
+    fn region_inputs<'a>(
+        &'a self,
+        view: &'a ExportFrameView,
         full_size: (u32, u32),
         origin: (u32, u32),
         region_size: (u32, u32),
@@ -5520,7 +5971,7 @@ impl FrozenScene {
     ) -> (
         Uniforms,
         ColouringUniforms,
-        Option<(u64, &[GpuReferencePoint])>,
+        Option<(u64, &'a [GpuReferencePoint])>,
     ) {
         let magnification = view.magnification;
         let handoff_log = ARBITRARY_HANDOFF_ZOOM.log10();
@@ -5533,7 +5984,7 @@ impl FrozenScene {
             region_size,
             [-view.screen_offset[0], -view.screen_offset[1]],
         );
-        let (anchor_centre, ap_reference, f64_reference) = match view
+        let (anchor_centre, mut ap_reference, mut f64_reference) = match view
             .anchor
             .and_then(|index| self.path.as_ref()?.anchors.get(index)?.as_ref())
         {
@@ -5548,6 +5999,12 @@ impl FrozenScene {
                 self.f64_reference.as_ref(),
             ),
         };
+        // Parameter curves invalidate the frozen orbits: this frame's
+        // rebuilt references replace them (same centre, new dynamics).
+        if let Some(rebuilt) = &view.rebuilt {
+            ap_reference = rebuilt.ap_reference.as_ref();
+            f64_reference = rebuilt.f64_reference.as_ref();
+        }
         let reference = if magnification > handoff_log {
             ap_reference.map(|r| (r.0, r.1.as_slice(), false))
         } else {
@@ -5569,7 +6026,7 @@ impl FrozenScene {
             ],
             region.half_height_f64,
             region.aspect,
-            self.julia_c,
+            view.julia_c.unwrap_or(self.julia_c),
             iterations.min(self.iterations),
             self.bailout,
             self.family.shader_flag(),
@@ -5581,7 +6038,7 @@ impl FrozenScene {
             } else {
                 PrecisionMode::F32
             },
-            self.family_words,
+            view.family_words.unwrap_or(self.family_words),
         );
         if let Some((_, points, ds_fallback)) = reference {
             uniforms = uniforms.enable_perturbation(
@@ -5630,7 +6087,7 @@ impl FrozenScene {
         iterations: u32,
     ) -> Result<Vec<u8>, String> {
         let (uniforms, colouring_uniforms, reference) =
-            self.region_inputs(view, full_size, origin, region_size, sweep, iterations);
+            self.region_inputs(&view, full_size, origin, region_size, sweep, iterations);
         let renderer = render_state.renderer.read();
         let pipeline = renderer
             .callback_resources
@@ -5664,7 +6121,7 @@ impl FrozenScene {
     ) -> Result<Vec<u8>, String> {
         let receiver = {
             let (uniforms, colouring_uniforms, reference) =
-                self.region_inputs(view, full_size, origin, region_size, sweep, iterations);
+                self.region_inputs(&view, full_size, origin, region_size, sweep, iterations);
             let renderer = render_state.renderer.read();
             let pipeline = renderer
                 .callback_resources
@@ -6472,6 +6929,145 @@ fn badge(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frozen scene whose only purpose is reference rebuilding.
+    fn recipe_scene(
+        family: FractalFamily,
+        dynamical: bool,
+        julia_c: [f64; 2],
+        centre: [f64; 2],
+        deep: Option<(DeepComplex, u32)>,
+    ) -> FrozenScene {
+        let layers = LayerStack::default();
+        FrozenScene {
+            family,
+            dynamical,
+            family_words: FamilyParameters::default().uniform_words(dynamical),
+            iterations: 300,
+            bailout: 4.0,
+            julia_c,
+            centre,
+            gradient: Arc::new(GradientTable::new(1, &layers)),
+            layers,
+            ap_reference: None,
+            f64_reference: None,
+            single_pass: None,
+            path: None,
+            parameters: FamilyParameters::default(),
+            deep_julia_c: None,
+            recipe: Some(CentreRecipe { centre, deep }),
+        }
+    }
+
+    fn point_bytes(points: &[GpuReferencePoint]) -> &[u8] {
+        bytemuck::cast_slice(points)
+    }
+
+    /// Per-frame reference rebuilds under animated dynamics must reproduce
+    /// exactly the orbit freeze-time construction would build for the same
+    /// values — for a curved Julia parameter, curved family settings, and
+    /// at arbitrary precision.
+    #[test]
+    fn rebuilt_references_mirror_freeze_for_animated_dynamics() {
+        // A curved Julia parameter on the shallow f64 path.
+        let scene = recipe_scene(
+            FractalFamily::Quadratic,
+            true,
+            [-0.8, 0.156],
+            [0.3, -0.2],
+            None,
+        );
+        let curved_c = [-0.4, 0.6];
+        let rebuilt = scene
+            .rebuild_references(scene.recipe.as_ref().unwrap(), curved_c, true, &scene.parameters)
+            .unwrap();
+        assert!(rebuilt.ap_reference.is_none());
+        let (_, points) = rebuilt.f64_reference.expect("an f64 reference");
+        let expected = reference_orbit_f64(
+            scene.family,
+            &scene.parameters,
+            initial_state_with(scene.family, scene.centre, true, curved_c),
+            scene.iterations,
+            scene.bailout as f64,
+        )
+        .points;
+        let expected =
+            DeepRenderData::from_f64_orbit(999, 1.0, &expected, true, [0.0; 2]).reference;
+        assert_eq!(point_bytes(&points), point_bytes(&expected));
+        let base = reference_orbit_f64(
+            scene.family,
+            &scene.parameters,
+            initial_state_with(scene.family, scene.centre, true, scene.julia_c),
+            scene.iterations,
+            scene.bailout as f64,
+        )
+        .points;
+        let base = DeepRenderData::from_f64_orbit(998, 1.0, &base, true, [0.0; 2]).reference;
+        assert_ne!(
+            point_bytes(&points),
+            point_bytes(&base),
+            "the curved orbit must differ from the base orbit"
+        );
+
+        // Curved family settings flow into the rebuilt orbit.
+        let scene = recipe_scene(
+            FractalFamily::Mandelbox,
+            false,
+            [0.0, 0.0],
+            [0.4, 0.3],
+            None,
+        );
+        let mut curved = scene.parameters.clone();
+        curved.mandelbox_scale = 2.5;
+        let rebuilt = scene
+            .rebuild_references(scene.recipe.as_ref().unwrap(), scene.julia_c, false, &curved)
+            .unwrap();
+        let (_, points) = rebuilt.f64_reference.expect("an f64 reference");
+        let expected = reference_orbit_f64(
+            scene.family,
+            &curved,
+            initial_state_with(scene.family, scene.centre, false, scene.julia_c),
+            scene.iterations,
+            scene.bailout as f64,
+        )
+        .points;
+        let expected =
+            DeepRenderData::from_f64_orbit(997, 1.0, &expected, true, [0.0; 2]).reference;
+        assert_eq!(point_bytes(&points), point_bytes(&expected));
+
+        // The arbitrary-precision branch mirrors the deep freeze.
+        let zoom_exponent = 45u32;
+        let deep_centre = DeepComplex::from_f64([-0.7436, 0.1318], zoom_exponent).unwrap();
+        let scene = recipe_scene(
+            FractalFamily::Quadratic,
+            false,
+            [0.0, 0.0],
+            [-0.7436, 0.1318],
+            Some((deep_centre.clone(), zoom_exponent)),
+        );
+        let rebuilt = scene
+            .rebuild_references(
+                scene.recipe.as_ref().unwrap(),
+                scene.julia_c,
+                false,
+                &scene.parameters,
+            )
+            .unwrap();
+        let (_, ap_points) = rebuilt.ap_reference.expect("an arbitrary-precision reference");
+        assert!(rebuilt.f64_reference.is_some());
+        let julia = DeepComplex::from_f64([0.0, 0.0], zoom_exponent).unwrap();
+        let initial = DeepState::initial(scene.family, &deep_centre, false, &julia).unwrap();
+        let orbit = ReferenceOrbit::family(
+            scene.family,
+            &scene.parameters,
+            initial,
+            scene.iterations,
+            scene.bailout as f64,
+        )
+        .unwrap();
+        let expected = DeepRenderData::from_points(996, 1.0, 0, &orbit.points, false).reference;
+        assert_eq!(point_bytes(&ap_points), point_bytes(&expected));
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

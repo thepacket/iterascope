@@ -19,8 +19,16 @@
 //!
 //! An optional gradient sweep advances both colouring offsets across the
 //! animation for the classic slowly-turning-palette look.
+//!
+//! Parameter curves animate the dynamics themselves: the Julia parameter
+//! morphs along a keyed path through the parameter plane, and continuous
+//! family settings (Nova relaxation, the Mandelbox radii and scale) follow
+//! keyed scalar curves. Animated dynamics invalidate the reference orbit,
+//! so the exporter rebuilds it per frame from the frozen scene's recipe —
+//! f64 below the arbitrary-precision handoff, full precision beyond it.
 
 use crate::arbitrary::DeepReal;
+use crate::family::{FamilyParameters, FractalFamily};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_DIMENSION: u32 = 8_192;
@@ -59,6 +67,12 @@ pub(crate) struct ZoomAnimation {
     /// above are ignored.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) waypoints: Vec<ZoomWaypoint>,
+    /// Morphs the Julia parameter along a keyed path (Julia-plane exports).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) julia_curve: Option<JuliaCurve>,
+    /// Keyed curves over continuous family settings.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) family_curves: Vec<FamilyCurve>,
 }
 
 /// One waypoint of a keyframed camera path: a location and magnification
@@ -99,8 +113,208 @@ impl Default for ZoomAnimation {
             encode_video: true,
             scale_iterations: true,
             waypoints: Vec::new(),
+            julia_curve: None,
+            family_curves: Vec::new(),
         }
     }
+}
+
+pub(crate) const MAX_CURVE_KEYS: usize = 64;
+
+/// One key of a scalar parameter curve: a value pinned at a fraction of the
+/// animation's duration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct CurveKey {
+    pub(crate) time: f32,
+    pub(crate) value: f64,
+}
+
+/// One key of the Julia-parameter curve: the complex parameter at a time
+/// fraction. The morph path is a (optionally eased) polyline through the
+/// parameter plane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct JuliaKey {
+    pub(crate) time: f32,
+    pub(crate) c: [f64; 2],
+}
+
+/// A keyed morph of the Julia parameter. Between keys the parameter
+/// interpolates linearly (smoothstep-eased per key pair when `smooth`);
+/// before the first and after the last key it holds. Keys may be stored in
+/// any order — evaluation sorts by time.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct JuliaCurve {
+    pub(crate) keys: Vec<JuliaKey>,
+    pub(crate) smooth: bool,
+}
+
+impl JuliaCurve {
+    /// The Julia parameter at linear progress `u ∈ [0, 1]`.
+    pub(crate) fn at(&self, u: f64) -> [f64; 2] {
+        let (before, after, t) = keyed_span(self.keys.iter().map(|key| key.time), u, self.smooth);
+        let (a, b) = (self.keys[before].c, self.keys[after].c);
+        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        validate_key_times("julia curve", self.keys.iter().map(|key| key.time))?;
+        for (index, key) in self.keys.iter().enumerate() {
+            if !key.c[0].is_finite()
+                || !key.c[1].is_finite()
+                || key.c[0].abs() > 8.0
+                || key.c[1].abs() > 8.0
+            {
+                return Err(format!(
+                    "julia curve key {index}: c must be finite with |re|, |im| at most 8"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The continuous family settings a curve may drive. The Multibrot/Nova
+/// degree stays fixed: it is integer-valued in the iteration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum FamilyCurveTarget {
+    #[default]
+    NovaRelaxation,
+    MandelboxScale,
+    MandelboxMinRadius,
+    MandelboxFixedRadius,
+}
+
+impl FamilyCurveTarget {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::NovaRelaxation => "Nova relaxation",
+            Self::MandelboxScale => "Mandelbox scale",
+            Self::MandelboxMinRadius => "Mandelbox min radius",
+            Self::MandelboxFixedRadius => "Mandelbox fixed radius",
+        }
+    }
+
+    /// The valid value range, mirroring `FamilyParameters::validate`.
+    pub(crate) fn range(self) -> (f64, f64) {
+        match self {
+            Self::NovaRelaxation => (0.1, 4.0),
+            Self::MandelboxScale => (-4.0, 4.0),
+            Self::MandelboxMinRadius => (0.01, 2.0),
+            Self::MandelboxFixedRadius => (0.1, 4.0),
+        }
+    }
+
+    pub(crate) fn applies_to(self, family: FractalFamily) -> bool {
+        match self {
+            Self::NovaRelaxation => family.uses_relaxation(),
+            Self::MandelboxScale | Self::MandelboxMinRadius | Self::MandelboxFixedRadius => {
+                family.uses_mandelbox()
+            }
+        }
+    }
+
+    pub(crate) fn apply(self, parameters: &mut FamilyParameters, value: f64) {
+        match self {
+            Self::NovaRelaxation => parameters.nova_relaxation = value,
+            Self::MandelboxScale => parameters.mandelbox_scale = value,
+            Self::MandelboxMinRadius => parameters.mandelbox_min_radius = value,
+            Self::MandelboxFixedRadius => parameters.mandelbox_fixed_radius = value,
+        }
+    }
+
+    pub(crate) fn current(self, parameters: &FamilyParameters) -> f64 {
+        match self {
+            Self::NovaRelaxation => parameters.nova_relaxation,
+            Self::MandelboxScale => parameters.mandelbox_scale,
+            Self::MandelboxMinRadius => parameters.mandelbox_min_radius,
+            Self::MandelboxFixedRadius => parameters.mandelbox_fixed_radius,
+        }
+    }
+}
+
+/// A keyed curve over one continuous family setting; the same hold/lerp
+/// semantics as [`JuliaCurve`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct FamilyCurve {
+    pub(crate) target: FamilyCurveTarget,
+    pub(crate) keys: Vec<CurveKey>,
+    pub(crate) smooth: bool,
+}
+
+impl FamilyCurve {
+    /// The setting's value at linear progress `u ∈ [0, 1]`.
+    pub(crate) fn at(&self, u: f64) -> f64 {
+        let (before, after, t) = keyed_span(self.keys.iter().map(|key| key.time), u, self.smooth);
+        let (a, b) = (self.keys[before].value, self.keys[after].value);
+        a + (b - a) * t
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let label = self.target.label();
+        validate_key_times(label, self.keys.iter().map(|key| key.time))?;
+        let (low, high) = self.target.range();
+        for (index, key) in self.keys.iter().enumerate() {
+            if !key.value.is_finite() || !(low..=high).contains(&key.value) {
+                return Err(format!(
+                    "{label} curve key {index}: value must be between {low} and {high}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The key pair bracketing progress `u` and the interpolation fraction
+/// between them, over keys sorted by time (holds at both ends). Indices
+/// refer to the unsorted key list, so callers index their own storage.
+fn keyed_span(times: impl Iterator<Item = f32>, u: f64, smooth: bool) -> (usize, usize, f64) {
+    let mut order: Vec<(usize, f32)> = times.enumerate().collect();
+    debug_assert!(!order.is_empty(), "curves hold at least one key");
+    order.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let first = order[0];
+    if u <= f64::from(first.1) {
+        return (first.0, first.0, 0.0);
+    }
+    for pair in order.windows(2) {
+        let (before, after) = (pair[0], pair[1]);
+        if u <= f64::from(after.1) {
+            let span = f64::from(after.1) - f64::from(before.1);
+            let mut t = if span > 0.0 {
+                ((u - f64::from(before.1)) / span).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            if smooth {
+                t = t * t * (3.0 - 2.0 * t);
+            }
+            // Land exactly on the key: `a + (b − a)·1` misses `b` by an ulp.
+            if t >= 1.0 {
+                return (after.0, after.0, 0.0);
+            }
+            return (before.0, after.0, t);
+        }
+    }
+    let last = order[order.len() - 1];
+    (last.0, last.0, 0.0)
+}
+
+fn validate_key_times(label: &str, times: impl Iterator<Item = f32>) -> Result<(), String> {
+    let times: Vec<f32> = times.collect();
+    if times.is_empty() || times.len() > MAX_CURVE_KEYS {
+        return Err(format!(
+            "{label}: a curve holds between 1 and {MAX_CURVE_KEYS} keys"
+        ));
+    }
+    for (index, time) in times.iter().enumerate() {
+        if !time.is_finite() || !(0.0..=1.0).contains(time) {
+            return Err(format!("{label} key {index}: time must be between 0 and 1"));
+        }
+    }
+    Ok(())
 }
 
 impl ZoomAnimation {
@@ -129,6 +343,18 @@ impl ZoomAnimation {
     /// Eased progress of `frame`, the sampling parameter for [`CameraPath`].
     pub(crate) fn eased_progress(&self, frame: usize) -> f64 {
         self.eased(self.progress(frame))
+    }
+
+    /// Linear (un-eased) progress of `frame`, the time base of the gradient
+    /// sweep and the parameter curves.
+    pub(crate) fn linear_progress(&self, frame: usize) -> f64 {
+        self.progress(frame)
+    }
+
+    /// Whether any curve animates the dynamics — which makes the exporter
+    /// rebuild the reference orbit per frame.
+    pub(crate) fn has_dynamics_curves(&self) -> bool {
+        self.julia_curve.is_some() || !self.family_curves.is_empty()
     }
 
     /// Whether the animation flies a waypoint path rather than the
@@ -231,6 +457,12 @@ impl ZoomAnimation {
             {
                 return Err(format!("waypoint {index}: exact centre must not be empty"));
             }
+        }
+        if let Some(curve) = &self.julia_curve {
+            curve.validate()?;
+        }
+        for curve in &self.family_curves {
+            curve.validate()?;
         }
         Ok(())
     }
@@ -874,6 +1106,156 @@ mod tests {
         assert_eq!(animation.frame_iterations_at(2_400, 0.0), 256);
         animation.validate().unwrap();
         animation.waypoints[0].magnification_log10 = f64::NAN;
+        assert!(animation.validate().is_err());
+    }
+
+    #[test]
+    fn curves_hold_lerp_and_smooth_between_keys() {
+        let curve = FamilyCurve {
+            target: FamilyCurveTarget::NovaRelaxation,
+            keys: vec![
+                CurveKey {
+                    time: 0.25,
+                    value: 1.0,
+                },
+                CurveKey {
+                    time: 0.75,
+                    value: 3.0,
+                },
+            ],
+            smooth: false,
+        };
+        // Holds before the first and after the last key.
+        assert_eq!(curve.at(0.0), 1.0);
+        assert_eq!(curve.at(1.0), 3.0);
+        // Linear between keys.
+        assert!((curve.at(0.5) - 2.0).abs() < 1e-12);
+        assert!((curve.at(0.375) - 1.5).abs() < 1e-12);
+        // Smoothstep keeps the midpoint but eases the ends.
+        let eased = FamilyCurve {
+            smooth: true,
+            ..curve.clone()
+        };
+        assert!((eased.at(0.5) - 2.0).abs() < 1e-12);
+        assert!(eased.at(0.3) < curve.at(0.3));
+        assert!(eased.at(0.7) > curve.at(0.7));
+        // A single key is a constant override.
+        let constant = FamilyCurve {
+            target: FamilyCurveTarget::MandelboxScale,
+            keys: vec![CurveKey {
+                time: 0.4,
+                value: -2.0,
+            }],
+            smooth: false,
+        };
+        for u in [0.0, 0.4, 1.0] {
+            assert_eq!(constant.at(u), -2.0);
+        }
+        // Unsorted key storage evaluates in time order.
+        let unsorted = FamilyCurve {
+            target: FamilyCurveTarget::NovaRelaxation,
+            keys: vec![
+                CurveKey {
+                    time: 0.75,
+                    value: 3.0,
+                },
+                CurveKey {
+                    time: 0.25,
+                    value: 1.0,
+                },
+            ],
+            smooth: false,
+        };
+        assert!((unsorted.at(0.5) - 2.0).abs() < 1e-12);
+        assert_eq!(unsorted.at(0.0), 1.0);
+    }
+
+    #[test]
+    fn julia_curves_morph_through_the_parameter_plane() {
+        let curve = JuliaCurve {
+            keys: vec![
+                JuliaKey {
+                    time: 0.0,
+                    c: [-0.8, 0.156],
+                },
+                JuliaKey {
+                    time: 0.5,
+                    c: [-0.4, 0.6],
+                },
+                JuliaKey {
+                    time: 1.0,
+                    c: [0.285, 0.01],
+                },
+            ],
+            smooth: false,
+        };
+        assert_eq!(curve.at(0.0), [-0.8, 0.156]);
+        assert_eq!(curve.at(0.5), [-0.4, 0.6]);
+        assert_eq!(curve.at(1.0), [0.285, 0.01]);
+        let quarter = curve.at(0.25);
+        assert!((quarter[0] - -0.6).abs() < 1e-12);
+        assert!((quarter[1] - 0.378).abs() < 1e-12);
+        curve.validate().unwrap();
+    }
+
+    #[test]
+    fn curve_validation_rejects_bad_keys_and_animation_carries_them() {
+        assert!(
+            JuliaCurve {
+                keys: Vec::new(),
+                smooth: false
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            JuliaCurve {
+                keys: vec![JuliaKey {
+                    time: 1.5,
+                    c: [0.0, 0.0]
+                }],
+                smooth: false
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            JuliaCurve {
+                keys: vec![JuliaKey {
+                    time: 0.5,
+                    c: [9.0, 0.0]
+                }],
+                smooth: false
+            }
+            .validate()
+            .is_err()
+        );
+        // Family targets enforce their own value ranges.
+        assert!(
+            FamilyCurve {
+                target: FamilyCurveTarget::NovaRelaxation,
+                keys: vec![CurveKey {
+                    time: 0.0,
+                    value: 5.0
+                }],
+                smooth: false,
+            }
+            .validate()
+            .is_err()
+        );
+        let mut animation = path(0.0, 3.0, false);
+        assert!(!animation.has_dynamics_curves());
+        animation.family_curves.push(FamilyCurve {
+            target: FamilyCurveTarget::MandelboxMinRadius,
+            keys: vec![CurveKey {
+                time: 0.0,
+                value: 0.5,
+            }],
+            smooth: false,
+        });
+        assert!(animation.has_dynamics_curves());
+        animation.validate().unwrap();
+        animation.family_curves[0].keys[0].value = 3.0;
         assert!(animation.validate().is_err());
     }
 
