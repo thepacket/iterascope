@@ -1820,6 +1820,7 @@ mod tests {
                     // The closest approach to the trap happens in the part
                     // of the orbit every deep pixel shares, so the outside
                     // trap is flat at depth; only the inside trap varies.
+                    // Skipping the shared prefix restores it — see below.
                     ColouringAlgorithm::OrbitTrap if deep_zoom => 8,
                     _ => 200,
                 };
@@ -1833,6 +1834,89 @@ mod tests {
                 );
             }
         }
+
+        // Diagnostics: the deep reference's length and the escape band of
+        // sample pixels across the deep view.
+        use crate::family::{OrbitFate, diagnose};
+        eprintln!(
+            "deep reference: {} points, escape {:?}",
+            deep.reference.len(),
+            orbit.escape_iteration
+        );
+        for offset in [-0.9f64, -0.45, 0.0, 0.45, 0.9] {
+            let world = [
+                deep_point[0] + offset * deep_half_height * gpu.aspect() as f64,
+                deep_point[1] + offset * deep_half_height,
+            ];
+            let result = diagnose(
+                family,
+                &parameters,
+                initial_state_with(family, world, false, family.default_parameter()),
+                iterations,
+                bailout as f64,
+            );
+            eprintln!(
+                "  sample {offset:+.2}: fate {:?} at iteration {}",
+                result.fate, result.iterations
+            );
+            let _ = OrbitFate::Bounded;
+        }
+
+        // Skipping the shared leading iterations restores the orbit trap's
+        // variety at depth. Deep pixels differ only in their last few dozen
+        // iterations (the escape band above sits at ~497-512), and a
+        // chaotic orbit keeps revisiting the trap, so the shared prefix
+        // dominates the minimum until the skip reaches almost the escape
+        // time — exactly how the control is used: raise it until structure
+        // appears.
+        let mut best = 0usize;
+        for skip in [0u32, 448, 480, 496, 504] {
+            let mut colouring = crate::colouring::Colouring {
+                gradient: Gradient::random(5),
+                ..crate::colouring::Colouring::default()
+            };
+            colouring
+                .outside
+                .set_algorithm(ColouringAlgorithm::OrbitTrap);
+            let mut stack = LayerStack::single(colouring);
+            stack.layers[0].skip_iterations = skip;
+            let pixel_log = (2.0 * deep_half_height / gpu.height as f64).ln() as f32;
+            gpu.set_layers(0, &stack, pixel_log);
+            let mut uniforms = Uniforms::new(
+                deep_point,
+                deep_half_height,
+                gpu.aspect(),
+                family.default_parameter(),
+                iterations,
+                bailout,
+                family.shader_flag(),
+                0,
+                true,
+                false,
+                PrecisionMode::DoubleSingle,
+                parameters.uniform_words(false),
+            );
+            uniforms = uniforms.enable_perturbation(
+                deep.scale_mantissa,
+                deep.scale_exponent,
+                deep.reference.len(),
+                true,
+                [0.0; 2],
+            );
+            let rgb = gpu.render(0, uniforms, Some(deep.reference.as_slice()));
+            let colours = distinct(&rgb);
+            eprintln!("deep outside trap with skip {skip}: {colours} distinct colours");
+            if let Some(directory) = &directory {
+                gpu.write_ppm(&format!("{directory}/trap-skip-{skip:03}.ppm"), &rgb);
+            }
+            if skip > 0 {
+                best = best.max(colours);
+            }
+        }
+        assert!(
+            best > 300,
+            "no skip revived the deep trap (best {best} colours)"
+        );
     }
 
     /// Renders the quadratic Julia plane at 1e4000× (Ultra Fractal 5's
@@ -2213,7 +2297,70 @@ mod tests {
             by_mode.push(image);
         }
 
-        // 4. The stack survives the maximum depth: all eight layers.
+        // 4. Masks: a solid-white mask between base and top changes
+        // nothing; a solid-black mask hides the top layer entirely; a
+        // half-strength mask sits in between.
+        let two_layer = render(&stack);
+        let mut masked = stack.clone();
+        let mut mask = Layer {
+            mask: true,
+            ..Layer::default()
+        };
+        mask.colouring
+            .outside
+            .set_algorithm(ColouringAlgorithm::Solid);
+        mask.colouring
+            .inside
+            .set_algorithm(ColouringAlgorithm::Solid);
+        mask.colouring.outside.solid = [1.0, 1.0, 1.0];
+        mask.colouring.inside.solid = [1.0, 1.0, 1.0];
+        masked.layers.insert(1, mask);
+        assert_eq!(
+            render(&masked),
+            two_layer,
+            "a solid-white mask changed the image"
+        );
+        masked.layers[1].colouring.outside.solid = [0.0; 3];
+        masked.layers[1].colouring.inside.solid = [0.0; 3];
+        let black_masked = render(&masked);
+        let base_only = render(&LayerStack::single(base.clone()));
+        // The masked stack still carries the top layer's accumulators and so
+        // renders through the orbit-statistics pipeline variant, whose
+        // instruction scheduling wiggles the last bit; compare with a small
+        // tolerance rather than byte-for-byte.
+        let differing = black_masked
+            .chunks(3)
+            .zip(base_only.chunks(3))
+            .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 2))
+            .count();
+        assert!(
+            differing < black_masked.len() / 3 / 200,
+            "a solid-black mask did not hide the layer above ({differing} pixels differ)"
+        );
+        masked.layers[1].opacity = 0.5;
+        let half_masked = render(&masked);
+        assert_ne!(half_masked, two_layer);
+        assert_ne!(half_masked, base_only);
+        // A gradient-driven mask produces a spatially varying blend.
+        masked.layers[1].opacity = 1.0;
+        masked.layers[1]
+            .colouring
+            .outside
+            .set_algorithm(ColouringAlgorithm::Iteration);
+        let varying = render(&masked);
+        assert_ne!(varying, two_layer);
+        assert_ne!(varying, base_only);
+        let distinct: std::collections::HashSet<&[u8]> = varying.chunks(3).collect();
+        eprintln!(
+            "gradient-masked composite: {} distinct colours",
+            distinct.len()
+        );
+        assert!(distinct.len() > 200);
+        if let Some(directory) = &directory {
+            gpu.write_ppm(&format!("{directory}/layers-masked.ppm"), &varying);
+        }
+
+        // 5. The stack survives the maximum depth: all eight layers.
         while stack.layers.len() < crate::colouring::MAX_LAYERS {
             let mut layer = stack.layers[1].clone();
             layer.opacity = 0.35;

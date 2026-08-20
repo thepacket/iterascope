@@ -141,7 +141,10 @@ from it.
   (Ultra Fractal 5's limit; IteraScope navigates to `1e5000×`)
 - Layers: up to eight complete colour stages composited over one iteration
   pass — each layer has its own gradient, algorithms, opacity and merge mode
-  (Normal, Add, Multiply, Screen, Overlay, Darken, Lighten, Difference) —
+  (Normal, Add, Multiply, Screen, Overlay, Darken, Lighten, Difference), and
+  any layer can act as a mask: it paints nothing and its luminance (times
+  its opacity) multiplies the opacity of the layer above it, so any
+  colouring algorithm can shape where another layer shows —
   with a single-image workspace (the default layout) that gives the
   composited image the full window. Layers share the image's location and
   family, so one reference orbit serves the whole stack and the deep-zoom
@@ -241,7 +244,20 @@ beneath it by its opacity and merge mode (the bottom layer composites over
 black, its mode ignored). Duplicate the active layer, restyle it — a stripe
 average multiplied over an iteration-count base, an orbit trap screened on
 top — and reorder or hide layers freely; the **Colouring** section always
-edits the active layer. Layers currently share the image's location, family
+edits the active layer. The **M** toggle in a layer's blend row turns it into
+a mask: it stops painting and its luminance, scaled by its opacity, controls
+the opacity of the layer above it — a stripe-average mask carving windows
+into a top layer, an orbit-trap mask haloing the set. Consecutive masks
+multiply.
+
+Each layer also has a **skip first N iterations** control (shown when a
+trap, stripe or triangle-inequality algorithm is selected). At deep
+magnifications every pixel's orbit shares hundreds of identical leading
+iterations with its neighbours, so those accumulators collapse to a single
+value; skipping the shared prefix — raise it until structure appears, which
+happens as the skip nears the view's typical escape time — restores their
+full variety. The GPU suite demonstrates the effect at `1e12×`: the outside
+point trap goes from 2 distinct colours at skip 0 to ~1900 at skip 496. Layers currently share the image's location, family
 and iteration settings (per-layer formulas and locations are future work),
 which is what keeps the whole stack exact at any magnification: one
 reference orbit drives every layer. The view
@@ -523,7 +539,9 @@ iteration, distance, stripe and triangle colourings around an
 arbitrary-precision reference at `1e4000×`, a five-frame zoom-path export
 crossing every precision path at a row-padded width, a layer-compositing test
 (a single-layer stack must reproduce the pre-layer renderer byte for byte,
-every merge mode must be distinct, and an eight-layer stack must survive),
+every merge mode must be distinct, white/black/gradient masks must behave,
+an eight-layer stack must survive, and skipping leading iterations must
+revive the orbit trap at depth),
 and a timing probe that also records the cost of the orbit-statistics
 variant:
 
@@ -558,11 +576,13 @@ live state is changed.
 5. Orbit probes for the non-quadratic escape-time families, and
    arbitrary-precision exponential/trigonometric reference orbits so the
    transcendental families can join the deep-zoom path
-6. Towards generative fractal art: per-layer formulas, locations and masks
-   (layers, the switch picker, anti-aliased tiled stills and the single-image
-   default landed); keyframed centre drift and per-parameter animation
-   curves; orbit-trap options that skip the shared leading iterations of
-   deep orbits; derivatives for the remaining families' distance estimates
+6. Towards generative fractal art: per-layer formulas and locations (layer
+   masks, iteration skipping, the switch picker, anti-aliased tiled stills
+   and the single-image default landed); keyframed centre drift and
+   per-parameter animation curves; register-resident accumulators for the
+   first statistics-bearing layer (the per-layer arrays cost the opt-in
+   statistics variant roughly 2× today); derivatives for the remaining
+   families' distance estimates
 
 ## Project status
 

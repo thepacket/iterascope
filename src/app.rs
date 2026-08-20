@@ -1797,7 +1797,18 @@ impl App {
             ui.horizontal(|ui| {
                 ui.add_space(26.0);
                 let layer = &mut self.layers.layers[index];
-                if bottom {
+                if ui
+                    .selectable_label(layer.mask, "M")
+                    .on_hover_text(
+                        "Mask: this layer paints nothing; its luminance (times its opacity) multiplies the opacity of the layer above it",
+                    )
+                    .clicked()
+                {
+                    layer.mask = !layer.mask;
+                }
+                if layer.mask {
+                    ui.label(egui::RichText::new("mask ↑").small().color(CREAM));
+                } else if bottom {
                     ui.label(egui::RichText::new("base").small().color(MUTED))
                         .on_hover_text(
                             "The bottom layer composites over black; its merge mode is ignored",
@@ -1921,6 +1932,34 @@ impl App {
                 });
         });
         ui.add_space(4.0);
+
+        {
+            let layer = self.layers.active_layer_mut();
+            let uses_accumulators = [&layer.colouring.outside, &layer.colouring.inside]
+                .iter()
+                .any(|side| {
+                    matches!(
+                        side.algorithm,
+                        ColouringAlgorithm::OrbitTrap
+                            | ColouringAlgorithm::Stripes
+                            | ColouringAlgorithm::TriangleInequality
+                    )
+                });
+            if uses_accumulators {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("skip first").color(MUTED));
+                    ui.add(
+                        egui::DragValue::new(&mut layer.skip_iterations)
+                            .range(0..=49_999)
+                            .speed(5),
+                    )
+                    .on_hover_text(
+                        "Iterations the trap, stripe and triangle accumulators ignore. Deep-zoom pixels share their leading iterations, which flattens these colourings; skip the shared prefix to restore their variety.",
+                    );
+                    ui.label(egui::RichText::new("iterations").color(MUTED));
+                });
+            }
+        }
 
         let outside_label = if family.converges() {
             "Outside · converged"

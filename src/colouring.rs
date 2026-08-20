@@ -1174,6 +1174,14 @@ pub(crate) struct Layer {
     pub(crate) visible: bool,
     pub(crate) opacity: f32,
     pub(crate) merge_mode: MergeMode,
+    /// A mask paints nothing: the luminance of its colour, scaled by its
+    /// opacity, multiplies the opacity of the next non-mask layer above it.
+    pub(crate) mask: bool,
+    /// Iterations the layer's orbit-trap, stripe and triangle-inequality
+    /// accumulators ignore at the start of every orbit. Deep-zoom pixels
+    /// share hundreds of identical leading iterations, which flattens those
+    /// colourings; skipping the shared prefix restores their variety.
+    pub(crate) skip_iterations: u32,
     pub(crate) colouring: Colouring,
 }
 
@@ -1184,6 +1192,8 @@ impl Default for Layer {
             visible: true,
             opacity: 1.0,
             merge_mode: MergeMode::Normal,
+            mask: false,
+            skip_iterations: 0,
             colouring: Colouring::default(),
         }
     }
@@ -1193,6 +1203,11 @@ impl Layer {
     pub(crate) fn validate(&self, index: usize) -> Result<(), String> {
         if !self.opacity.is_finite() || !(0.0..=1.0).contains(&self.opacity) {
             return Err(format!("layer {index}: opacity must be between 0 and 1"));
+        }
+        if self.skip_iterations >= 50_000 {
+            return Err(format!(
+                "layer {index}: skip_iterations must be below 50000"
+            ));
         }
         self.colouring
             .validate()
@@ -1304,6 +1319,10 @@ impl LayerStack {
             let base = 2 + count * LAYER_WORDS;
             words[base..base + 4].copy_from_slice(&outside);
             words[base + 4..base + 8].copy_from_slice(&inside);
+            // The two spare `d.w` slots carry the layer's mask flag and its
+            // accumulator skip; see `outside_d`/`inside_d` in fractal.wgsl.
+            words[base + 3][3] = layer.mask as u8 as f32;
+            words[base + 7][3] = layer.skip_iterations.min(49_999) as f32;
             let needs_trap = colouring.needs(ColouringAlgorithm::OrbitTrap);
             let needs_stripes = colouring.needs(ColouringAlgorithm::Stripes);
             words[base + 8] = [
@@ -1556,6 +1575,42 @@ gradient:
         stack.validate().unwrap();
         // The combined gradient table packs one table per visible layer.
         assert_eq!(stack.lookup_tables().len(), 2 * LOOKUP_TABLE_LEN);
+    }
+
+    #[test]
+    fn mask_flag_and_skip_land_in_the_spare_d_words() {
+        let mut mask = Layer {
+            mask: true,
+            opacity: 0.7,
+            ..Layer::default()
+        };
+        mask.colouring
+            .outside
+            .set_algorithm(ColouringAlgorithm::OrbitTrap);
+        mask.skip_iterations = 250;
+        let mut stack = LayerStack::default();
+        stack.layers.push(mask);
+        let words = stack.gpu_words(0.0);
+        // Layer 0: no mask, no skip.
+        assert_eq!(words[2 + 3][3], 0.0);
+        assert_eq!(words[2 + 7][3], 0.0);
+        // Layer 1: mask flag in outside_d.w, skip in inside_d.w; the solid
+        // colours in d.rgb are untouched.
+        assert_eq!(words[2 + 9 + 3][3], 1.0);
+        assert_eq!(words[2 + 9 + 7][3], 250.0);
+        stack.validate().unwrap();
+        stack.layers[1].skip_iterations = 60_000;
+        assert!(stack.validate().is_err());
+        stack.layers[1].skip_iterations = 0;
+
+        // Round trip through JSON keeps the new fields; old documents
+        // without them default to no mask, no skip.
+        let json = serde_json::to_string(&stack.layers).unwrap();
+        let back: Vec<Layer> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, stack.layers);
+        let old: Layer = serde_json::from_str("{\"name\":\"x\"}").unwrap();
+        assert!(!old.mask);
+        assert_eq!(old.skip_iterations, 0);
     }
 
     #[test]

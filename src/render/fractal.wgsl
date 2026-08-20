@@ -175,20 +175,27 @@ struct OrbitStats {
     // inside trap shapes.
     trap_outside: array<f32, 8>,
     trap_inside: array<f32, 8>,
-    // Triangle-inequality terms: running sum, the most recent term and the
-    // number of terms, so the last term can be blended by the fractional
-    // iteration count. Shared across layers (depends only on the family).
-    tia_sum: f32,
-    tia_last: f32,
-    tia_count: f32,
+    // Triangle-inequality terms per layer: running sum and the most recent
+    // term. Per layer because each layer may skip a different number of
+    // leading iterations; the term counts are derived from the final
+    // iteration count and the skip, so they are not stored.
+    tia_sum: array<f32, 8>,
+    tia_last: array<f32, 8>,
     // Stripe-average terms per layer (the frequency is a layer setting).
     stripe_sum: array<f32, 8>,
     stripe_last: array<f32, 8>,
-    stripe_count: f32,
     // Derivative of z_n with respect to the pixel coordinate, for distance
     // estimation; scaled so it survives deep zooms. Shared across layers.
     derivative: ScaledComplex,
 };
+
+// Iterations a layer's trap and average accumulators ignore at the start of
+// every orbit. Deep-zoom pixels share hundreds of identical leading
+// iterations with their neighbours; skipping them restores the variety of
+// traps, stripe and triangle averages at depth.
+fn layer_skip(layer: u32) -> u32 {
+    return u32(colouring.layers[layer].inside_d.w + 0.5);
+}
 
 struct EscapeResult {
     escaped: bool,
@@ -1830,13 +1837,11 @@ fn stats_new(dynamical: bool) -> OrbitStats {
     for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
         stats.trap_outside[layer] = 1e30;
         stats.trap_inside[layer] = 1e30;
+        stats.tia_sum[layer] = 0.0;
+        stats.tia_last[layer] = 0.0;
         stats.stripe_sum[layer] = 0.0;
         stats.stripe_last[layer] = 0.0;
     }
-    stats.tia_sum = 0.0;
-    stats.tia_last = 0.0;
-    stats.tia_count = 0.0;
-    stats.stripe_count = 0.0;
     stats.derivative = ScaledComplex(vec2<f32>(select(0.0, 1.0, dynamical), 0.0), 0);
     return stats;
 }
@@ -1909,14 +1914,21 @@ fn observe(
     if (!ORBIT_STATS) { return; }
     let count = layer_count();
     if (colouring.needs.x > 0.5) {
+        // Field-wise reads: copying the whole layer struct per iteration
+        // costs real time on Metal.
         for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
             if (layer >= count) { break; }
-            let l = colouring.layers[layer];
-            if (l.blend.z < 0.5) { continue; }
+            if (colouring.layers[layer].blend.z < 0.5 || iteration <= layer_skip(layer)) {
+                continue;
+            }
+            let outside_b = colouring.layers[layer].outside_b;
+            let outside_c = colouring.layers[layer].outside_c;
+            let inside_b = colouring.layers[layer].inside_b;
+            let inside_c = colouring.layers[layer].inside_c;
             (*stats).trap_outside[layer] = min((*stats).trap_outside[layer], trap_metric(
-                u32(l.outside_b.w + 0.5), l.outside_c.xy, l.outside_c.z, z));
+                u32(outside_b.w + 0.5), outside_c.xy, outside_c.z, z));
             (*stats).trap_inside[layer] = min((*stats).trap_inside[layer], trap_metric(
-                u32(l.inside_b.w + 0.5), l.inside_c.xy, l.inside_c.z, z));
+                u32(inside_b.w + 0.5), inside_c.xy, inside_c.z, z));
         }
     }
     if (colouring.needs.y > 0.5 && iteration > 1u) {
@@ -1935,25 +1947,33 @@ fn observe(
         if (span > 1e-12) {
             term = clamp((length(z) - low) / span, 0.0, 1.0);
         }
-        (*stats).tia_sum = (*stats).tia_sum + term;
-        (*stats).tia_last = term;
-        (*stats).tia_count = (*stats).tia_count + 1.0;
+        for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
+            if (layer >= count) { break; }
+            let uses_tia = u32(colouring.layers[layer].outside_a.x + 0.5) == ALGORITHM_TRIANGLE
+                || u32(colouring.layers[layer].inside_a.x + 0.5) == ALGORITHM_TRIANGLE;
+            if (!uses_tia || iteration <= 1u + layer_skip(layer)) { continue; }
+            (*stats).tia_sum[layer] = (*stats).tia_sum[layer] + term;
+            (*stats).tia_last[layer] = term;
+        }
     }
     if (colouring.needs.z > 0.5) {
         let angle = atan2(z.y, z.x);
         for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
             if (layer >= count) { break; }
-            let l = colouring.layers[layer];
-            if (l.blend.w < 0.5) { continue; }
+            if (colouring.layers[layer].blend.w < 0.5 || iteration <= layer_skip(layer)) {
+                continue;
+            }
             // The layer's outside frequency when its outside uses stripes,
             // otherwise its inside frequency.
-            let frequency = select(l.inside_b.z, l.outside_b.z,
-                u32(l.outside_a.x + 0.5) == ALGORITHM_STRIPES);
+            let frequency = select(
+                colouring.layers[layer].inside_b.z,
+                colouring.layers[layer].outside_b.z,
+                u32(colouring.layers[layer].outside_a.x + 0.5) == ALGORITHM_STRIPES,
+            );
             let term = 0.5 + 0.5 * sin(frequency * angle);
             (*stats).stripe_sum[layer] = (*stats).stripe_sum[layer] + term;
             (*stats).stripe_last[layer] = term;
         }
-        (*stats).stripe_count = (*stats).stripe_count + 1.0;
     }
     if (colouring.needs.w > 0.5 && family_has_derivative(family)) {
         (*stats).derivative = derivative_step(family, (*stats).derivative, z_prev, c, dynamical);
@@ -2046,15 +2066,20 @@ fn colour_side(
         }
         case ALGORITHM_TRIANGLE: {
             if (ORBIT_STATS) {
-                value = blended_average(result.stats.tia_sum, result.stats.tia_last,
-                    result.stats.tia_count, final_term_weight(family, result));
+                // Terms start at iteration 2 + skip.
+                let terms = f32(result.iteration) - 1.0 - f32(layer_skip(layer));
+                value = blended_average(result.stats.tia_sum[layer],
+                    result.stats.tia_last[layer],
+                    terms, final_term_weight(family, result));
             }
         }
         case ALGORITHM_STRIPES: {
             if (ORBIT_STATS) {
+                // Terms start at iteration 1 + skip.
+                let terms = f32(result.iteration) - f32(layer_skip(layer));
                 value = blended_average(result.stats.stripe_sum[layer],
                     result.stats.stripe_last[layer],
-                    result.stats.stripe_count, final_term_weight(family, result));
+                    terms, final_term_weight(family, result));
             }
         }
         case ALGORITHM_DISTANCE: {
@@ -2127,18 +2152,38 @@ fn blend_layer(dst: vec3<f32>, src: vec3<f32>, mode: u32, opacity: f32) -> vec3<
 // bottom layer's merge mode is ignored: it composites over black by its
 // opacity alone, so a single-layer stack reproduces the pre-layer renderer
 // exactly at opacity 1.
+// The composited colour of the visible layer stack, bottom first. A layer
+// flagged as a mask (outside_d.w) paints nothing: the luminance of its
+// colour — scaled by its opacity — multiplies the opacity of the next
+// non-mask layer above it, Ultra Fractal style. Consecutive masks multiply.
 fn colour_stage(family: u32, result: GenericResult) -> vec3<f32> {
     let count = layer_count();
-    var colour = layer_colour(0u, family, result) * clamp(colouring.layers[0].blend.y, 0.0, 1.0);
-    for (var layer = 1u; layer < MAX_LAYERS; layer = layer + 1u) {
+    var colour = vec3<f32>(0.0);
+    var pending_mask = 1.0;
+    var painted = false;
+    for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
         if (layer >= count) { break; }
         let l = colouring.layers[layer];
-        colour = blend_layer(
-            colour,
-            layer_colour(layer, family, result),
-            u32(l.blend.x + 0.5),
-            l.blend.y,
-        );
+        let source = layer_colour(layer, family, result);
+        if (l.outside_d.w > 0.5) {
+            let luminance = clamp(
+                dot(source, vec3<f32>(0.2126, 0.7152, 0.0722)),
+                0.0,
+                1.0,
+            );
+            pending_mask = pending_mask * mix(1.0, luminance, clamp(l.blend.y, 0.0, 1.0));
+            continue;
+        }
+        let opacity = clamp(l.blend.y, 0.0, 1.0) * pending_mask;
+        pending_mask = 1.0;
+        if (painted) {
+            colour = blend_layer(colour, source, u32(l.blend.x + 0.5), opacity);
+        } else {
+            // The bottom painted layer composites over black; its merge
+            // mode is ignored.
+            colour = source * opacity;
+            painted = true;
+        }
     }
     return colour;
 }
