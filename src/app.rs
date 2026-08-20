@@ -442,17 +442,46 @@ impl App {
             });
 
             section(ui, "Document", |ui| {
-                if ui.button("Export / Import JSON").clicked() {
-                    self.refresh_experiment_json();
-                    self.experiment_editor_open = true;
-                }
+                ui.horizontal(|ui| {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        if ui
+                            .button("Open…")
+                            .on_hover_text("Load an experiment document (.json)")
+                            .clicked()
+                        {
+                            self.open_document();
+                        }
+                        if ui
+                            .button("Save…")
+                            .on_hover_text("Save the experiment as a .json document")
+                            .clicked()
+                        {
+                            self.save_document();
+                        }
+                    }
+                    if ui
+                        .button("Edit JSON…")
+                        .on_hover_text("View, copy or paste the document as JSON text")
+                        .clicked()
+                    {
+                        self.refresh_experiment_json();
+                        self.experiment_editor_open = true;
+                    }
+                });
                 ui.label(
                     egui::RichText::new(
-                        "Versioned experiment documents reproduce both views and their scientific settings.",
+                        "Versioned experiment documents reproduce the views, layers and scientific settings.",
                     )
                     .small()
                     .color(MUTED),
                 );
+                if let Some((message, error)) = &self.experiment_message
+                    && !self.experiment_editor_open
+                {
+                    let colour = if *error { CORAL } else { BLUE };
+                    ui.label(egui::RichText::new(message).small().color(colour));
+                }
             });
 
             if self.family.linkage() == Linkage::ParameterDynamical {
@@ -1080,6 +1109,60 @@ impl App {
             } else {
                 None
             },
+        }
+    }
+
+    /// Loads an experiment document chosen in the native file dialog.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_document(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("IteraScope experiment", &["json"])
+            .set_title("Open experiment document")
+            .pick_file()
+        else {
+            return;
+        };
+        let loaded = std::fs::read_to_string(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|json| ExperimentDocument::from_json(&json));
+        match loaded {
+            Ok(document) => {
+                self.apply_experiment(document);
+                self.experiment_message = Some((format!("Loaded {}", path.display()), false));
+            }
+            Err(error) => {
+                self.experiment_message =
+                    Some((format!("Cannot load {}: {error}", path.display()), true));
+            }
+        }
+    }
+
+    /// Saves the current experiment document through the native file dialog.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn save_document(&mut self) {
+        let json = match self.experiment_document().to_pretty_json() {
+            Ok(json) => json,
+            Err(error) => {
+                self.experiment_message = Some((error, true));
+                return;
+            }
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("IteraScope experiment", &["json"])
+            .set_file_name(format!("{}-experiment.json", self.family.document_id()))
+            .set_title("Save experiment document")
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, json) {
+            Ok(()) => {
+                self.experiment_message = Some((format!("Saved {}", path.display()), false));
+            }
+            Err(error) => {
+                self.experiment_message =
+                    Some((format!("Cannot save {}: {error}", path.display()), true));
+            }
         }
     }
 

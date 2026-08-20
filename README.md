@@ -551,8 +551,10 @@ ITERASCOPE_RENDER_DIR=out cargo test --release gpu_ -- --ignored --nocapture
 
 ## Experiment documents
 
-Open **Document → Export / Import JSON** to capture the complete reproducible
-experiment state. The versioned document (format version 6) records the
+**Document → Save…** writes the complete reproducible experiment state to a
+`.json` file through the native file dialog, and **Open…** loads one back
+(native app; the browser build uses the JSON editor instead). **Edit JSON…**
+opens the same document as text for clipboard exchange. The versioned document (format version 6) records the
 active family, both plane centres and scales, the selected parameter or
 starting value, the family parameters the active family uses, computation
 limits, the layer stack with each layer's gradient and colouring algorithms,
@@ -561,9 +563,9 @@ documents load their single colouring as a one-layer stack; documents from
 before version 5 load with the default colouring (their palette phase becomes
 the outside offset). Runtime
 diagnostics, selected inspector step and frame timing are deliberately not
-stored. Copy the JSON to export it; paste another IteraScope document into the
-editor and choose **Load JSON** to import it. Imports are validated before any
-live state is changed.
+stored. In the editor, copy the JSON to export it; paste another IteraScope
+document and choose **Load JSON** to import it. Opens and imports are
+validated before any live state is changed.
 
 ## Near-term roadmap
 
