@@ -30,6 +30,7 @@ use crate::precision::{
     ValidityLevel,
 };
 use crate::render::GpuReferencePoint;
+use crate::transform::{self, Transformation, TransformationKind};
 use crate::render::{
     self, ColouringUniforms, DeepRenderData, FractalPipeline, GradientTable, LayerPass, Uniforms,
     composite_cpu,
@@ -194,9 +195,15 @@ impl PlaneView {
     fn point_at(&self, rect: egui::Rect, position: egui::Pos2) -> [f64; 2] {
         let nx = ((position.x - rect.center().x) / (rect.height() * 0.5)) as f64;
         let ny = ((rect.center().y - position.y) / (rect.height() * 0.5)) as f64;
+        self.point_from_local([nx, ny])
+    }
+
+    /// The world point of a view-local coordinate (x and y in units of the
+    /// half-height, y up) — the pick path routes warped locals through this.
+    fn point_from_local(&self, local: [f64; 2]) -> [f64; 2] {
         [
-            self.centre[0] + nx * self.half_height,
-            self.centre[1] + ny * self.half_height,
+            self.centre[0] + local[0] * self.half_height,
+            self.centre[1] + local[1] * self.half_height,
         ]
     }
 
@@ -245,6 +252,10 @@ pub struct App {
     bailout: f32,
     grid: bool,
     layers: LayerStack,
+    /// The transformations stage of the image: screen-space warps applied
+    /// to both panes and to shared-scene exports (detached layer scenes
+    /// stay unwarped).
+    transformations: Vec<Transformation>,
     /// Single composited image instead of the two linked panes.
     single_image: bool,
     /// The Ultra Fractal-style switch picker: a parameter-plane window with
@@ -344,6 +355,7 @@ impl App {
             bailout: 4.0,
             grid: false,
             layers: LayerStack::default(),
+            transformations: Vec::new(),
             single_image: true,
             switch_picker_open: false,
             left_panel_open: true,
@@ -1011,6 +1023,8 @@ impl App {
 
                 section(ui, "Colouring", |ui| self.colouring_controls(ui));
 
+                section(ui, "Transformations", |ui| self.transformation_controls(ui));
+
                 section(ui, "Still image", |ui| self.still_controls(ui));
 
                 section(ui, "Animation", |ui| self.animation_controls(ui));
@@ -1110,6 +1124,7 @@ impl App {
             },
             animation: (self.animation != ZoomAnimation::default())
                 .then(|| self.animation.clone()),
+            transformations: self.transformations.clone(),
         }
     }
 
@@ -1285,6 +1300,7 @@ impl App {
         };
         self.gradient_selected_stop = 0;
         self.animation = document.animation.unwrap_or_default();
+        self.transformations = document.transformations;
 
         self.zoom_focus = [None, None];
         self.pending_pan_steps = [0.0; 2];
@@ -1513,10 +1529,14 @@ impl App {
                     accelerate_zoom_factor(0.5, accelerated)
                 };
                 let overview_detail = self.family.linkage() == Linkage::OverviewDetail;
+                // Picking looks through the transformations stage: the
+                // clicked pixel's warped coordinate is what the shader drew
+                // there, so recentring lands on the feature under the cursor.
+                let picked_local =
+                    transform::apply_chain(&self.transformations, local_coordinate(viewport, position));
                 if let Some(deep) = &mut self.deep_views[pane] {
                     // Deep navigation: recentre and zoom in arbitrary precision.
-                    let local = local_coordinate(viewport, position);
-                    let _ = deep.recenter_local(local);
+                    let _ = deep.recenter_local(picked_local);
                     if overview_detail {
                         if pane == 0 && secondary_click {
                             // Recentre the overview only.
@@ -1543,9 +1563,9 @@ impl App {
                     self.zoom_focus[pane] = None;
                 } else if overview_detail {
                     let point = if pane == 0 {
-                        self.parameter.point_at(viewport, position)
+                        self.parameter.point_from_local(picked_local)
                     } else {
-                        self.dynamical.point_at(viewport, position)
+                        self.dynamical.point_from_local(picked_local)
                     };
                     if pane == 0 && secondary_click {
                         // Recentre the overview only.
@@ -1567,9 +1587,9 @@ impl App {
                     }
                 } else {
                     let point = if pane == 0 {
-                        self.parameter.point_at(viewport, position)
+                        self.parameter.point_from_local(picked_local)
                     } else {
-                        self.dynamical.point_at(viewport, position)
+                        self.dynamical.point_from_local(picked_local)
                     };
                     self.zoom_focus[pane] = Some(point);
                     if pane == 0 {
@@ -1756,6 +1776,10 @@ impl App {
                 data.ds_fallback,
                 data.reference_offset,
             );
+        }
+        if !self.transformations.is_empty() {
+            let (words, count) = transform::shader_words(&self.transformations);
+            uniforms = uniforms.with_transformations(words, count, [1.0, 0.0, 0.0]);
         }
         // Natural log of one pixel's height in world units, from the
         // magnification so it stays finite far below f64 range.
@@ -2081,6 +2105,10 @@ impl App {
                         data.ds_fallback,
                         data.reference_offset,
                     );
+                }
+                if !self.transformations.is_empty() {
+                    let (words, count) = transform::shader_words(&self.transformations);
+                    uniforms = uniforms.with_transformations(words, count, [1.0, 0.0, 0.0]);
                 }
                 (uniforms, deep.clone(), pixel_log)
             };
@@ -2834,6 +2862,114 @@ impl App {
         #[cfg(target_arch = "wasm32")]
         {
             self.animation_export_controls_web(ui);
+        }
+    }
+
+    /// The transformations stage editor: chain up to four screen-space
+    /// warps — rotation, mirror fold, kaleidoscope, twist, inversion —
+    /// applied around the view centre before the dynamics see the pixel.
+    /// Exact at any depth; applies to the image (detached layer scenes
+    /// stay unwarped).
+    fn transformation_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "Warps of the view around its centre, applied before the fractal is sampled — kaleidoscopes of a 10^1000 zoom stay exact. First in the list is applied first.",
+            )
+            .small()
+            .color(MUTED),
+        );
+        let mut remove = None;
+        let mut swap = None;
+        let count = self.transformations.len();
+        for (index, transformation) in self.transformations.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(transformation.kind.label())
+                        .small()
+                        .strong(),
+                );
+                if ui
+                    .add_enabled(index > 0, egui::Button::new("↑").small())
+                    .clicked()
+                {
+                    swap = Some(index - 1);
+                }
+                if ui
+                    .add_enabled(index + 1 < count, egui::Button::new("↓").small())
+                    .clicked()
+                {
+                    swap = Some(index);
+                }
+                if ui.small_button("✕").clicked() {
+                    remove = Some(index);
+                }
+            });
+            match transformation.kind {
+                TransformationKind::Rotation | TransformationKind::Mirror => {
+                    let label = if transformation.kind == TransformationKind::Rotation {
+                        "angle°"
+                    } else {
+                        "axis°"
+                    };
+                    let mut degrees = transformation.a.to_degrees();
+                    if ui
+                        .add(egui::Slider::new(&mut degrees, -360.0..=360.0).text(label))
+                        .changed()
+                    {
+                        transformation.a = degrees.to_radians();
+                    }
+                }
+                TransformationKind::Kaleidoscope => {
+                    let mut sectors = transformation.a.round() as u32;
+                    if ui
+                        .add(egui::Slider::new(&mut sectors, 2..=24).text("sectors"))
+                        .changed()
+                    {
+                        transformation.a = f64::from(sectors);
+                    }
+                    let mut degrees = transformation.b.to_degrees();
+                    if ui
+                        .add(egui::Slider::new(&mut degrees, -180.0..=180.0).text("rotation°"))
+                        .changed()
+                    {
+                        transformation.b = degrees.to_radians();
+                    }
+                }
+                TransformationKind::Twist => {
+                    ui.add(
+                        egui::Slider::new(&mut transformation.a, -8.0..=8.0)
+                            .text("radians per unit radius"),
+                    );
+                }
+                TransformationKind::Inversion => {
+                    ui.add(
+                        egui::Slider::new(&mut transformation.a, 0.05..=4.0)
+                            .logarithmic(true)
+                            .text("radius"),
+                    );
+                }
+            }
+        }
+        if let Some(index) = swap {
+            self.transformations.swap(index, index + 1);
+        }
+        if let Some(index) = remove {
+            self.transformations.remove(index);
+        }
+        if self.transformations.len() < transform::MAX_TRANSFORMATIONS {
+            ui.horizontal_wrapped(|ui| {
+                for kind in [
+                    TransformationKind::Rotation,
+                    TransformationKind::Mirror,
+                    TransformationKind::Kaleidoscope,
+                    TransformationKind::Twist,
+                    TransformationKind::Inversion,
+                ] {
+                    if ui.button(format!("+ {}", kind.label())).clicked() {
+                        self.transformations.push(kind.default_transformation());
+                    }
+                }
+            });
         }
     }
 
@@ -3729,6 +3865,7 @@ impl App {
             parameters: self.family_parameters.clone(),
             deep_julia_c: self.deep_julia_c.clone(),
             recipe,
+            transformations: self.transformations.clone(),
         })
     }
 
@@ -3922,10 +4059,12 @@ impl App {
                         single_pass: Some((layer, gradient_base)),
                         path: None,
                         // Detached scenes keep their own fixed dynamics;
-                        // parameter curves never touch them.
+                        // parameter curves and transformations never touch
+                        // them.
                         parameters: scene.parameters(),
                         deep_julia_c: None,
                         recipe: None,
+                        transformations: Vec::new(),
                     },
                 }
             } else {
@@ -3948,6 +4087,7 @@ impl App {
                     parameters: shared.parameters.clone(),
                     deep_julia_c: shared.deep_julia_c.clone(),
                     recipe: shared.recipe.clone(),
+                    transformations: shared.transformations.clone(),
                 };
                 scene.single_pass = Some((layer.clone(), gradient_base));
                 FrozenPass {
@@ -4216,7 +4356,21 @@ impl App {
         else {
             return;
         };
-        if search.contains("autotest=still") {
+        if search.contains("autotest=transform") {
+            log::info!("autotest: rendering a 640×360 kaleidoscope-twist still");
+            self.transformations = vec![
+                TransformationKind::Kaleidoscope.default_transformation(),
+                Transformation {
+                    kind: TransformationKind::Twist,
+                    a: 0.8,
+                    b: 0.0,
+                },
+            ];
+            self.still_width = 640;
+            self.still_height = 360;
+            self.still_supersample = 2;
+            self.start_still_web(ctx);
+        } else if search.contains("autotest=still") {
             log::info!("autotest: rendering a 640×360 still at 2×2 anti-aliasing");
             self.still_width = 640;
             self.still_height = 360;
@@ -5694,6 +5848,8 @@ struct FrozenScene {
     /// The scene centre in rebuildable form, for per-frame reference
     /// reconstruction under animated dynamics.
     recipe: Option<CentreRecipe>,
+    /// The transformations stage; empty for detached layer scenes.
+    transformations: Vec<Transformation>,
 }
 
 /// The exact centre a reference orbit can be rebuilt at when animated
@@ -6047,6 +6203,18 @@ impl FrozenScene {
                 points.len(),
                 ds_fallback,
                 region.reference_offset,
+            );
+        }
+        if !self.transformations.is_empty() {
+            let (words, count) = transform::shader_words(&self.transformations);
+            uniforms = uniforms.with_transformations(
+                words,
+                count,
+                [
+                    region.share,
+                    region.frame_centre_local[0],
+                    region.frame_centre_local[1],
+                ],
             );
         }
         let pixel_log = animation::frame_pixel_log(magnification, full_size.1);
@@ -6956,6 +7124,7 @@ mod tests {
             parameters: FamilyParameters::default(),
             deep_julia_c: None,
             recipe: Some(CentreRecipe { centre, deep }),
+            transformations: Vec::new(),
         }
     }
 

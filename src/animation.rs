@@ -680,6 +680,12 @@ pub(crate) struct RegionView {
     /// Frame centre relative to the region centre, in region-local units
     /// (x and y in units of the region half-height).
     pub(crate) reference_offset: [f32; 2],
+    /// Region half-height as a share of the frame half-height.
+    pub(crate) share: f32,
+    /// Region centre in frame-local units (x spans ±frame aspect, y ±1) —
+    /// with `share`, the affine map the transformations stage uses to
+    /// evaluate warps in frame coordinates.
+    pub(crate) frame_centre_local: [f32; 2],
 }
 
 /// `frame_reference_offset` is the reference point's position relative to
@@ -718,6 +724,8 @@ pub(crate) fn region_view(
             ((frame_reference_offset[0] - centre_x) / share) as f32,
             ((frame_reference_offset[1] - centre_y) / share) as f32,
         ],
+        share: share as f32,
+        frame_centre_local: [centre_x as f32, centre_y as f32],
     }
 }
 

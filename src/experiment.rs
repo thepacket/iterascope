@@ -7,7 +7,7 @@ use crate::colouring::{Colouring, Layer, MAX_LAYERS};
 use crate::family::{FamilyParameters, FractalFamily, Linkage};
 
 pub(crate) const FORMAT_ID: &str = "iterascope-experiment";
-pub(crate) const FORMAT_VERSION: u32 = 9;
+pub(crate) const FORMAT_VERSION: u32 = 10;
 /// Largest escape radius a document may ask for. Large radii give the
 /// triangle-inequality and stripe colourings their smoothest results.
 pub(crate) const MAX_BAILOUT: f32 = 1e10;
@@ -59,6 +59,9 @@ pub(crate) struct ExperimentDocument {
     /// they differ from the defaults (format version 8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) animation: Option<crate::animation::ZoomAnimation>,
+    /// The transformations stage of the image (format version 10).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) transformations: Vec<crate::transform::Transformation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -283,6 +286,12 @@ impl ExperimentDocument {
                 .validate()
                 .map_err(|error| format!("animation: {error}"))?;
         }
+        if !self.transformations.is_empty() {
+            if self.version < 10 {
+                return Err("transformations require document version 10".to_owned());
+            }
+            crate::transform::validate_chain(&self.transformations)?;
+        }
         if !self.display.palette_phase.is_finite()
             || !(-1.0..=1.0).contains(&self.display.palette_phase)
         {
@@ -439,7 +448,29 @@ mod tests {
             deep_dynamical_plane: None,
             deep_parameter_c: None,
             animation: None,
+            transformations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn transformations_round_trip_and_need_version_10() {
+        use crate::transform::{Transformation, TransformationKind};
+        let mut document = example();
+        document.transformations = vec![
+            TransformationKind::Kaleidoscope.default_transformation(),
+            Transformation {
+                kind: TransformationKind::Twist,
+                a: 1.2,
+                b: 0.0,
+            },
+        ];
+        let json = document.to_pretty_json().unwrap();
+        assert_eq!(ExperimentDocument::from_json(&json).unwrap(), document);
+        document.version = 9;
+        assert!(document.validate().is_err());
+        document.version = FORMAT_VERSION;
+        document.transformations[1].a = f64::NAN;
+        assert!(document.validate().is_err());
     }
 
     #[test]

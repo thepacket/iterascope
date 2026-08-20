@@ -182,6 +182,12 @@ pub struct Uniforms {
     family_b: [f32; 4],
     numerics: [f32; 4],
     reference: [f32; 4],
+    /// x = region→frame scale (share), yz = region centre in frame-local
+    /// units, w = number of active transformations. Identity: (1, 0, 0, 0).
+    transform_map: [f32; 4],
+    /// The transformations stage, first applied first: x = kind code,
+    /// y/z = the kind's parameters.
+    transforms: [[f32; 4]; crate::transform::MAX_TRANSFORMATIONS],
 }
 
 impl Uniforms {
@@ -228,7 +234,25 @@ impl Uniforms {
             // compensated arithmetic from fast-math reassociation.
             numerics: [1.0; 4],
             reference: [0.0; 4],
+            transform_map: [1.0, 0.0, 0.0, 0.0],
+            transforms: [[0.0; 4]; crate::transform::MAX_TRANSFORMATIONS],
         }
+    }
+
+    /// Enables the transformations stage: `words`/`count` describe the
+    /// chain, and `map = (share, centre_x, centre_y)` is the affine
+    /// region→frame conversion so the warp is evaluated in frame-local
+    /// units — a warped frame then tiles seamlessly. Whole-frame renders
+    /// pass the identity `(1, 0, 0)`.
+    pub(crate) fn with_transformations(
+        mut self,
+        words: [[f32; 4]; crate::transform::MAX_TRANSFORMATIONS],
+        count: u32,
+        map: [f32; 3],
+    ) -> Self {
+        self.transform_map = [map[0], map[1], map[2], count as f32];
+        self.transforms = words;
+        self
     }
 
     /// Enables perturbation rendering around the uploaded reference orbit.
@@ -1896,8 +1920,10 @@ mod tests {
     }
 
     #[test]
-    fn uniform_layout_is_ten_vec4s() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 160);
+    fn uniform_layout_is_fifteen_vec4s() {
+        // Ten core vec4s plus the transformations stage: its map and four
+        // transform slots. Must match the WGSL Uniforms struct.
+        assert_eq!(std::mem::size_of::<Uniforms>(), 240);
     }
 
     #[test]
@@ -1970,7 +1996,7 @@ mod tests {
             [0.0; 8],
         );
         assert_eq!(uniforms.dynamics_lo[2], 1.0);
-        assert_eq!(std::mem::size_of::<Uniforms>(), 160);
+        assert_eq!(std::mem::size_of::<Uniforms>(), 240);
         assert_eq!(uniforms.numerics[0], 1.0);
     }
 
@@ -3370,6 +3396,277 @@ mod tests {
             assert!(
                 fraction < 0.01,
                 "{label}: tiled render differs from whole on {:.2}% of pixels",
+                100.0 * fraction
+            );
+        }
+    }
+
+    /// The transformations stage: an identity chain must be bit-identical
+    /// to the untransformed render, a mirror fold exactly symmetric, a
+    /// kaleidoscope rotationally symmetric; and a warped frame must tile
+    /// seamlessly at the shallow f32 path and beyond the arbitrary-
+    /// precision handoff — the warp is evaluated in frame-local units
+    /// through the region map, so tiles agree with the whole frame.
+    #[test]
+    #[ignore]
+    fn gpu_transformations_warp_exactly_and_tile_seamlessly() {
+        use crate::animation::region_view;
+        use crate::arbitrary::{DeepComplex, DeepReal, DeepState, DeepView, ReferenceOrbit};
+        use crate::colouring::LayerStack;
+        use crate::family::{FamilyParameters, FractalFamily};
+        use crate::transform::{Transformation, TransformationKind};
+
+        let gpu = GpuHarness::new(64, 64); // device host; export sizes vary
+        let parameters = FamilyParameters::default();
+        let family = FractalFamily::Quadratic;
+        let iterations = 512u32;
+        let layers = LayerStack::default();
+        let gradient = GradientTable::new(51, &layers);
+
+        let render = |size: (u32, u32),
+                      full: (u32, u32),
+                      origin: (u32, u32),
+                      magnification: f64,
+                      centre: [f64; 2],
+                      julia: bool,
+                      reference: Option<(u64, &[GpuReferencePoint])>,
+                      chain: &[Transformation]|
+         -> Vec<u8> {
+            let region = region_view(magnification, full, origin, size, [0.0; 2]);
+            let mut uniforms = Uniforms::new(
+                [
+                    centre[0] + region.centre_shift[0],
+                    centre[1] + region.centre_shift[1],
+                ],
+                region.half_height_f64,
+                region.aspect,
+                family.default_parameter(),
+                iterations,
+                4.0,
+                family.shader_flag(),
+                usize::from(julia),
+                true,
+                false,
+                if reference.is_some() {
+                    PrecisionMode::DoubleSingle
+                } else {
+                    PrecisionMode::F32
+                },
+                parameters.uniform_words(julia),
+            );
+            if let Some((_, points)) = reference {
+                uniforms = uniforms.enable_perturbation(
+                    region.scale_mantissa,
+                    region.scale_exponent,
+                    points.len(),
+                    false,
+                    region.reference_offset,
+                );
+            }
+            if !chain.is_empty() {
+                let (words, count) = crate::transform::shader_words(chain);
+                uniforms = uniforms.with_transformations(
+                    words,
+                    count,
+                    [
+                        region.share,
+                        region.frame_centre_local[0],
+                        region.frame_centre_local[1],
+                    ],
+                );
+            }
+            gpu.pipeline.render_export(
+                &gpu.device,
+                &gpu.queue,
+                &uniforms,
+                &ColouringUniforms::new(&layers, -5.0),
+                &gradient,
+                reference,
+                size,
+            )
+        };
+
+        // Symmetry checks on a square shallow parameter-plane view. The
+        // centre sits off the real axis — the parameter plane is mirror-
+        // symmetric about it, which would make a fold invisible.
+        let square = (256u32, 256u32);
+        let centre = [-0.6, 0.3];
+        let baseline = render(square, square, (0, 0), 0.0, centre, false, None, &[]);
+        let no_op = [
+            Transformation {
+                kind: TransformationKind::Rotation,
+                a: 0.0,
+                b: 0.0,
+            },
+            Transformation {
+                kind: TransformationKind::Twist,
+                a: 0.0,
+                b: 0.0,
+            },
+        ];
+        let identity = render(square, square, (0, 0), 0.0, centre, false, None, &no_op);
+        assert_eq!(baseline, identity, "an identity chain changed the image");
+
+        let mirror = render(
+            square,
+            square,
+            (0, 0),
+            0.0,
+            centre,
+            false,
+            None,
+            &[Transformation {
+                kind: TransformationKind::Mirror,
+                a: 0.0,
+                b: 0.0,
+            }],
+        );
+        assert_ne!(mirror, baseline, "the mirror fold did nothing");
+        // Interpolated fragment coordinates are not bit-symmetric between
+        // mirrored rows, so escape bands can flip on boundary pixels; the
+        // fold must still match to a small fraction.
+        let (w, h) = (square.0 as usize, square.1 as usize);
+        let mut differing = 0usize;
+        for y in 0..h / 2 {
+            for x in 0..w {
+                let top = &mirror[(y * w + x) * 4..(y * w + x) * 4 + 3];
+                let bottom_index = ((h - 1 - y) * w + x) * 4;
+                let bottom = &mirror[bottom_index..bottom_index + 3];
+                let delta: i32 = (0..3)
+                    .map(|k| (top[k] as i32 - bottom[k] as i32).abs())
+                    .sum();
+                if delta > 60 {
+                    differing += 1;
+                }
+            }
+        }
+        let share = 100.0 * differing as f64 / (w * h / 2) as f64;
+        eprintln!("mirror fold symmetry: {share:.3}% of pixel pairs differ");
+        assert!(share < 0.5, "mirror fold asymmetry ({share:.2}%)");
+
+        let kaleidoscope = render(
+            square,
+            square,
+            (0, 0),
+            0.0,
+            centre,
+            false,
+            None,
+            &[Transformation {
+                kind: TransformationKind::Kaleidoscope,
+                a: 4.0,
+                b: 0.0,
+            }],
+        );
+        let mut differing = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                // 90° rotation maps pixel (x, y) onto (y, h − 1 − x).
+                let a = &kaleidoscope[(y * w + x) * 4..(y * w + x) * 4 + 3];
+                let rotated = ((h - 1 - x) * w + y) * 4;
+                let b = &kaleidoscope[rotated..rotated + 3];
+                let delta: i32 = (0..3).map(|k| (a[k] as i32 - b[k] as i32).abs()).sum();
+                if delta > 60 {
+                    differing += 1;
+                }
+            }
+        }
+        let share = 100.0 * differing as f64 / (w * h) as f64;
+        eprintln!("kaleidoscope 4-fold symmetry: {share:.3}% of pixels differ");
+        assert!(share < 0.5, "kaleidoscope is not 4-fold symmetric ({share:.2}%)");
+
+        // A warped frame must tile seamlessly, shallow and at 1e30.
+        let chain = [
+            Transformation {
+                kind: TransformationKind::Kaleidoscope,
+                a: 6.0,
+                b: 0.3,
+            },
+            Transformation {
+                kind: TransformationKind::Twist,
+                a: 0.8,
+                b: 0.0,
+            },
+        ];
+        let zoom_exponent = 30u32;
+        let precision_exponent = zoom_exponent + 40;
+        let c_deep = DeepComplex::from_f64(family.default_parameter(), precision_exponent).unwrap();
+        let (fixed_point, _) = [[0.6, 0.4], [-0.5, 0.7], [1.1, -0.3]]
+            .iter()
+            .filter_map(|start| {
+                repelling_fixed_point(family, &parameters, &c_deep, *start, precision_exponent)
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("a repelling fixed point");
+        let deep_view = DeepView {
+            centre: fixed_point.clone(),
+            half_height: DeepReal::parse(&format!("1.45e-{zoom_exponent}"), precision_exponent)
+                .unwrap(),
+            zoom_exponent: precision_exponent,
+            magnification_log10: zoom_exponent as f64,
+        };
+        let initial = DeepState::initial(family, &deep_view.centre, true, &c_deep).unwrap();
+        let orbit = ReferenceOrbit::family(family, &parameters, initial, iterations, 4.0).unwrap();
+        let ap = DeepRenderData::from_points(52, 1.0, 0, &orbit.points, false).reference;
+
+        let full = (384u32, 256u32);
+        for (label, magnification, view_centre, julia) in [
+            ("shallow", 0.0f64, [-0.6, 0.0], false),
+            ("deep 1e30", 30.0, deep_view.centre_preview(), true),
+        ] {
+            let reference = julia.then_some((52u64, ap.as_slice()));
+            let whole = render(
+                full,
+                full,
+                (0, 0),
+                magnification,
+                view_centre,
+                julia,
+                reference,
+                &chain,
+            );
+            let distinct: std::collections::HashSet<&[u8]> = whole.chunks(4).collect();
+            assert!(
+                distinct.len() > 200,
+                "{label}: the warped render collapsed ({} distinct colours)",
+                distinct.len()
+            );
+            let mut assembled = vec![0u8; whole.len()];
+            for (row_offset, tile_height) in crate::animation::tile_spans(full.1, 140) {
+                for (column_offset, tile_width) in crate::animation::tile_spans(full.0, 200) {
+                    let tile = render(
+                        (tile_width, tile_height),
+                        full,
+                        (column_offset, row_offset),
+                        magnification,
+                        view_centre,
+                        julia,
+                        reference,
+                        &chain,
+                    );
+                    for y in 0..tile_height as usize {
+                        let source = y * tile_width as usize * 4..(y + 1) * tile_width as usize * 4;
+                        let target = ((row_offset as usize + y) * full.0 as usize
+                            + column_offset as usize)
+                            * 4;
+                        assembled[target..target + tile_width as usize * 4]
+                            .copy_from_slice(&tile[source]);
+                    }
+                }
+            }
+            let differing = whole
+                .chunks(4)
+                .zip(assembled.chunks(4))
+                .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 2))
+                .count();
+            let fraction = differing as f64 / (whole.len() / 4) as f64;
+            eprintln!(
+                "warped tiling {label}: {:.3}% of pixels differ between whole and tiled",
+                100.0 * fraction
+            );
+            assert!(
+                fraction < 0.01,
+                "{label}: warped tiles differ from the whole frame on {:.2}% of pixels",
                 100.0 * fraction
             );
         }

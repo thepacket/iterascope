@@ -31,7 +31,74 @@ struct Uniforms {
     // units as the fragment coordinate (x spans ±aspect, y spans ±1) — the
     // reference orbit may be chosen away from the centre so it lives longer.
     reference: vec4<f32>,
+    // The transformations stage. x = region→frame scale (share), yz =
+    // region centre in frame-local units, w = number of active
+    // transformations; identity map is (1, 0, 0, 0).
+    transform_map: vec4<f32>,
+    // Per transformation, first applied first: x = kind code (see
+    // TRANSFORM_* below), y/z = the kind's parameters.
+    transforms: array<vec4<f32>, 4>,
 };
+
+const TRANSFORM_ROTATION: u32 = 1u;
+const TRANSFORM_MIRROR: u32 = 2u;
+const TRANSFORM_KALEIDOSCOPE: u32 = 3u;
+const TRANSFORM_TWIST: u32 = 4u;
+const TRANSFORM_INVERSION: u32 = 5u;
+
+fn transform_rotate(p: vec2<f32>, angle: f32) -> vec2<f32> {
+    let s = sin(angle);
+    let c = cos(angle);
+    return vec2<f32>(c * p.x - s * p.y, s * p.x + c * p.y);
+}
+
+// The transformations stage: screen-space warps of the view-local
+// coordinate, applied before any precision path derives a world position or
+// perturbation delta — so warps are exact at any magnification (they only
+// choose where near the reference each pixel samples). Region renders
+// (tiles) conjugate through frame-local units via `transform_map`, so a
+// warped frame tiles seamlessly. The CPU mirror lives in transform.rs;
+// both must stay in step.
+fn apply_transformations(local: vec2<f32>) -> vec2<f32> {
+    let count = u32(u.transform_map.w);
+    if (count == 0u) {
+        return local;
+    }
+    var p = local * u.transform_map.x + u.transform_map.yz;
+    for (var index = 0u; index < count; index++) {
+        let t = u.transforms[index];
+        switch u32(t.x) {
+            case TRANSFORM_ROTATION: {
+                p = transform_rotate(p, t.y);
+            }
+            case TRANSFORM_MIRROR: {
+                var q = transform_rotate(p, -t.y);
+                q.y = abs(q.y);
+                p = transform_rotate(q, t.y);
+            }
+            case TRANSFORM_KALEIDOSCOPE: {
+                let radius = length(p);
+                let sector = 3.14159265358979 / max(t.y, 1.0);
+                let span = 2.0 * sector;
+                var theta = atan2(p.y, p.x) - t.z;
+                theta = theta - floor(theta / span) * span;
+                if (theta > sector) {
+                    theta = span - theta;
+                }
+                theta = theta + t.z;
+                p = radius * vec2<f32>(cos(theta), sin(theta));
+            }
+            case TRANSFORM_TWIST: {
+                p = transform_rotate(p, t.y * length(p));
+            }
+            case TRANSFORM_INVERSION: {
+                p = p * (t.y * t.y) / max(dot(p, p), 1e-12);
+            }
+            default: {}
+        }
+    }
+    return (p - u.transform_map.yz) / u.transform_map.x;
+}
 
 // Family codes. They must match `FractalFamily::shader_flag` in family.rs.
 const FAMILY_QUADRATIC: u32 = 0u;
@@ -2200,8 +2267,10 @@ fn grid(world: vec2<f32>, scale: f32) -> f32 {
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // Top of the viewport maps to positive imaginary values.
-    let local = vec2<f32>((in.uv.x * 2.0 - 1.0) * u.view_hi.w,
-                         (in.uv.y * 2.0 - 1.0));
+    // The transformations stage warps the raw fragment coordinate before
+    // any precision path uses it: every path below samples the warped point.
+    let local = apply_transformations(vec2<f32>((in.uv.x * 2.0 - 1.0) * u.view_hi.w,
+                         (in.uv.y * 2.0 - 1.0)));
     let centre_ds = Ds2(
         Ds(u.view_hi.x, u.view_lo.x),
         Ds(u.view_hi.y, u.view_lo.y),
